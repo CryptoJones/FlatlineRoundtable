@@ -8,16 +8,16 @@ neither side drifts.
 
 - [ ] Wrap protocol-over-stdio agents so they can serve as `cli` lanes. Some
       assistants expose no one-shot print mode, only a JSON-RPC stdio protocol,
-      which is why such lanes ship `active: false`.
+      which is why such lanes ship `active: false`. ([#2](https://github.com/CryptoJones/FlatlineRoundtable/issues/2))
 - [ ] Cost estimation only covers lanes with `price_per_mtok` set by hand. Pull
       real pricing from the gateway so `budget_usd` is accurate rather than
-      advisory.
+      advisory. ([#3](https://github.com/CryptoJones/FlatlineRoundtable/issues/3))
 - [ ] `--max-spend` is enforced *after* the run, since token counts are not known
       until responses return. A pre-flight estimate from brief length would let it
-      refuse to dispatch.
-- [ ] No test suite. The verification set below is manual.
+      refuse to dispatch. ([#4](https://github.com/CryptoJones/FlatlineRoundtable/issues/4))
+- [ ] No test suite. The verification set below is manual. ([#5](https://github.com/CryptoJones/FlatlineRoundtable/issues/5))
 - [ ] Consider a `--diff` mode that reports only where lanes disagree, since that
-      is the actual product and reading nine full answers does not scale.
+      is the actual product and reading nine full answers does not scale. ([#6](https://github.com/CryptoJones/FlatlineRoundtable/issues/6))
 
 ## Verification set
 
