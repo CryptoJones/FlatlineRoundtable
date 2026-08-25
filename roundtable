@@ -49,6 +49,14 @@ except ImportError:
 
 DEFAULT_CONFIG = Path.home() / ".config" / "flatline-roundtable" / "FlatlineRoundtable.yaml"
 TRANSCRIPT_DIR = Path.home() / ".local" / "share" / "flatline-roundtable" / "transcripts"
+PRICING_CACHE = Path.home() / ".cache" / "flatline-roundtable" / "pricing.json"
+PRICING_TTL = 24 * 3600
+OPENROUTER_MODELS = "https://openrouter.ai/api/v1/models"
+
+# Rough, deliberately pessimistic. Real tokenizers vary by model and we would
+# need one per vendor to do better; ~4 chars/token overestimates for English
+# prose, which is the safe direction for a budget check.
+CHARS_PER_TOKEN = 4
 
 # Keys a lane's `extra_body` must never set: they define the request itself, and
 # silently overwriting them turns a config typo into a call you did not intend.
@@ -75,6 +83,71 @@ SCRUB_ENV = (
 
 def die(msg: str) -> "NoReturn":  # noqa: F821
     sys.exit(f"roundtable: {msg}")
+
+
+# --------------------------------------------------------------------------- #
+# pricing
+# --------------------------------------------------------------------------- #
+def load_pricing(lanes: list[dict]) -> dict[str, tuple[float, float]]:
+    """Per-token (prompt, completion) prices, keyed by model id.
+
+    Hand-maintained prices in config go stale silently the moment a vendor
+    changes them, and a stale number is worse than none because it reads as
+    authoritative. Pull the real table instead, cached for a day so a run does
+    not depend on the network.
+
+    Config `price_per_mtok` still wins if set — it is the escape hatch for
+    vendors with no price endpoint.
+    """
+    if not any(l.get("vendor") == "openrouter" for l in lanes):
+        return {}
+    try:
+        if PRICING_CACHE.exists() and time.time() - PRICING_CACHE.stat().st_mtime < PRICING_TTL:
+            raw = json.loads(PRICING_CACHE.read_text())
+        else:
+            with urllib.request.urlopen(OPENROUTER_MODELS, timeout=20) as r:
+                raw = json.load(r)
+            PRICING_CACHE.parent.mkdir(parents=True, exist_ok=True)
+            PRICING_CACHE.write_text(json.dumps(raw))
+    except Exception:
+        # Never fail a run over pricing. Estimates degrade to config values.
+        return {}
+    out = {}
+    for m in raw.get("data", []):
+        pr = m.get("pricing") or {}
+        try:
+            out[m["id"]] = (float(pr.get("prompt", 0)), float(pr.get("completion", 0)))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def lane_prices(lane: dict, table: dict) -> tuple[float, float]:
+    """(prompt, completion) per-token price for a lane, or (0, 0) if free/unknown."""
+    if lane.get("price_per_mtok") is not None:      # explicit override
+        p = float(lane["price_per_mtok"]) / 1_000_000
+        return (p, p)
+    if lane["harness"] in ("cli", "acp"):           # subscription — no marginal cost
+        return (0.0, 0.0)
+    return table.get(lane.get("model"), (0.0, 0.0))
+
+
+def estimate_run(lanes: list[dict], prompt: str, table: dict, defaults: dict) -> float:
+    """Worst-case cost BEFORE dispatch (issue #4).
+
+    Enforcing a budget only after responses return reports an overrun rather
+    than preventing one -- the money is already spent by then. Assume every lane
+    answers to its full max_tokens, which is the ceiling a run can actually hit.
+    """
+    total = 0.0
+    for l in lanes:
+        pin, pout = lane_prices(l, table)
+        if not (pin or pout):
+            continue
+        in_tok = (len(prompt) + len(l.get("personality") or "")) / CHARS_PER_TOKEN
+        out_tok = float(l.get("max_tokens", defaults.get("max_tokens", 2000)))
+        total += in_tok * pin + out_tok * pout
+    return total
 
 
 # --------------------------------------------------------------------------- #
@@ -109,12 +182,15 @@ def load_config(path: Path) -> dict:
         seen.add(name)
 
         harness = lane.get("harness")
-        if harness not in ("http", "cli"):
-            die(f"{name}: harness must be 'http' or 'cli', got {harness!r}")
+        if harness not in ("http", "cli", "acp"):
+            die(f"{name}: harness must be 'http', 'cli' or 'acp', got {harness!r}")
         if harness == "http":
             for req in ("model", "base_url"):
                 if not lane.get(req):
                     die(f"{name}: http lane needs {req}")
+        elif harness == "acp":
+            if not lane.get("command"):
+                die(f"{name}: acp lane needs a command")
         else:
             if not lane.get("command"):
                 die(f"{name}: cli lane needs a command")
@@ -296,7 +372,94 @@ def cli_lane(lane: dict, prompt: str) -> dict:
 # --------------------------------------------------------------------------- #
 # run
 # --------------------------------------------------------------------------- #
-def ask(lane, prompt, keys, retries, deadline, sems, lock, spent):
+def acp_lane(lane: dict, prompt: str) -> dict:
+    """Drive an ACP (Agent Client Protocol) agent for exactly one turn.
+
+    Some assistants expose no one-shot print mode -- only JSON-RPC over stdio.
+    This does the minimum exchange to get one answer:
+
+        initialize -> session/new -> session/prompt -> collect updates -> kill
+
+    The process is created for this turn and killed at the end of it, in its own
+    process group. That is the whole point: an ACP agent is a SERVER and will sit
+    there indefinitely if you let it, which is precisely the long-lived-process
+    failure this tool exists to avoid. Do not "optimise" this by reusing a
+    session across lanes or keeping the process warm.
+    """
+    env = {k: v for k, v in os.environ.items() if k not in SCRUB_ENV}
+    env["NO_COLOR"] = "1"
+    proc = subprocess.Popen(
+        [lane["command"], *(lane.get("args") or [])],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, bufsize=1, env=env, start_new_session=True,
+    )
+    lk, replies, chunks = threading.Lock(), {}, []
+
+    def reader():
+        try:
+            for line in proc.stdout:
+                try:
+                    m = json.loads(line)
+                except (ValueError, TypeError):
+                    continue          # agents emit non-JSON banners on stdout
+                if "id" in m and ("result" in m or "error" in m):
+                    with lk:
+                        replies[m["id"]] = m
+                elif m.get("method") == "session/update":
+                    u = (m.get("params") or {}).get("update") or {}
+                    if u.get("sessionUpdate") == "agent_message_chunk":
+                        t = (u.get("content") or {}).get("text")
+                        if t:
+                            chunks.append(t)
+        except (ValueError, OSError):
+            pass                       # stream closed under us on kill
+
+    threading.Thread(target=reader, daemon=True).start()
+    deadline = time.time() + lane.get("timeout", 300)
+
+    def call(rid, method, params):
+        proc.stdin.write(json.dumps(
+            {"jsonrpc": "2.0", "id": rid, "method": method, "params": params}) + "\n")
+        proc.stdin.flush()
+        while time.time() < deadline:
+            with lk:
+                if rid in replies:
+                    return replies[rid]
+            if proc.poll() is not None:
+                raise RuntimeError(f"{lane['command']} exited during {method}")
+            time.sleep(0.05)
+        raise RuntimeError(f"timed out waiting for {method}")
+
+    try:
+        call(0, "initialize", {"protocolVersion": lane.get("protocol_version", 1),
+                               "clientCapabilities": {"fs": {"readTextFile": False,
+                                                             "writeTextFile": False}}})
+        r = call(1, "session/new", {"cwd": os.getcwd(), "mcpServers": []})
+        sid = (r.get("result") or {}).get("sessionId")
+        if not sid:
+            raise RuntimeError(f"session/new returned no sessionId: {str(r)[:150]}")
+        text = prompt
+        if lane.get("personality"):
+            text = f"{lane['personality']}\n\n---\n\n{prompt}"
+        r = call(2, "session/prompt",
+                 {"sessionId": sid, "prompt": [{"type": "text", "text": text}]})
+        if "error" in r:
+            raise RuntimeError(str(r["error"])[:200])
+        stop = (r.get("result") or {}).get("stopReason")
+        answer = "".join(chunks).strip()
+        if not answer:
+            raise RuntimeError(f"no agent_message_chunk received (stopReason={stop})")
+        return {"answer": answer,
+                "finish_reason": "length" if stop == "max_tokens" else "stop",
+                "served_by": lane["command"], "usage": None}
+    finally:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+
+
+def ask(lane, prompt, keys, retries, deadline, sems, lock, spent, prices):
     started = time.time()
     result = {
         "lane": lane["name"],
@@ -312,7 +475,9 @@ def ask(lane, prompt, keys, retries, deadline, sems, lock, spent):
         if deadline and time.time() > deadline:
             raise RuntimeError("global deadline passed before dispatch")
         with sem:
-            if lane["harness"] == "cli":
+            if lane["harness"] == "acp":
+                out = acp_lane(lane, prompt)
+            elif lane["harness"] == "cli":
                 out = cli_lane(lane, prompt)
             else:
                 key = keys.get(lane["key_entry"]) if lane.get("key_entry") else None
@@ -323,14 +488,81 @@ def ask(lane, prompt, keys, retries, deadline, sems, lock, spent):
         # A clipped answer is a silent failure: it reads as complete and is not.
         if result.get("finish_reason") == "length":
             result["truncated"] = True
-        if out.get("usage") and lane.get("price_per_mtok"):
-            tok = (out["usage"] or {}).get("total_tokens") or 0
+        # Charge prompt and completion separately: completion is typically 2-4x
+        # the prompt rate, so a blended per-token figure understates a long answer.
+        pin, pout = prices
+        u = out.get("usage") or {}
+        if (pin or pout) and u:
+            cost = (u.get("prompt_tokens") or 0) * pin + (u.get("completion_tokens") or 0) * pout
+            result["cost"] = round(cost, 6)
             with lock:
-                spent[0] += tok / 1_000_000 * float(lane["price_per_mtok"])
+                spent[0] += cost
     except Exception as e:  # noqa: BLE001 — a lane failing must never kill the run
         result["error"] = str(e)
     result["seconds"] = round(time.time() - started, 1)
     return result
+
+
+SYNTH_PROMPT = """Below are {n} independent answers to the same question, each from a
+different model that could not see the others.
+
+Report ONLY:
+1. AGREED — points where they independently land in the same place.
+2. SPLIT — points of genuine disagreement. For each, say WHO takes which side and
+   WHY they differ (different assumption, different priority, different reading).
+3. LONE CLAIMS — anything asserted by exactly one lane that the others neither
+   support nor contradict. Flag any that look like invented specifics.
+
+Do not summarise the answers. Do not add your own opinion on the question.
+If they substantially agree, say so in one line rather than manufacturing a split.
+
+--- THE QUESTION ---
+{brief}
+
+--- THE ANSWERS ---
+{answers}"""
+
+
+def synthesize(results, brief, cfg, lanes, keys, prices):
+    """Ask one lane to report where the others diverged (issue #6).
+
+    Reading N full answers does not scale, and disagreement is the actual
+    product. This is opt-in because it is NOT neutral: the synthesizer is itself
+    one model with its own priors deciding what counts as a disagreement. It is
+    a reading aid, not a verdict -- which is why the raw answers are still
+    written to the transcript.
+
+    Prefers a free lane so the convenience does not quietly cost money.
+    """
+    answered = [r for r in results if r.get("answer")]
+    if len(answered) < 2:
+        return None, "need at least 2 answers to compare"
+
+    want = cfg.get("synthesizer")
+    pool = [l for l in lanes if l["name"] != want] if want else lanes
+    chosen = next((l for l in lanes if l["name"] == want), None)
+    if chosen is None:
+        # free lanes first: cli (subscription) then :free models
+        chosen = next((l for l in pool if l["harness"] == "cli"), None) \
+              or next((l for l in pool if str(l.get("model", "")).endswith(":free")), None) \
+              or (pool[0] if pool else None)
+    if chosen is None:
+        return None, "no lane available to synthesize"
+
+    body = "\n\n".join(f"### {r['lane']} ({r['model'] or r['harness']})\n{r['answer']}"
+                        for r in answered)
+    ask_text = SYNTH_PROMPT.format(n=len(answered), brief=brief.strip()[:4000], answers=body)
+    synth_lane = {**chosen, "max_tokens": max(int(chosen.get("max_tokens", 2000)), 1500),
+                  "personality": None}
+    try:
+        if synth_lane["harness"] == "cli":
+            out = cli_lane(synth_lane, ask_text)
+        else:
+            key = keys.get(synth_lane["key_entry"]) if synth_lane.get("key_entry") else None
+            out = http_lane(synth_lane, ask_text, key, 1)
+        return {"by": chosen["name"], "text": out["answer"]}, None
+    except Exception as e:
+        return None, f"synthesis failed ({chosen['name']}): {e}"
 
 
 def main() -> int:
@@ -342,6 +574,7 @@ def main() -> int:
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--max-spend", type=float)
     ap.add_argument("--no-transcript", action="store_true")
+    ap.add_argument("--diff", action="store_true")
     ap.add_argument("-h", "--help", action="store_true")
     a = ap.parse_args()
     if a.help:
@@ -372,6 +605,16 @@ def main() -> int:
     budget = a.max_spend if a.max_spend is not None else cfg.get("budget_usd")
     deadline = time.time() + cfg["deadline_seconds"] if cfg.get("deadline_seconds") else None
     keys = fetch_keys(lanes)
+    prices = load_pricing(lanes)
+
+    # Refuse BEFORE spending, not after. A budget checked only on the way out
+    # reports an overrun; it does not prevent one.
+    estimate = estimate_run(lanes, prompt, prices, cfg.get("defaults") or {})
+    if budget is not None and estimate > budget:
+        die(
+            f"estimated worst case ${estimate:.4f} exceeds budget ${budget:.2f} — refusing to dispatch\n"
+            f"  raise --max-spend, drop lanes with --lanes, or lower max_tokens"
+        )
 
     # Per-vendor caps: a single-slot local llama.cpp will queue every concurrent
     # request past its own timeout if we fan out against it blindly.
@@ -385,19 +628,34 @@ def main() -> int:
     t0 = time.time()
     with cf.ThreadPoolExecutor(max_workers=max(len(lanes), 1)) as pool:
         results = list(pool.map(
-            lambda l: ask(l, prompt, keys, int(cfg.get("retries", 1)), deadline, sems, lock, spent),
+            lambda l: ask(l, prompt, keys, int(cfg.get("retries", 1)), deadline, sems, lock,
+                          spent, lane_prices(l, prices)),
             lanes,
         ))
 
     answered = [r for r in results if r["answer"]]
+
+    synth = None
+    if a.diff:
+        synth, synth_err = synthesize(results, prompt, cfg, lanes, keys, prices)
+
     if not a.no_transcript:
         TRANSCRIPT_DIR.mkdir(parents=True, exist_ok=True)
         stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
         path = TRANSCRIPT_DIR / f"{stamp}.json"
-        path.write_text(json.dumps({"brief": prompt, "results": results}, indent=2))
+        path.write_text(json.dumps(
+            {"brief": prompt, "results": results, "synthesis": synth}, indent=2))
 
     if a.json:
-        print(json.dumps(results, indent=2))
+        print(json.dumps({"results": results, "synthesis": synth} if a.diff else results, indent=2))
+    elif a.diff:
+        if synth:
+            print(f"\n{'=' * 74}\nWHERE THEY DIVERGE  (read by {synth['by']})\n{'=' * 74}")
+            print(synth["text"])
+            print(f"\n  -- one lane's reading of the others, not a verdict."
+                  f" raw answers in the transcript.")
+        else:
+            print(f"\n  !! {synth_err}", file=sys.stderr)
     else:
         for r in results:
             print(f"\n{'=' * 74}\n{r['lane']}  ({r['model'] or r['harness']})  {r['seconds']}s")
@@ -407,15 +665,17 @@ def main() -> int:
                 print("\n  !! TRUNCATED — hit max_tokens; raise it for this lane")
         print(f"\n{'=' * 74}")
         print(f"{len(answered)}/{len(results)} lanes answered in {time.time() - t0:.1f}s")
-        if spent[0]:
-            print(f"estimated spend: ${spent[0]:.4f}")
+        if spent[0] or estimate:
+            print(f"spend: ${spent[0]:.4f} actual  (est. worst case ${estimate:.4f})")
         if not a.no_transcript:
             print(f"transcript: {path}")
         for r in results:
             if not r["answer"]:
                 print(f"  FAILED  {r['lane']}: {r['error']}")
 
-    if budget and spent[0] > budget:
+    # Backstop only -- the pre-flight gate above is what actually protects the
+    # budget. This catches an estimate that was too optimistic.
+    if budget is not None and spent[0] > budget:
         print(f"\n!! spend ${spent[0]:.4f} exceeded budget ${budget:.2f}", file=sys.stderr)
         return 2
     # A silent lane is the bug this tool exists to eliminate, so partial

@@ -15,6 +15,8 @@ defaults:
 concurrency: 8          # global default; lanes may lower it
 retries: 1              # transient 5xx / connection errors only
 deadline_seconds: 600   # whole-run wall clock
+# synthesizer: Chair    # lane used by --diff to report where the others split;
+                        # defaults to a free lane so the convenience is free
 # budget_usd: 0.50      # refuse to finish over this (needs price_per_mtok on metered lanes)
 
 lanes:
@@ -93,14 +95,30 @@ lanes:
       You are the outsider. You have not seen this codebase before. Say what is
       confusing on first read.
 
+  # ----------------------------------------------------------------- acp ----
+  # For agents that speak JSON-RPC over stdio and have no one-shot print mode.
+  # The tool does initialize -> session/new -> session/prompt -> kill, for one
+  # turn only. An ACP agent is a SERVER: it will sit there forever if allowed,
+  # so the process is created for the turn and killed with its process group at
+  # the end of it. Do not keep one warm between lanes.
+  - name: Protocol
+    active: false
+    vendor: example
+    harness: acp
+    command: /path/to/some-acp-binary
+    model: some-model
+    timeout: 180
+    # protocol_version: 1
+    personality: |
+      You are the protocol lane.
+
   # ------------------------------------------------------------- disabled ----
-  # Keep a lane in the file with active:false rather than deleting it, so the
-  # reason it is off does not get lost.
+  # Keep a lane with active:false rather than deleting it, so the reason it is
+  # off does not get lost.
   - name: Parked
     active: false
     vendor: example
-    harness: cli
-    command: some-acp-binary
-    args: ["-p"]
+    harness: http
     model: some-model
-    notes: "no one-shot mode — protocol-over-stdio only; needs a wrapper first"
+    base_url: https://example.invalid/v1
+    notes: "parked 2026-08-25 — answers were incoherent; see lane quality notes"

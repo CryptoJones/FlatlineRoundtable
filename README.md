@@ -86,8 +86,8 @@ Optionally `./install.sh` to expose it as a Claude Code skill.
 
 **`harness` decides cost, not `model`.**
 
-An `http` lane bills per token. A `cli` lane drives a vendor's own CLI against
-an existing subscription and costs nothing extra.
+An `http` lane bills per token. `cli` and `acp` lanes drive a vendor's own binary
+against an existing subscription and cost nothing extra.
 
 Rewriting a `cli` lane as an `http` lane pointed at the same vendor's API
 silently moves it onto metered credits. So does leaving an API key in your
@@ -95,8 +95,11 @@ shell: these CLIs prefer an env key over the OAuth session. FlatlineRoundtable
 scrubs `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` and friends from every CLI lane's
 environment for that reason.
 
-Set `price_per_mtok` on metered lanes to get a spend estimate, and `budget_usd`
-to make overruns visible.
+Prices come from the gateway's own table (cached for a day), so they do not go
+stale the way a hand-maintained number does; `price_per_mtok` overrides it for
+vendors with no price endpoint. `--max-spend` and `budget_usd` are checked
+**before dispatch** against a worst-case estimate, so an overrun is prevented
+rather than reported.
 
 ## Usage
 
@@ -107,16 +110,38 @@ roundtable --lanes Skeptic,Chair "..."  # a subset
 roundtable --list                       # roster + route; no network calls
 roundtable --json                       # structured output
 roundtable --config PATH
-roundtable --max-spend 0.50
+roundtable --max-spend 0.50        # refuses BEFORE dispatch if the estimate exceeds it
+roundtable --diff                  # report only where the lanes disagree
 roundtable --no-transcript
 ```
+
+`--diff` asks one lane to report AGREED / SPLIT / LONE CLAIMS across the others,
+because reading N full answers does not scale and disagreement is the product.
+It is opt-in and it is not neutral — the synthesizer is one model with its own
+priors deciding what counts as a disagreement, so the raw answers still go to the
+transcript. It prefers a free lane, so the convenience does not quietly cost
+money.
 
 Every run writes a transcript to
 `~/.local/share/flatline-roundtable/transcripts/`, because answers that exist
 only in a terminal scrollback are answers waiting to be lost.
 
+## Tests
+
+```console
+$ python3 -m unittest discover -s tests
+```
+
+25 tests against a stub HTTP server and fake CLI binaries — no vendor is
+contacted, nothing is spent, no credential is needed. They cover the behaviours
+that silently cost money or leak processes: the env scrub, the process-group
+kill, the missing-secret abort, and partial delivery failing the run.
+
 ## Limits
 
+- Three harnesses: `http` (any OpenAI-compatible endpoint), `cli` (one-shot
+  subscription CLIs), and `acp` (JSON-RPC-over-stdio agents, driven for exactly
+  one turn).
 - Lanes have **no tools and no file access**. This is "read this and tell me what
   you think," not "go investigate the repo." Put the material in the brief.
 - Lanes never see each other's answers. That is the point; it is also why they

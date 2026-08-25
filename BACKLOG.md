@@ -6,18 +6,13 @@ neither side drifts.
 
 ## Open
 
-- [ ] Wrap protocol-over-stdio agents so they can serve as `cli` lanes. Some
-      assistants expose no one-shot print mode, only a JSON-RPC stdio protocol,
-      which is why such lanes ship `active: false`. ([#2](https://github.com/CryptoJones/FlatlineRoundtable/issues/2))
-- [ ] Cost estimation only covers lanes with `price_per_mtok` set by hand. Pull
-      real pricing from the gateway so `budget_usd` is accurate rather than
-      advisory. ([#3](https://github.com/CryptoJones/FlatlineRoundtable/issues/3))
-- [ ] `--max-spend` is enforced *after* the run, since token counts are not known
-      until responses return. A pre-flight estimate from brief length would let it
-      refuse to dispatch. ([#4](https://github.com/CryptoJones/FlatlineRoundtable/issues/4))
-- [ ] No test suite. The verification set below is manual. ([#5](https://github.com/CryptoJones/FlatlineRoundtable/issues/5))
-- [ ] Consider a `--diff` mode that reports only where lanes disagree, since that
-      is the actual product and reading nine full answers does not scale. ([#6](https://github.com/CryptoJones/FlatlineRoundtable/issues/6))
+- [ ] Per-vendor rate-limit awareness. `Retry-After` is honoured on 429, but a
+      wide fan-out can still trip a vendor's per-minute cap before any 429
+      arrives.
+- [ ] `--diff` synthesis is one lane's reading, not a neutral one. Consider
+      running it on two lanes and reporting where the *syntheses* differ.
+- [ ] The pre-flight estimate uses ~4 chars/token rather than a real tokenizer,
+      so it overestimates. Safe direction, but a wide margin on long briefs.
 
 ## Verification set
 
@@ -43,6 +38,16 @@ Run before any PR. Most of these are behavioural and no test suite covers them.
 
 ## Done
 
+- [x] Wrap protocol-over-stdio agents so they can serve as lanes — new `acp`
+      harness: initialize → session/new → session/prompt → process-group kill,
+      one turn only. ([#2](https://github.com/CryptoJones/FlatlineRoundtable/issues/2))
+- [x] Real pricing pulled from the gateway and cached for a day; prompt and
+      completion charged at their separate rates. ([#3](https://github.com/CryptoJones/FlatlineRoundtable/issues/3))
+- [x] `--max-spend` / `budget_usd` enforced **before dispatch** against a
+      worst-case estimate, so an overrun is prevented, not reported. ([#4](https://github.com/CryptoJones/FlatlineRoundtable/issues/4))
+- [x] Test suite — 25 tests, stub HTTP server and fake CLI binaries, no vendor
+      contacted and nothing spent. ([#5](https://github.com/CryptoJones/FlatlineRoundtable/issues/5))
+- [x] `--diff` mode reporting AGREED / SPLIT / LONE CLAIMS. ([#6](https://github.com/CryptoJones/FlatlineRoundtable/issues/6))
 - [x] Direct-call architecture replacing long-lived agent processes — no
       identity, no message bus, no publish step, nothing left running to bill.
 - [x] Secrets via `pass` entry names only; keys resolved once, held in memory,
