@@ -8,11 +8,11 @@ neither side drifts.
 
 - [ ] Per-vendor rate-limit awareness. `Retry-After` is honoured on 429, but a
       wide fan-out can still trip a vendor's per-minute cap before any 429
-      arrives.
+      arrives. ([#7](https://github.com/CryptoJones/FlatlineRoundtable/issues/7))
 - [ ] `--diff` synthesis is one lane's reading, not a neutral one. Consider
-      running it on two lanes and reporting where the *syntheses* differ.
+      running it on two lanes and reporting where the *syntheses* differ. ([#8](https://github.com/CryptoJones/FlatlineRoundtable/issues/8))
 - [ ] The pre-flight estimate uses ~4 chars/token rather than a real tokenizer,
-      so it overestimates. Safe direction, but a wide margin on long briefs.
+      so it overestimates. Safe direction, but a wide margin on long briefs. ([#9](https://github.com/CryptoJones/FlatlineRoundtable/issues/9))
 
 ## Verification set
 
