@@ -1,0 +1,124 @@
+# FlatlineRoundtable — example config
+#
+# Copy to ~/.config/flatline-roundtable/FlatlineRoundtable.yaml and edit.
+# That path is deliberate: your real config lives OUTSIDE the repo, so a stray
+# `git add -f`, a stash, or an editor backup cannot publish it.
+#
+# NO SECRET VALUE EVER GOES IN THIS FILE. `key_entry` names a `pass` entry;
+# the key is read into memory only while that lane is being queried.
+
+defaults:
+  max_tokens: 2000
+  timeout: 300
+  temperature: 0.7
+
+concurrency: 8          # global default; lanes may lower it
+retries: 1              # transient 5xx / connection errors only
+deadline_seconds: 600   # whole-run wall clock
+# synthesizer: Chair    # lane used by --diff to report where the others split;
+                        # defaults to a free lane so the convenience is free
+# budget_usd: 0.50      # refuse to finish over this (needs price_per_mtok on metered lanes)
+
+lanes:
+  # ---------------------------------------------------------------- http ----
+  # Any OpenAI-compatible endpoint. `vendor` is a human label used for grouping
+  # and per-vendor concurrency; routing depends on harness + base_url, not on it.
+  - name: Skeptic
+    active: true
+    vendor: openrouter
+    harness: http
+    model: some-vendor/some-model
+    base_url: https://openrouter.ai/api/v1
+    key_entry: openrouter/agent/skeptic     # a pass ENTRY NAME, never a key
+    price_per_mtok: 1.50                    # optional; enables spend estimates
+    personality: |
+      You are the Skeptic. Assume every claim is unproven until it is shown.
+      Attack the weakest link in the argument, not the conclusion.
+
+  # A free-tier model: same shape, no price.
+  - name: Contrarian
+    active: true
+    vendor: openrouter
+    harness: http
+    model: some-vendor/some-model:free
+    base_url: https://openrouter.ai/api/v1
+    key_entry: openrouter/agent/contrarian
+    personality: |
+      You are the Contrarian. Argue the position the others are least likely
+      to take, as long as it is defensible.
+
+  # --------------------------------------------------------------- local ----
+  # A llama.cpp / vLLM server on your own hardware. No key needed.
+  - name: Local
+    active: false
+    vendor: local
+    harness: http
+    model: your-local-model
+    base_url: http://localhost:8080/v1
+    timeout: 180
+    concurrency: 1   # llama.cpp with --parallel 1 serves ONE request at a time;
+                     # fanning out against it queues every lane past its timeout
+    personality: |
+      You are the house model. Be concise and concrete.
+
+  # ----------------------------------------------------------------- cli ----
+  # Subscription-backed assistants, driven in one-shot print mode.
+  #
+  # THIS IS A COST BOUNDARY, NOT A STYLE CHOICE. These are $0 only through their
+  # own OAuth session. Rewriting one as an `http` lane pointed at the vendor API
+  # silently moves it onto metered credits, which bill separately from the
+  # subscription. The tool scrubs ANTHROPIC_API_KEY / OPENAI_API_KEY and friends
+  # from the child environment for exactly this reason.
+  - name: Chair
+    active: false
+    vendor: anthropic
+    harness: cli
+    command: claude
+    args: ["-p"]
+    stdin: true      # this CLI reads the prompt from stdin — safest for long briefs
+    model: opus
+    personality: |
+      You chair the roundtable. Weigh the strongest case on each side and say
+      which one actually survives.
+
+  # Arg templates rather than hardcoded per-CLI logic: some CLIs take the prompt
+  # as an argument and consume the NEXT token as its value, so flags must come
+  # first. Encoding that here means a CLI change is a config edit, not a patch.
+  - name: Outsider
+    active: false
+    vendor: google
+    harness: cli
+    command: agy
+    args: ["--model", "some-model", "-p", "{prompt}"]
+    model: some-model
+    personality: |
+      You are the outsider. You have not seen this codebase before. Say what is
+      confusing on first read.
+
+  # ----------------------------------------------------------------- acp ----
+  # For agents that speak JSON-RPC over stdio and have no one-shot print mode.
+  # The tool does initialize -> session/new -> session/prompt -> kill, for one
+  # turn only. An ACP agent is a SERVER: it will sit there forever if allowed,
+  # so the process is created for the turn and killed with its process group at
+  # the end of it. Do not keep one warm between lanes.
+  - name: Protocol
+    active: false
+    vendor: example
+    harness: acp
+    command: /path/to/some-acp-binary
+    model: some-model
+    timeout: 180
+    # protocol_version: 1
+    personality: |
+      You are the protocol lane.
+
+  # ------------------------------------------------------------- disabled ----
+  # Keep a lane with active:false rather than deleting it, so the reason it is
+  # off does not get lost.
+  - name: Parked
+    active: false
+    vendor: example
+    harness: http
+    model: some-model
+    base_url: https://example.invalid/v1
+    notes: "parked 2026-08-25 — answers were incoherent; see lane quality notes"
