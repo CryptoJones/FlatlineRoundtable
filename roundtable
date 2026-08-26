@@ -1033,15 +1033,32 @@ def classify_mentions(text, lane_names):
 
 
 def compare_readings(readings, lane_names):
-    """Where the readers disagree about a lane's classification."""
+    """Where the readers genuinely disagree about a lane's classification.
+
+    Disjoint placements, not merely unequal ones. Readers differ in how liberally
+    they name lanes: one writes "all four land on the same core" and so names
+    every lane in every section, another describes the sections without
+    attribution and names lanes only under LONE CLAIMS. Comparing sets for
+    equality flags every lane on a panel the readers agreed about -- observed on
+    a live four-lane run where one reader's own summary was "no genuine
+    disagreement".
+
+    Overlap means they put the lane in at least one of the same buckets, which is
+    not a disagreement. A block that fires on an agreeing panel teaches the
+    reader to skip it, which is worse than not printing it.
+    """
     if len(readings) < 2:
         return []
     maps = [(r["by"], classify_mentions(r.get("text"), lane_names)) for r in readings]
     conflicts = []
     for name in lane_names:
         placements = {by: m.get(name) for by, m in maps}
-        distinct = {tuple(v) for v in placements.values() if v}
-        if len(distinct) > 1:
+        sets = [set(v) for v in placements.values() if v]
+        # Fewer than two readers placed it at all: nothing to disagree about.
+        if len(sets) < 2:
+            continue
+        common = set.intersection(*sets)
+        if not common:
             conflicts.append({"lane": name, "placements": placements})
     return conflicts
 

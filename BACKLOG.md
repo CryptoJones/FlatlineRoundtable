@@ -35,6 +35,11 @@ rest still need a human, and the env-scrub and orphan-kill checks especially.
 
 ## Done
 
+- [x] `THE READERS DISAGREE` fired when readers merely differed in how liberally
+      they named lanes, not in judgement — a conflict now requires disjoint
+      placements rather than unequal ones. Found on a live run whose own reader
+      reported "no genuine disagreement" while every lane was flagged.
+      ([#51](https://github.com/CryptoJones/FlatlineRoundtable/issues/51))
 - [x] An empty answer with `finish_reason: length` is a doomed retry, not a
       transient one — the model spent its whole budget on reasoning and will
       do it again. Fails once with an actionable message instead of billing
