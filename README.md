@@ -131,6 +131,19 @@ move the problem one level up. Set `synthesizers: 1` to go back to a single
 reader, or name a specific one with `synthesizer: <lane>`. It prefers free
 lanes, so the convenience does not quietly cost money.
 
+After a run, any lanes that turn out **not** to be independent are named:
+
+```
+  LANES THAT ARE NOT INDEPENDENT
+    Twin1, Twin2 — answered from claude / haiku
+    Agreement between these is an echo, not convergence.
+```
+
+Two lanes collide when a gateway served them the same model, or when they
+declare the same `lineage:`. It is never fatal — a deliberate duplicate is a
+legitimate thing to want — but it must not be silent, because it is invisible in
+the answers themselves and it falsifies the one claim the tool makes.
+
 Every run writes a transcript to
 `~/.local/share/flatline-roundtable/transcripts/`, because answers that exist
 only in a terminal scrollback are answers waiting to be lost.
