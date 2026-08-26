@@ -6,9 +6,12 @@ neither side drifts.
 
 ## Open
 
-- [ ] Per-vendor rate-limit awareness. `Retry-After` is honoured on 429, but a
-      wide fan-out can still trip a vendor's per-minute cap before any 429
-      arrives. ([#7](https://github.com/CryptoJones/FlatlineRoundtable/issues/7))
+- [ ] Per-vendor rate-limit awareness. A wide fan-out can trip a vendor's
+      per-minute cap before any 429 arrives; nothing paces requests per vendor.
+      (`Retry-After` handling itself was fixed in
+      [#11](https://github.com/CryptoJones/FlatlineRoundtable/issues/11) — this
+      item is only the proactive half.)
+      ([#7](https://github.com/CryptoJones/FlatlineRoundtable/issues/7))
 - [ ] `--diff` synthesis is one lane's reading, not a neutral one. Consider
       running it on two lanes and reporting where the *syntheses* differ. ([#8](https://github.com/CryptoJones/FlatlineRoundtable/issues/8))
 - [ ] The pre-flight estimate uses ~4 chars/token rather than a real tokenizer,
@@ -17,6 +20,8 @@ neither side drifts.
 ## Verification set
 
 Run before any PR. Most of these are behavioural and no test suite covers them.
+The first two items and the config-parse check now run in CI on every PR; the
+rest still need a human, and the env-scrub and orphan-kill checks especially.
 
 - [ ] `./roundtable --list` — correct route per lane, **zero network calls**.
 - [ ] Full run — **every active lane answers**, exit code `0`. Partial delivery
@@ -38,6 +43,10 @@ Run before any PR. Most of these are behavioural and no test suite covers them.
 
 ## Done
 
+- [x] Free-lane retry resilience — a 200 carrying an error body and an empty
+      answer are both retried instead of ending the lane, and `Retry-After` is
+      honoured to 90s rather than capped at 30s below the 60s window vendors
+      actually advertise. ([#11](https://github.com/CryptoJones/FlatlineRoundtable/issues/11))
 - [x] Wrap protocol-over-stdio agents so they can serve as lanes — new `acp`
       harness: initialize → session/new → session/prompt → process-group kill,
       one turn only. ([#2](https://github.com/CryptoJones/FlatlineRoundtable/issues/2))

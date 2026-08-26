@@ -1,0 +1,31 @@
+# Route-resolution fixture for CI's `--list` check. Deliberately fake: no
+# key_entry anywhere, so a lane that tried to dial out would fail on the missing
+# secret even before the dead proxy caught it.
+defaults:
+  max_tokens: 100
+concurrency: 2
+retries: 0
+
+lanes:
+  - name: ProbeHttp
+    active: true
+    vendor: openrouter
+    harness: http
+    model: some/model
+    base_url: https://openrouter.ai/api/v1
+
+  - name: ProbeCli
+    active: true
+    vendor: anthropic
+    harness: cli
+    command: claude
+    args: ["--model", "sonnet", "-p"]
+    stdin: true
+    model: sonnet
+
+  - name: ProbeInactive
+    active: false
+    vendor: openrouter
+    harness: http
+    model: other/model
+    base_url: https://openrouter.ai/api/v1
