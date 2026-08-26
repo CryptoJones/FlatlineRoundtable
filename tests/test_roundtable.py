@@ -866,6 +866,25 @@ class TestEndToEnd(unittest.TestCase):
         # Each vendor has its own slot 0, so nothing waits on anything else.
         self.assertLess(elapsed, 2.0)
 
+    def test_deadline_bounds_the_whole_run(self):
+        """#25: both checks sat before the semaphore acquire, so with one thread
+        per lane every one of them passed at t=0 and the deadline never applied
+        again. Five lanes behind a one-slot vendor ran serially, unbounded."""
+        d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d, True)
+        slow = write_exe(d / "slow", 'sleep 5; echo late\n')
+        lanes = [{"name": f"L{i}", "harness": "cli", "vendor": "single",
+                  "command": str(slow), "args": ["-p"], "stdin": True,
+                  "concurrency": 1, "timeout": 30}
+                 for i in range(4)]
+        t0 = time.monotonic()
+        r = self._run(lanes, extra_cfg={"deadline_seconds": 6})
+        elapsed = time.monotonic() - t0
+        # Serial at 5s each would be ~20s. The deadline has to cut it well short.
+        self.assertLess(elapsed, 14, "deadline did not bound the wall clock")
+        # And a run that could not deliver every lane must still fail.
+        self.assertEqual(r.returncode, 1)
+
     def test_budget_refuses_before_dispatch(self):
         with StubServer() as s:
             r = self._run(

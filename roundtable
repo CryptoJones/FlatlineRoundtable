@@ -729,14 +729,36 @@ def ask(lane, prompt, keys, retries, deadline, sems, lock, spent, prices, pacers
             # answer we have already decided not to wait for.
             if deadline and time.time() > deadline:
                 raise RuntimeError("global deadline passed while pacing")
-        with sem:
+        # Waiting for a vendor slot is unbounded without this, and both checks
+        # above have already passed by then -- which is how deadline_seconds
+        # came to bound nothing at all. Every thread reached them at t=0.
+        if sem is not None:
+            slot_wait = (deadline - time.time()) if deadline else None
+            if slot_wait is not None and slot_wait <= 0:
+                raise RuntimeError("global deadline passed before dispatch")
+            if not (sem.acquire(timeout=slot_wait) if slot_wait is not None
+                    else sem.acquire()):
+                raise RuntimeError("global deadline passed waiting for a vendor slot")
+        try:
+            # The lane's own timeout, further capped by whatever is left of the
+            # run. "whole-run wall clock" has to actually bound the wall clock,
+            # or it reads as a guarantee it does not give.
+            budget_s = lane.get("timeout", 300)
+            if deadline:
+                budget_s = min(budget_s, deadline - time.time())
+                if budget_s <= 0:
+                    raise RuntimeError("global deadline passed before dispatch")
+            bounded = {**lane, "timeout": budget_s}
             if lane["harness"] == "acp":
-                out = acp_lane(lane, prompt)
+                out = acp_lane(bounded, prompt)
             elif lane["harness"] == "cli":
-                out = cli_lane(lane, prompt)
+                out = cli_lane(bounded, prompt)
             else:
                 key = keys.get(lane["key_entry"]) if lane.get("key_entry") else None
-                out = http_lane(lane, prompt, key, retries)
+                out = http_lane(bounded, prompt, key, retries)
+        finally:
+            if sem is not None:
+                sem.release()
         result.update(out)
         if not result["answer"]:
             result["error"] = "empty answer"
