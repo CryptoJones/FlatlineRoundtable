@@ -364,6 +364,51 @@ class TestSynthesis(unittest.TestCase):
         self.assertEqual(got["Gamma"], ["SPLIT"])
         self.assertEqual(got["Delta"], ["LONE CLAIMS"])
 
+    def test_a_preamble_restating_the_headings_does_not_relocate_lanes(self):
+        """The regression from #18.
+
+        Anchoring on the first occurrence of each marker anywhere in the text
+        meant a reader that opened by restating its instructions put all three
+        markers in its preamble, and every lane fell into whichever section came
+        last. Models restating instructions is the common case.
+        """
+        body = ("AGREED\nAlpha and Beta agree.\n"
+                "SPLIT\nGamma dissents.\n"
+                "LONE CLAIMS\nDelta invented a number.")
+        pre = "I will report AGREED, SPLIT and LONE CLAIMS below.\n\n" + body
+        self.assertEqual(rt.classify_mentions(pre, ["Alpha", "Beta", "Gamma", "Delta"]),
+                         rt.classify_mentions(body, ["Alpha", "Beta", "Gamma", "Delta"]))
+
+    def test_a_preamble_does_not_manufacture_conflicts(self):
+        # The output this protects is THE READERS DISAGREE, which is trusted
+        # precisely because it is mechanical.
+        body = "AGREED\nAlpha\nSPLIT\nBeta\nLONE CLAIMS\nGamma"
+        pre = "Reporting AGREED, SPLIT and LONE CLAIMS.\n\n" + body
+        conflicts = rt.compare_readings(
+            [{"by": "R1", "text": pre}, {"by": "R2", "text": body}],
+            ["Alpha", "Beta", "Gamma"])
+        self.assertEqual(conflicts, [])
+
+    def test_lane_names_match_on_word_boundaries(self):
+        # `Chair` must not be claimed by the word "Chairman".
+        got = rt.classify_mentions(
+            "AGREED\nThe Chairman objected.\nSPLIT\nChair dissents.", ["Chair"])
+        self.assertEqual(got, {"Chair": ["SPLIT"]})
+
+    def test_headers_are_recognised_in_the_shapes_models_emit(self):
+        got = rt.classify_mentions(
+            "## 1. AGREED\nAlpha\n\n**SPLIT**\nBeta\n\n### 3) LONE CLAIMS\nGamma",
+            ["Alpha", "Beta", "Gamma"])
+        self.assertEqual(got, {"Alpha": ["AGREED"], "Beta": ["SPLIT"],
+                               "Gamma": ["LONE CLAIMS"]})
+
+    def test_a_heading_word_used_mid_sentence_is_not_a_header(self):
+        # "they agreed" / "the split" in prose must not open a section.
+        got = rt.classify_mentions(
+            "AGREED\nAlpha and Beta agreed, and the split was minor. Beta held.",
+            ["Alpha", "Beta"])
+        self.assertEqual(got, {"Alpha": ["AGREED"], "Beta": ["AGREED"]})
+
     def test_classify_mentions_survives_an_unstructured_reading(self):
         # A model that ignores the format must not crash the comparison.
         self.assertEqual(rt.classify_mentions("they all basically agree", ["Alpha"]), {})
