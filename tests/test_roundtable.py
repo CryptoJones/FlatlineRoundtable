@@ -455,6 +455,39 @@ class TestTokenCalibration(unittest.TestCase):
         self.assertLess(measured, naive)
 
 
+class TestVendorSemaphores(unittest.TestCase):
+    """#21: the cap must be the smallest in the group, not the first listed."""
+
+    def _slots(self, sem):
+        n = 0
+        while sem.acquire(blocking=False):
+            n += 1
+        return n
+
+    def test_the_strictest_lane_wins_regardless_of_order(self):
+        loose = {"name": "A", "vendor": "local"}                    # default 8
+        strict = {"name": "B", "vendor": "local", "concurrency": 1}
+        for roster in ([loose, strict], [strict, loose]):
+            sems = rt.build_semaphores(roster, 8)
+            self.assertEqual(self._slots(sems["local"]), 1,
+                             "a concurrency:1 lane must cap its whole vendor group")
+
+    def test_vendors_are_capped_independently(self):
+        sems = rt.build_semaphores(
+            [{"name": "A", "vendor": "local", "concurrency": 1},
+             {"name": "B", "vendor": "openrouter"}], 8)
+        self.assertEqual(self._slots(sems["local"]), 1)
+        self.assertEqual(self._slots(sems["openrouter"]), 8)
+
+    def test_a_lane_without_a_vendor_is_its_own_group(self):
+        sems = rt.build_semaphores([{"name": "Solo", "concurrency": 2}], 8)
+        self.assertEqual(self._slots(sems["Solo"]), 2)
+
+    def test_the_default_applies_when_no_lane_sets_one(self):
+        sems = rt.build_semaphores([{"name": "A", "vendor": "v"}], 3)
+        self.assertEqual(self._slots(sems["v"]), 3)
+
+
 class TestPacer(unittest.TestCase):
     """Proactive per-vendor pacing.
 

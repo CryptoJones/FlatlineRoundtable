@@ -379,6 +379,26 @@ class Pacer:
         return delay
 
 
+def build_semaphores(lanes: list[dict], default_cc: int) -> dict[str, threading.Semaphore]:
+    """One semaphore per vendor group, sized by the SMALLEST cap in the group.
+
+    A single-slot local llama.cpp will queue every concurrent request past its
+    own timeout if we fan out against it blindly, so the cap is load-bearing.
+
+    Smallest, not first: this used to be a `setdefault`, which took whichever
+    lane for that vendor appeared first in the YAML. A `concurrency: 1` lane
+    listed second was silently ignored and the group ran at the default --
+    reintroducing the exact failure the cap exists to prevent, decided by roster
+    order. build_pacers already resolves rpm by minimum; this agrees with it.
+    """
+    caps: dict[str, int] = {}
+    for l in lanes:
+        gid = l.get("vendor") or l["name"]
+        cc = int(l.get("concurrency", default_cc))
+        caps[gid] = min(caps.get(gid, cc), cc)
+    return {gid: threading.Semaphore(cc) for gid, cc in caps.items()}
+
+
 def build_pacers(lanes: list[dict]) -> dict[str, Pacer]:
     """One Pacer per vendor group, keyed the same way the semaphores are.
 
@@ -892,13 +912,7 @@ def main() -> int:
             f"  raise --max-spend, drop lanes with --lanes, or lower max_tokens"
         )
 
-    # Per-vendor caps: a single-slot local llama.cpp will queue every concurrent
-    # request past its own timeout if we fan out against it blindly.
-    default_cc = int(cfg.get("concurrency", 8))
-    sems: dict[str, threading.Semaphore] = {}
-    for l in lanes:
-        gid = l.get("vendor") or l["name"]
-        sems.setdefault(gid, threading.Semaphore(int(l.get("concurrency", default_cc))))
+    sems = build_semaphores(lanes, int(cfg.get("concurrency", 8)))
     # Concurrency bounds how many are in flight; rpm bounds how fast they start.
     pacers = build_pacers(lanes)
 
