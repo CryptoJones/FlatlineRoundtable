@@ -702,46 +702,142 @@ If they substantially agree, say so in one line rather than manufacturing a spli
 {answers}"""
 
 
-def synthesize(results, brief, cfg, lanes, keys, prices):
-    """Ask one lane to report where the others diverged (issue #6).
+SYNTH_SECTIONS = ("AGREED", "SPLIT", "LONE CLAIMS")
+
+
+def pick_synthesizers(lanes, want, n):
+    """Choose up to n readers, preferring free lanes from *different* vendors.
+
+    Vendor spread is the point: two readings from one lineage share the priors
+    that make a single reading untrustworthy, so they would agree for the same
+    reason rather than independently.
+    """
+    named = [l for l in lanes if l["name"] == want] if want else []
+    pool = [l for l in lanes if l["name"] != want]
+
+    def rank(l):
+        # cli rides a subscription; :free costs nothing; everything else bills.
+        return (0 if l["harness"] == "cli"
+                else 1 if str(l.get("model", "")).endswith(":free")
+                else 2)
+
+    chosen, used_vendors = list(named), {l.get("vendor") for l in named}
+    for lane in sorted(pool, key=rank):
+        if len(chosen) >= n:
+            break
+        if lane.get("vendor") in used_vendors:
+            continue
+        chosen.append(lane)
+        used_vendors.add(lane.get("vendor"))
+    # Only if vendor spread could not fill the quota, allow a repeat vendor --
+    # two readings still beat one, even correlated ones.
+    for lane in sorted(pool, key=rank):
+        if len(chosen) >= n:
+            break
+        if lane not in chosen:
+            chosen.append(lane)
+    return chosen[:n]
+
+
+def classify_mentions(text, lane_names):
+    """Which section of a reading each lane is named under.
+
+    Deliberately mechanical. Comparing two readings with a third model would
+    reintroduce exactly the problem this is meant to expose -- another single
+    model's priors deciding what counts as a difference.
+    """
+    if not text:
+        return {}
+    upper = text.upper()
+    marks = sorted(
+        ((upper.find(sec), sec) for sec in SYNTH_SECTIONS if upper.find(sec) >= 0)
+    )
+    if not marks:
+        return {}
+    bounds = []
+    for i, (pos, sec) in enumerate(marks):
+        end = marks[i + 1][0] if i + 1 < len(marks) else len(text)
+        bounds.append((sec, upper[pos:end]))
+    out = {}
+    for name in lane_names:
+        hits = {sec for sec, chunk in bounds if name.upper() in chunk}
+        if hits:
+            out[name] = sorted(hits)
+    return out
+
+
+def compare_readings(readings, lane_names):
+    """Where the readers disagree about a lane's classification."""
+    if len(readings) < 2:
+        return []
+    maps = [(r["by"], classify_mentions(r.get("text"), lane_names)) for r in readings]
+    conflicts = []
+    for name in lane_names:
+        placements = {by: m.get(name) for by, m in maps}
+        distinct = {tuple(v) for v in placements.values() if v}
+        if len(distinct) > 1:
+            conflicts.append({"lane": name, "placements": placements})
+    return conflicts
+
+
+def synthesize(results, brief, cfg, lanes, keys, prices, count=2):
+    """Ask N lanes to report where the others diverged (issues #6, #8).
 
     Reading N full answers does not scale, and disagreement is the actual
-    product. This is opt-in because it is NOT neutral: the synthesizer is itself
+    product. This is opt-in because it is NOT neutral: a synthesizer is itself
     one model with its own priors deciding what counts as a disagreement. It is
     a reading aid, not a verdict -- which is why the raw answers are still
     written to the transcript.
 
-    Prefers a free lane so the convenience does not quietly cost money.
+    Two readers rather than one, because a single reading hides its own bias:
+    with one you cannot tell a real split from that model's taste in splits.
+    Where two independent readers place the same lane differently, the reading
+    is doing the work rather than the evidence. That comparison is mechanical on
+    purpose -- handing it to a third model would just move the problem.
+
+    Prefers free lanes so the convenience does not quietly cost money.
     """
     answered = [r for r in results if r.get("answer")]
     if len(answered) < 2:
         return None, "need at least 2 answers to compare"
 
-    want = cfg.get("synthesizer")
-    pool = [l for l in lanes if l["name"] != want] if want else lanes
-    chosen = next((l for l in lanes if l["name"] == want), None)
-    if chosen is None:
-        # free lanes first: cli (subscription) then :free models
-        chosen = next((l for l in pool if l["harness"] == "cli"), None) \
-              or next((l for l in pool if str(l.get("model", "")).endswith(":free")), None) \
-              or (pool[0] if pool else None)
-    if chosen is None:
+    chosen = pick_synthesizers(lanes, cfg.get("synthesizer"), max(1, int(count)))
+    if not chosen:
         return None, "no lane available to synthesize"
 
     body = "\n\n".join(f"### {r['lane']} ({r['model'] or r['harness']})\n{r['answer']}"
                         for r in answered)
     ask_text = SYNTH_PROMPT.format(n=len(answered), brief=brief.strip()[:4000], answers=body)
-    synth_lane = {**chosen, "max_tokens": max(int(chosen.get("max_tokens", 2000)), 1500),
-                  "personality": None}
-    try:
+
+    def read(lane):
+        synth_lane = {**lane, "max_tokens": max(int(lane.get("max_tokens", 2000)), 1500),
+                      "personality": None}
         if synth_lane["harness"] == "cli":
             out = cli_lane(synth_lane, ask_text)
+        elif synth_lane["harness"] == "acp":
+            out = acp_lane(synth_lane, ask_text)
         else:
             key = keys.get(synth_lane["key_entry"]) if synth_lane.get("key_entry") else None
             out = http_lane(synth_lane, ask_text, key, 1)
-        return {"by": chosen["name"], "text": out["answer"]}, None
-    except Exception as e:
-        return None, f"synthesis failed ({chosen['name']}): {e}"
+        return {"by": lane["name"], "text": out["answer"]}
+
+    readings, errors = [], []
+    with cf.ThreadPoolExecutor(max_workers=len(chosen)) as pool:
+        for lane, fut in [(l, pool.submit(read, l)) for l in chosen]:
+            try:
+                readings.append(fut.result())
+            except Exception as e:
+                errors.append(f"{lane['name']}: {e}")
+
+    if not readings:
+        return None, f"synthesis failed ({'; '.join(errors)})"
+
+    names = [r["lane"] for r in answered]
+    return {
+        "readings": readings,
+        "conflicts": compare_readings(readings, names),
+        "errors": errors,
+    }, None
 
 
 def main() -> int:
@@ -823,7 +919,8 @@ def main() -> int:
 
     synth = None
     if a.diff:
-        synth, synth_err = synthesize(results, prompt, cfg, lanes, keys, prices)
+        synth, synth_err = synthesize(results, prompt, cfg, lanes, keys, prices,
+                                      count=int(cfg.get("synthesizers", 2)))
 
     if not a.no_transcript:
         TRANSCRIPT_DIR.mkdir(parents=True, exist_ok=True)
@@ -836,9 +933,28 @@ def main() -> int:
         print(json.dumps({"results": results, "synthesis": synth} if a.diff else results, indent=2))
     elif a.diff:
         if synth:
-            print(f"\n{'=' * 74}\nWHERE THEY DIVERGE  (read by {synth['by']})\n{'=' * 74}")
-            print(synth["text"])
-            print(f"\n  -- one lane's reading of the others, not a verdict."
+            for r in synth["readings"]:
+                print(f"\n{'=' * 74}\nWHERE THEY DIVERGE  (read by {r['by']})\n{'=' * 74}")
+                print(r["text"])
+            # Two readers exist so the reading's own bias is visible. Where they
+            # place the same lane differently, that is the synthesizer talking,
+            # not the panel -- go read that lane's raw answer.
+            if synth["conflicts"]:
+                print(f"\n{'=' * 74}\nTHE READERS DISAGREE\n{'=' * 74}")
+                for c in synth["conflicts"]:
+                    where = "  ".join(
+                        f"{by}={'/'.join(sec) if sec else 'unmentioned'}"
+                        for by, sec in c["placements"].items()
+                    )
+                    print(f"  {c['lane']:<18} {where}")
+                print("\n  These are classification disputes between the readers, not\n"
+                      "  findings. Read those lanes' raw answers in the transcript.")
+            elif len(synth["readings"]) > 1:
+                print(f"\n  Both readers classified every lane the same way.")
+            for e in synth.get("errors") or []:
+                print(f"\n  !! reader failed — {e}", file=sys.stderr)
+            n = len(synth["readings"])
+            print(f"\n  -- {n} lane{'s' if n != 1 else ''} reading the others, not a verdict."
                   f" raw answers in the transcript.")
         else:
             print(f"\n  !! {synth_err}", file=sys.stderr)

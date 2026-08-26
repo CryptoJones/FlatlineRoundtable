@@ -16,8 +16,14 @@ concurrency: 8          # global default; lanes may lower it
 retries: 1              # transient 5xx / 429 / connection errors only
                         # (never timeouts -- the call may already have billed)
 deadline_seconds: 600   # whole-run wall clock
-# synthesizer: Chair    # lane used by --diff to report where the others split;
-                        # defaults to a free lane so the convenience is free
+# synthesizer: Chair    # pin one lane as a --diff reader; otherwise free lanes
+                        # are preferred so the convenience is free
+# synthesizers: 2       # how many independent readers --diff uses (default 2).
+                        # Two readings from different vendors make the reading's
+                        # own bias visible: where they classify a lane
+                        # differently, that is the synthesizer talking rather
+                        # than the panel. Set to 1 for the old single-reader
+                        # behaviour.
 # budget_usd: 0.50      # refuse to finish over this (needs price_per_mtok on metered lanes)
                         # The pre-flight estimate calibrates itself: every http
                         # response reports usage.prompt_tokens for a prompt whose
