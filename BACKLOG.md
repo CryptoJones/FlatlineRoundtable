@@ -6,6 +6,12 @@ neither side drifts.
 
 ## Open
 
+- [ ] The stub server in the test suite is hand-written, so its response *shape*
+      can drift from what vendors actually return without CI noticing. Add
+      golden fixtures captured from real responses, and optionally a
+      `workflow_dispatch`-only live smoke job. A heavier emulator (LocalAI,
+      Ollama) was considered and rejected: they serve *correct* responses, while
+      the value here is in the malformed ones. ([#13](https://github.com/CryptoJones/FlatlineRoundtable/issues/13))
 
 ## Verification set
 
