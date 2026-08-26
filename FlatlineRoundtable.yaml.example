@@ -82,6 +82,17 @@ lanes:
     personality: |
       You are the house model. Be concise and concrete.
 
+  # scrub_env: [WEIRD_VENDOR_TOKEN]   # any cli/acp lane may name EXTRA variables
+                                      # to strip from the child. The built-in
+                                      # list and its patterns (*_API_KEY,
+                                      # *_AUTH_TOKEN, *_BASE_URL,
+                                      # CLAUDE_CODE_USE_*) already cover the
+                                      # common shapes; this is for a vendor CLI
+                                      # whose billing switch looks like none of
+                                      # them. Over-scrubbing fails a lane
+                                      # loudly; under-scrubbing costs money
+                                      # silently.
+
   # ----------------------------------------------------------------- cli ----
   # Subscription-backed assistants, driven in one-shot print mode.
   #
