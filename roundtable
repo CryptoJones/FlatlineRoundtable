@@ -37,6 +37,7 @@ import re
 import shutil
 import signal
 import subprocess
+import tempfile
 import sys
 import threading
 import time
@@ -749,10 +750,25 @@ def acp_lane(lane: dict, prompt: str) -> dict:
     session across lanes or keeping the process warm.
     """
     env = child_env(lane)
+    # An empty directory, not the caller's cwd.
+    #
+    # ACP agents are overwhelmingly coding agents with their own filesystem
+    # tools. clientCapabilities.fs below declares what *this client* offers; it
+    # does not disable theirs, and mcpServers: [] only means "no extra servers".
+    # Handing over os.getcwd() therefore contradicted "lanes have no tools and
+    # no file access" -- and worse for the panel, it let one lane see context
+    # the others could not, which is the independence claim quietly breaking.
+    workdir = tempfile.mkdtemp(prefix="roundtable-acp-")
     proc = subprocess.Popen(
         [lane["command"], *(lane.get("args") or [])],
-        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        text=True, bufsize=1, env=env, start_new_session=True,
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        # NOT a PIPE. Nothing reads stderr, so a chatty agent fills the buffer,
+        # blocks on write, and the lane dies at "timed out waiting for
+        # session/prompt" -- pointing the diagnosis at the protocol rather than
+        # at a full pipe. cli_lane escapes this only because communicate()
+        # pumps both streams.
+        stderr=subprocess.DEVNULL,
+        text=True, bufsize=1, env=env, cwd=workdir, start_new_session=True,
     )
     lk, replies, chunks = threading.Lock(), {}, []
 
@@ -795,7 +811,7 @@ def acp_lane(lane: dict, prompt: str) -> dict:
         call(0, "initialize", {"protocolVersion": lane.get("protocol_version", 1),
                                "clientCapabilities": {"fs": {"readTextFile": False,
                                                              "writeTextFile": False}}})
-        r = call(1, "session/new", {"cwd": os.getcwd(), "mcpServers": []})
+        r = call(1, "session/new", {"cwd": workdir, "mcpServers": []})
         sid = (r.get("result") or {}).get("sessionId")
         if not sid:
             raise RuntimeError(f"session/new returned no sessionId: {str(r)[:150]}")
@@ -818,6 +834,14 @@ def acp_lane(lane: dict, prompt: str) -> dict:
             os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
         except (ProcessLookupError, PermissionError, OSError):
             pass
+        # killpg only signals. Without a wait the child stays a zombie in the
+        # process table for the life of the run -- one per acp lane. cli_lane
+        # already reaps; this now matches it.
+        try:
+            proc.wait(timeout=10)
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+        shutil.rmtree(workdir, ignore_errors=True)
 
 
 def ask(lane, prompt, keys, retries, deadline, sems, lock, spent, prices, pacers=None):

@@ -1012,6 +1012,71 @@ class TestGoldenResponses(unittest.TestCase):
                 self.assertIn("raise max_tokens", str(e.exception))
 
 
+class TestAcpLane(unittest.TestCase):
+    """#24. The acp harness had no test at all, which is how three defects lived
+    in one function: it handed the agent the caller's cwd, held stderr in a pipe
+    nothing drained, and never reaped the process it killed."""
+
+    AGENT = """            __EXTRA__
+            while IFS= read -r line; do
+              case "$line" in
+                *initialize*)
+                    echo '{"jsonrpc":"2.0","id":0,"result":{}}' ;;
+                *session/new*)
+                    echo '{"jsonrpc":"2.0","id":1,"result":{"sessionId":"s1"}}'
+                    pwd > "$RT_CWD_FILE" ;;
+                *session/prompt*)
+                    echo '{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"text":"hello from acp"}}}}'
+                    echo '{"jsonrpc":"2.0","id":2,"result":{"stopReason":"end_turn"}}' ;;
+              esac
+            done"""
+
+    def _agent(self, extra=""):
+        d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d, True)
+        self.cwd_file = d / "cwd.txt"
+        os.environ["RT_CWD_FILE"] = str(self.cwd_file)
+        self.addCleanup(os.environ.pop, "RT_CWD_FILE", None)
+        return write_exe(d / "agent", self.AGENT.replace("__EXTRA__", extra))
+
+    def test_answers_one_turn(self):
+        out = rt.acp_lane({"command": str(self._agent()), "args": [], "timeout": 20}, "hi")
+        self.assertEqual(out["answer"], "hello from acp")
+        self.assertEqual(out["finish_reason"], "stop")
+
+    def test_the_agent_does_not_get_the_callers_cwd(self):
+        """A lane must not see context the others cannot -- that is the
+        independence claim breaking quietly."""
+        exe = self._agent()
+        rt.acp_lane({"command": str(exe), "args": [], "timeout": 20}, "hi")
+        got = Path(self.cwd_file).read_text().strip()
+        self.assertNotEqual(Path(got).resolve(), Path(os.getcwd()).resolve())
+        self.assertIn("roundtable-acp-", got)
+
+    def test_a_noisy_agent_does_not_deadlock_on_stderr(self):
+        """stderr in an undrained PIPE fills, blocks the writer, and the lane
+        'times out' for a reason nothing reports."""
+        noisy = 'for i in $(seq 1 5000); do echo "chatter $i chatter $i chatter" >&2; done'
+        out = rt.acp_lane(
+            {"command": str(self._agent(extra=noisy)), "args": [], "timeout": 30}, "hi")
+        self.assertEqual(out["answer"], "hello from acp")
+
+    def test_the_process_is_reaped_not_left_a_zombie(self):
+        exe = self._agent()
+        rt.acp_lane({"command": str(exe), "args": [], "timeout": 20}, "hi")
+        stat = subprocess.run(["ps", "-eo", "stat,command"],
+                              capture_output=True, text=True).stdout
+        leftover = [l for l in stat.splitlines()
+                    if str(exe) in l and l.split()[0].startswith("Z")]
+        self.assertEqual(leftover, [], f"zombie left behind: {leftover}")
+
+    def test_the_temp_workdir_is_cleaned_up(self):
+        exe = self._agent()
+        rt.acp_lane({"command": str(exe), "args": [], "timeout": 20}, "hi")
+        used = Path(Path(self.cwd_file).read_text().strip())
+        self.assertFalse(used.exists(), "acp workdir outlived the lane")
+
+
 class TestSecrets(unittest.TestCase):
     def _fake_pass(self, body):
         """Put a stub `pass` first on PATH.
