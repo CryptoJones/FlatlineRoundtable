@@ -866,6 +866,19 @@ class TestEndToEnd(unittest.TestCase):
         # Each vendor has its own slot 0, so nothing waits on anything else.
         self.assertLess(elapsed, 2.0)
 
+    def test_a_lane_whose_vendor_has_no_semaphore_still_runs(self):
+        """Regression: two green PRs collided here.
+
+        The missing-vendor fallback was a nullcontext, then `with sem:` became an
+        explicit acquire/release -- which nullcontext does not have. Each change
+        was correct alone; together they broke every synthesis reader."""
+        with StubServer() as s:
+            out = rt.ask({"name": "A", "harness": "http", "model": "m",
+                          "base_url": s.url, "timeout": 10, "vendor": "unlisted"},
+                         "hi", {}, 0, None, {}, threading.Lock(), [0.0], (0.0, 0.0))
+        self.assertEqual(out["answer"], "stub answer")
+        self.assertIsNone(out["error"])
+
     def test_deadline_bounds_the_whole_run(self):
         """#25: both checks sat before the semaphore acquire, so with one thread
         per lane every one of them passed at t=0 and the deadline never applied

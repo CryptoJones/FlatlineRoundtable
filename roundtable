@@ -29,7 +29,6 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures as cf
-import contextlib
 import datetime as dt
 import json
 import os
@@ -715,9 +714,12 @@ def ask(lane, prompt, keys, retries, deadline, sems, lock, spent, prices, pacers
         "error": None,
         "finish_reason": None,
     }
-    # A vendor with no configured semaphore must not crash the lane: `with None`
-    # raises, and ask() is now called from synthesize() as well as the fan-out.
-    sem = sems.get(lane.get("vendor") or lane["name"]) or contextlib.nullcontext()
+    # A vendor with no configured semaphore must not crash the lane -- ask() is
+    # called from synthesize() as well as the fan-out, and a reader's vendor may
+    # not be in `sems`. This was a nullcontext until the deadline work replaced
+    # `with sem:` by an explicit acquire/release, which nullcontext does not
+    # have. None is the honest value, and every use below already guards for it.
+    sem = sems.get(lane.get("vendor") or lane["name"])
     try:
         if deadline and time.time() > deadline:
             raise RuntimeError("global deadline passed before dispatch")
