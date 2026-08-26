@@ -1,0 +1,54 @@
+{
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "logprobs": null,
+      "message": {
+        "content": null,
+        "reasoning": "The user asks: \"Reply with exactly: OK\". So we must output exactly the string \"OK\". No extra punctuation, spaces, or newline? It says exactly: OK. Likely they want just the word OK. We must comply. There's no policy violation. So respond with \"OK\".",
+        "reasoning_details": [
+          {
+            "format": "unknown",
+            "index": 0,
+            "text": "The user asks: \"Reply with exactly: OK\". So we must output exactly the string \"OK\". No extra punctuation, spaces, or newline? It says exactly: OK. Likely they want just the word OK. We must comply. There's no policy violation. So respond with \"OK\".",
+            "type": "reasoning.text"
+          }
+        ],
+        "refusal": null,
+        "role": "assistant"
+      },
+      "native_finish_reason": "max_tokens"
+    }
+  ],
+  "created": 0,
+  "id": "<redacted-id>",
+  "model": "cohere/north-mini-code:free",
+  "object": "chat.completion",
+  "provider": "Cohere",
+  "service_tier": null,
+  "system_fingerprint": "<redacted-system_fingerprint>",
+  "usage": {
+    "completion_tokens": 59,
+    "completion_tokens_details": {
+      "audio_tokens": 0,
+      "image_tokens": 0,
+      "reasoning_tokens": 62
+    },
+    "cost": 0,
+    "cost_details": {
+      "upstream_inference_completions_cost": 0,
+      "upstream_inference_cost": 0,
+      "upstream_inference_prompt_cost": 0
+    },
+    "is_byok": false,
+    "prompt_tokens": 5,
+    "prompt_tokens_details": {
+      "audio_tokens": 0,
+      "cache_write_tokens": 0,
+      "cached_tokens": 0,
+      "video_tokens": 0
+    },
+    "total_tokens": 64
+  }
+}
