@@ -848,11 +848,19 @@ class TestGoldenResponses(unittest.TestCase):
         self.assertGreaterEqual(len(self.FIXTURES), 5,
                                 "golden fixtures missing -- run scripts/capture-fixtures.py")
 
+    @staticmethod
+    def _spent_its_budget(data):
+        ch = data["choices"][0]
+        return (ch["finish_reason"] == "length"
+                and not (ch["message"].get("content") or "").strip())
+
     def test_every_fixture_parses_into_a_lane_result(self):
         for f in self.FIXTURES:
+            payload = f.read_text()
+            data = json.loads(payload)
+            if self._spent_its_budget(data):
+                continue          # covered by the budget-exhausted test below
             with self.subTest(fixture=f.name):
-                payload = f.read_text()
-                data = json.loads(payload)
                 url = self._serve(payload)
                 out = rt.http_lane(
                     {"model": data["model"], "base_url": url, "timeout": 10}, "hi", None, 0)
@@ -890,19 +898,19 @@ class TestGoldenResponses(unittest.TestCase):
         content -- the whole token budget went to `reasoning`. That must read as
         a failed lane, not a silent empty answer."""
         spent = [f for f in self.FIXTURES
-                 if (lambda d: d["choices"][0]["finish_reason"] == "length"
-                     and not (d["choices"][0]["message"].get("content") or "").strip())
-                    (json.loads(f.read_text()))]
+                 if self._spent_its_budget(json.loads(f.read_text()))]
         self.assertTrue(spent, "expected at least one budget-exhausted fixture")
         for f in spent:
             with self.subTest(fixture=f.name):
                 payload = f.read_text()
                 url = self._serve(payload)
-                out = rt.http_lane(
-                    {"model": json.loads(payload)["model"], "base_url": url,
-                     "timeout": 10}, "hi", None, 0)
-                self.assertEqual(out["answer"], "")
-                self.assertEqual(out["finish_reason"], "length")
+                # Not an empty answer to be retried -- a deterministic budget
+                # failure that names its own fix. Retrying it is `retries` more
+                # billed calls, every one certain to fail the same way.
+                with self.assertRaises(RuntimeError) as e:
+                    rt.http_lane({"model": json.loads(payload)["model"],
+                                  "base_url": url, "timeout": 10}, "hi", None, 3)
+                self.assertIn("raise max_tokens", str(e.exception))
 
 
 class TestSecrets(unittest.TestCase):
