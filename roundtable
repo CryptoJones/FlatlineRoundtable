@@ -608,27 +608,34 @@ def http_lane(lane: dict, prompt: str, key: str | None, retries: int) -> dict:
             choice = data["choices"][0]
             answer = (choice["message"].get("content") or "").strip()
             finish = choice.get("finish_reason")
-            # An empty body with finish_reason "length" is not transient. The
-            # model spent its whole budget on `reasoning` and never reached the
-            # answer, and it will do exactly that again -- measured on live
-            # captures from two vendors, both emitting zero content after 60
-            # tokens. Retrying is `retries` more billed calls, every one of them
-            # certain to fail, and it buries the real fix.
-            if not answer and finish == "length":
-                raise RuntimeError(
-                    "no answer — the whole token budget went to reasoning; "
-                    "raise max_tokens for this lane"
-                )
-            # An empty body otherwise IS worth another attempt: free endpoints
-            # return it under load (measured: 1 call in 6 on one provider, 1
-            # completion token, finish_reason "stop"). The dead call billed its
-            # prompt only, so a retry is far cheaper than losing the lane. It IS
-            # a second charge on a metered lane, so it stays bounded by `retries`
-            # exactly like every other path here.
+            # An empty body is worth another attempt, whatever the finish
+            # reason. Free endpoints return one under load (measured: 1 call in 6
+            # on one provider, 1 completion token, finish_reason "stop"), and a
+            # reasoning model returns one when that run's thinking overshot the
+            # budget before it reached any answer.
+            #
+            # That second case was briefly treated as deterministic and not
+            # retried at all. It is not: reasoning usage is a distribution, not a
+            # constant. The same lane, same brief, same max_tokens came back
+            # empty 5 times in 10, reasoning ranging 167-353 within those ten
+            # runs -- and 28-4126 across longer ones. A retry is another draw,
+            # and at the margin it wins about half the time. Refusing to retry
+            # threw away a recovery that works.
+            #
+            # It IS a second charge on a metered lane, so it stays bounded by
+            # `retries` exactly like every other path here.
             if not answer and attempt < retries:
                 attempt += 1
                 time.sleep(RETRY_BACKOFF * attempt)
                 continue
+            # Out of attempts. Name which failure this was: "empty answer" points
+            # at the vendor, when the number the operator can actually change is
+            # max_tokens.
+            if not answer and finish == "length":
+                raise RuntimeError(
+                    "no answer — every attempt spent its whole token budget on "
+                    "reasoning; raise max_tokens for this lane"
+                )
             return {
                 "answer": answer,
                 "finish_reason": finish,

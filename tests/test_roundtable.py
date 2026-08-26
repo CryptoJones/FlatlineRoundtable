@@ -65,6 +65,18 @@ class StubHandler(BaseHTTPRequestHandler):
         if model == "empty":
             self._send(200, {"choices": [{"message": {"content": ""}, "finish_reason": "stop"}]})
             return
+        if model == "reasoned_away_once":
+            self.server.hits[model] = self.server.hits.get(model, 0) + 1
+            if self.server.hits[model] == 1:
+                self._send(200, {
+                    "choices": [{"message": {"content": "", "reasoning": "thinking..."},
+                                 "finish_reason": "length"}],
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 60},
+                })
+                return
+            self._send(200, {"choices": [{"message": {"content": "recovered"},
+                                          "finish_reason": "stop"}]})
+            return
         if model == "reasoned_away":
             # Captured live from two vendors: the whole budget went to
             # `reasoning` and no content was ever emitted.
@@ -298,19 +310,39 @@ class TestFreeLaneResilience(unittest.TestCase):
                     {"model": "always_error_body", "base_url": s.url, "timeout": 10}, "hi", None, 1)
             self.assertEqual(s.srv.hits["always_error_body"], 2)
 
-    def test_a_reasoning_budget_failure_is_not_retried(self):
-        """#46: empty + finish_reason=length is deterministic, not transient.
+    def test_a_reasoning_overshoot_is_retried(self):
+        """#53, correcting #46.
 
-        The model will spend the same budget on reasoning every time, so with
-        retries: 3 that is four billed calls all certain to fail."""
+        #46 assumed this shape was deterministic and skipped its retry. It is
+        not: reasoning usage is a distribution. The same lane, same brief, same
+        max_tokens came back empty 5 times in 10, so a retry is another draw and
+        wins about half the time at the margin."""
+        self._no_sleep()
+        with StubServer() as s:
+            with self.assertRaises(RuntimeError):
+                rt.http_lane({"model": "reasoned_away", "base_url": s.url,
+                              "timeout": 10}, "hi", None, 3)
+            self.assertEqual(s.srv.hits["reasoned_away"], 4,
+                             "an overshoot must get its retries like any empty answer")
+
+    def test_a_reasoning_overshoot_recovers_when_a_later_draw_fits(self):
+        """The whole point: the next draw often does fit."""
+        self._no_sleep()
+        with StubServer() as s:
+            out = rt.http_lane({"model": "reasoned_away_once", "base_url": s.url,
+                                "timeout": 10}, "hi", None, 2)
+            self.assertEqual(out["answer"], "recovered")
+            self.assertEqual(s.srv.hits["reasoned_away_once"], 2)
+
+    def test_an_exhausted_overshoot_names_max_tokens(self):
+        """What #46 got right and this keeps: "empty answer" points at the
+        vendor; max_tokens is the number the operator can actually change."""
         self._no_sleep()
         with StubServer() as s:
             with self.assertRaises(RuntimeError) as e:
                 rt.http_lane({"model": "reasoned_away", "base_url": s.url,
-                              "timeout": 10}, "hi", None, 3)
+                              "timeout": 10}, "hi", None, 1)
             self.assertIn("raise max_tokens", str(e.exception))
-            self.assertEqual(s.srv.hits["reasoned_away"], 1,
-                             "a doomed retry must not be attempted at all")
 
     def test_empty_answer_is_retried(self):
         self._no_sleep()
