@@ -550,19 +550,31 @@ def http_lane(lane: dict, prompt: str, key: str | None, retries: int) -> dict:
                 raise RuntimeError(str(data["error"])[:300])
             choice = data["choices"][0]
             answer = (choice["message"].get("content") or "").strip()
-            # An empty body is a lane that delivered nothing, which fails the whole
-            # run -- and free endpoints return it under load (measured: 1 call in 6
-            # on one provider, 1 completion token, finish_reason "stop"). The dead
-            # call billed its prompt only, so a retry is far cheaper than losing
-            # the lane. It IS a second charge on a metered lane, so it is bounded
-            # by `retries` exactly like every other path here.
+            finish = choice.get("finish_reason")
+            # An empty body with finish_reason "length" is not transient. The
+            # model spent its whole budget on `reasoning` and never reached the
+            # answer, and it will do exactly that again -- measured on live
+            # captures from two vendors, both emitting zero content after 60
+            # tokens. Retrying is `retries` more billed calls, every one of them
+            # certain to fail, and it buries the real fix.
+            if not answer and finish == "length":
+                raise RuntimeError(
+                    "no answer — the whole token budget went to reasoning; "
+                    "raise max_tokens for this lane"
+                )
+            # An empty body otherwise IS worth another attempt: free endpoints
+            # return it under load (measured: 1 call in 6 on one provider, 1
+            # completion token, finish_reason "stop"). The dead call billed its
+            # prompt only, so a retry is far cheaper than losing the lane. It IS
+            # a second charge on a metered lane, so it stays bounded by `retries`
+            # exactly like every other path here.
             if not answer and attempt < retries:
                 attempt += 1
                 time.sleep(RETRY_BACKOFF * attempt)
                 continue
             return {
                 "answer": answer,
-                "finish_reason": choice.get("finish_reason"),
+                "finish_reason": finish,
                 "served_by": data.get("provider"),
                 "usage": data.get("usage"),
             }

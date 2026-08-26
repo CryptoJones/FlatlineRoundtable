@@ -65,6 +65,17 @@ class StubHandler(BaseHTTPRequestHandler):
         if model == "empty":
             self._send(200, {"choices": [{"message": {"content": ""}, "finish_reason": "stop"}]})
             return
+        if model == "reasoned_away":
+            # Captured live from two vendors: the whole budget went to
+            # `reasoning` and no content was ever emitted.
+            self.server.hits[model] = self.server.hits.get(model, 0) + 1
+            self._send(200, {
+                "choices": [{"message": {"content": "", "reasoning": "thinking..."},
+                             "finish_reason": "length"}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 60,
+                          "completion_tokens_details": {"reasoning_tokens": 60}},
+            })
+            return
         # Behaviours below count attempts so a retry can be observed directly.
         self.server.hits[model] = self.server.hits.get(model, 0) + 1
         if model == "always_error_body":
@@ -281,6 +292,20 @@ class TestFreeLaneResilience(unittest.TestCase):
                 rt.http_lane(
                     {"model": "always_error_body", "base_url": s.url, "timeout": 10}, "hi", None, 1)
             self.assertEqual(s.srv.hits["always_error_body"], 2)
+
+    def test_a_reasoning_budget_failure_is_not_retried(self):
+        """#46: empty + finish_reason=length is deterministic, not transient.
+
+        The model will spend the same budget on reasoning every time, so with
+        retries: 3 that is four billed calls all certain to fail."""
+        self._no_sleep()
+        with StubServer() as s:
+            with self.assertRaises(RuntimeError) as e:
+                rt.http_lane({"model": "reasoned_away", "base_url": s.url,
+                              "timeout": 10}, "hi", None, 3)
+            self.assertIn("raise max_tokens", str(e.exception))
+            self.assertEqual(s.srv.hits["reasoned_away"], 1,
+                             "a doomed retry must not be attempted at all")
 
     def test_empty_answer_is_retried(self):
         self._no_sleep()
