@@ -13,7 +13,8 @@ defaults:
   temperature: 0.7
 
 concurrency: 8          # global default; lanes may lower it
-retries: 1              # transient 5xx / connection errors only
+retries: 1              # transient 5xx / 429 / connection errors only
+                        # (never timeouts -- the call may already have billed)
 deadline_seconds: 600   # whole-run wall clock
 # synthesizer: Chair    # lane used by --diff to report where the others split;
                         # defaults to a free lane so the convenience is free
@@ -21,8 +22,9 @@ deadline_seconds: 600   # whole-run wall clock
 
 lanes:
   # ---------------------------------------------------------------- http ----
-  # Any OpenAI-compatible endpoint. `vendor` is a human label used for grouping
-  # and per-vendor concurrency; routing depends on harness + base_url, not on it.
+  # Any OpenAI-compatible endpoint. `vendor` is a human label used for grouping,
+  # per-vendor concurrency and per-vendor rate limiting; routing depends on
+  # harness + base_url, not on it.
   - name: Skeptic
     active: true
     vendor: openrouter
@@ -58,6 +60,14 @@ lanes:
     timeout: 180
     concurrency: 1   # llama.cpp with --parallel 1 serves ONE request at a time;
                      # fanning out against it queues every lane past its timeout
+    # rpm: 20        # optional: cap how fast this vendor's lanes may START.
+                     # `concurrency` bounds how many run at once, which is a
+                     # different quantity -- at concurrency 1 a fast endpoint
+                     # still receives a burst, because each request frees the
+                     # slot the instant it finishes. rpm spaces the starts, so a
+                     # per-minute cap is not tripped before any 429 arrives to
+                     # warn you. Shared per vendor; if lanes disagree, the
+                     # smallest wins, since the limit belongs to the vendor.
     personality: |
       You are the house model. Be concise and concrete.
 
