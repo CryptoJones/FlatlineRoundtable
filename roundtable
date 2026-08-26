@@ -32,6 +32,7 @@ import concurrent.futures as cf
 import datetime as dt
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -99,14 +100,58 @@ RETRY_BACKOFF = 3
 # a paid one, with no error and no visible difference in the output.
 #
 # The same shape applies to the other vendors' CLIs.
+#
+# An API key is NOT the only way a subscription lane becomes metered, which is
+# why the patterns below exist alongside this list. CLAUDE_CODE_USE_BEDROCK and
+# CLAUDE_CODE_USE_VERTEX route `claude` to AWS/GCP metered billing using ambient
+# cloud credentials, with no API key involved at all -- a key-only denylist does
+# nothing about them. A *_BASE_URL points the CLI at an arbitrary proxy.
 SCRUB_ENV = (
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_BASE_URL",
     "OPENAI_API_KEY",
     "OPENAI_BASE_URL",
     "GEMINI_API_KEY",
     "GOOGLE_API_KEY",
+    "GOOGLE_GENAI_USE_VERTEXAI",
+    "GOOGLE_CLOUD_PROJECT",
+    "GOOGLE_CLOUD_LOCATION",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
 )
+
+# An explicit list goes stale the moment a vendor adds a billing route, and the
+# roster already spans vendors whose variables are not named here at all. These
+# catch the shapes rather than the names.
+#
+# Over-scrubbing makes a lane fail loudly; under-scrubbing costs money silently.
+# In this tool that trade is not close, so the patterns are deliberately broad.
+SCRUB_ENV_PATTERNS = (
+    re.compile(r"_API_KEY$"),
+    re.compile(r"_AUTH_TOKEN$"),
+    re.compile(r"_BASE_URL$"),
+    re.compile(r"^CLAUDE_CODE_USE_"),
+)
+
+
+def child_env(lane: dict) -> dict:
+    """The environment a subprocess lane runs in.
+
+    Shared by the cli and acp harnesses -- they carried byte-identical copies of
+    this, which is one more place for the two to drift apart on a rule where
+    drifting costs money.
+
+    A lane may name extra variables via `scrub_env:`, so adding a lane for a new
+    vendor's CLI does not require editing this file to stay safe.
+    """
+    drop = set(SCRUB_ENV) | set(lane.get("scrub_env") or ())
+    env = {
+        k: v for k, v in os.environ.items()
+        if k not in drop and not any(p.search(k) for p in SCRUB_ENV_PATTERNS)
+    }
+    env["NO_COLOR"] = "1"
+    return env
 
 
 def die(msg: str) -> "NoReturn":  # noqa: F821
@@ -489,8 +534,7 @@ def cli_lane(lane: dict, prompt: str) -> dict:
        CLI (or one sitting at a login prompt) orphaned and running -- which is
        precisely the failure this tool was built to eliminate.
     """
-    env = {k: v for k, v in os.environ.items() if k not in SCRUB_ENV}
-    env["NO_COLOR"] = "1"
+    env = child_env(lane)
 
     cmd, stdin_text = [], None
     for arg in lane["args"]:
@@ -557,8 +601,7 @@ def acp_lane(lane: dict, prompt: str) -> dict:
     failure this tool exists to avoid. Do not "optimise" this by reusing a
     session across lanes or keeping the process warm.
     """
-    env = {k: v for k, v in os.environ.items() if k not in SCRUB_ENV}
-    env["NO_COLOR"] = "1"
+    env = child_env(lane)
     proc = subprocess.Popen(
         [lane["command"], *(lane.get("args") or [])],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,

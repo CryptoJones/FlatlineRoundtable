@@ -298,6 +298,41 @@ class TestCliLane(unittest.TestCase):
         self.assertIn("KEY=[unset]", out["answer"])
         self.assertNotIn("leaked-would-bill", out["answer"])
 
+    def test_bedrock_and_vertex_routes_are_scrubbed(self):
+        """#22: these bill via ambient cloud credentials, with no API key.
+
+        A key-only denylist does nothing about them, so the "free lane silently
+        becomes a paid one" failure had a second door.
+        """
+        for var in ("CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX",
+                    "ANTHROPIC_BASE_URL", "GOOGLE_GENAI_USE_VERTEXAI"):
+            with self.subTest(var=var):
+                os.environ[var] = "1"
+                self.addCleanup(os.environ.pop, var, None)
+                self.assertNotIn(var, rt.child_env({}))
+
+    def test_unknown_vendor_key_shapes_are_scrubbed_by_pattern(self):
+        # The roster spans vendors whose variables are not named in SCRUB_ENV.
+        for var in ("MISTRAL_API_KEY", "COHERE_API_KEY", "SOMEVENDOR_AUTH_TOKEN",
+                    "SOMEVENDOR_BASE_URL"):
+            with self.subTest(var=var):
+                os.environ[var] = "x"
+                self.addCleanup(os.environ.pop, var, None)
+                self.assertNotIn(var, rt.child_env({}))
+
+    def test_a_lane_can_scrub_extra_variables(self):
+        os.environ["WEIRD_VENDOR_TOKEN"] = "x"
+        self.addCleanup(os.environ.pop, "WEIRD_VENDOR_TOKEN", None)
+        self.assertIn("WEIRD_VENDOR_TOKEN", rt.child_env({}))
+        self.assertNotIn("WEIRD_VENDOR_TOKEN",
+                         rt.child_env({"scrub_env": ["WEIRD_VENDOR_TOKEN"]}))
+
+    def test_ordinary_environment_survives_the_scrub(self):
+        # Over-scrubbing fails a lane loudly, but PATH still has to get through.
+        env = rt.child_env({})
+        self.assertIn("PATH", env)
+        self.assertEqual(env["NO_COLOR"], "1")
+
     def test_hung_lane_is_killed_and_leaves_no_orphan(self):
         """A thread timeout does not kill a process tree. This proves the group dies."""
         marker = self.tmp / "orphan-marker"
