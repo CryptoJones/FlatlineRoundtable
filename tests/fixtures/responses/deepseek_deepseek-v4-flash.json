@@ -1,0 +1,54 @@
+{
+  "choices": [
+    {
+      "finish_reason": "stop",
+      "index": 0,
+      "logprobs": null,
+      "message": {
+        "content": "OK",
+        "reasoning": "We need to respond with exactly \"OK\". The user said \"Reply with exactly: OK\". So just output OK.",
+        "reasoning_details": [
+          {
+            "format": "unknown",
+            "index": 0,
+            "text": "We need to respond with exactly \"OK\". The user said \"Reply with exactly: OK\". So just output OK.",
+            "type": "reasoning.text"
+          }
+        ],
+        "refusal": null,
+        "role": "assistant"
+      },
+      "native_finish_reason": "stop"
+    }
+  ],
+  "created": 0,
+  "id": "<redacted-id>",
+  "model": "deepseek/deepseek-v4-flash",
+  "object": "chat.completion",
+  "provider": "StreamLake",
+  "service_tier": null,
+  "system_fingerprint": "<redacted-system_fingerprint>",
+  "usage": {
+    "completion_tokens": 27,
+    "completion_tokens_details": {
+      "audio_tokens": 0,
+      "image_tokens": 0,
+      "reasoning_tokens": 24
+    },
+    "cost": 5.10678e-06,
+    "cost_details": {
+      "upstream_inference_completions_cost": 4.37724e-06,
+      "upstream_inference_cost": 5.10678e-06,
+      "upstream_inference_prompt_cost": 7.2954e-07
+    },
+    "is_byok": false,
+    "prompt_tokens": 9,
+    "prompt_tokens_details": {
+      "audio_tokens": 0,
+      "cache_write_tokens": 0,
+      "cached_tokens": 0,
+      "video_tokens": 0
+    },
+    "total_tokens": 36
+  }
+}

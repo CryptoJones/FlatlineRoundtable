@@ -1,0 +1,54 @@
+{
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "logprobs": null,
+      "message": {
+        "content": null,
+        "reasoning": "The user says: \"Reply with exactly: OK\". The request is to output exactly \"OK\". There's no policy violation. It's a straightforward request. We need to respond with exactly the string \"OK\". The user says \"Reply with exactly: OK\". So answer should be \"OK\".",
+        "reasoning_details": [
+          {
+            "format": "unknown",
+            "index": 0,
+            "text": "The user says: \"Reply with exactly: OK\". The request is to output exactly \"OK\". There's no policy violation. It's a straightforward request. We need to respond with exactly the string \"OK\". The user says \"Reply with exactly: OK\". So answer should be \"OK\".",
+            "type": "reasoning.text"
+          }
+        ],
+        "refusal": null,
+        "role": "assistant"
+      },
+      "native_finish_reason": "length"
+    }
+  ],
+  "created": 0,
+  "id": "<redacted-id>",
+  "model": "minimax/minimax-m2.7:free",
+  "object": "chat.completion",
+  "provider": "GMICloud",
+  "service_tier": null,
+  "system_fingerprint": "<redacted-system_fingerprint>",
+  "usage": {
+    "completion_tokens": 60,
+    "completion_tokens_details": {
+      "audio_tokens": 0,
+      "image_tokens": 0,
+      "reasoning_tokens": 64
+    },
+    "cost": 0,
+    "cost_details": {
+      "upstream_inference_completions_cost": 0,
+      "upstream_inference_cost": 0,
+      "upstream_inference_prompt_cost": 0
+    },
+    "is_byok": false,
+    "prompt_tokens": 46,
+    "prompt_tokens_details": {
+      "audio_tokens": 0,
+      "cache_write_tokens": 0,
+      "cached_tokens": 0,
+      "video_tokens": 0
+    },
+    "total_tokens": 106
+  }
+}

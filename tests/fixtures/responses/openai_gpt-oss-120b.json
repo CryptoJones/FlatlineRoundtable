@@ -1,0 +1,54 @@
+{
+  "choices": [
+    {
+      "finish_reason": "stop",
+      "index": 0,
+      "logprobs": null,
+      "message": {
+        "content": "OK",
+        "reasoning": "User asks: \"Reply with exactly: OK\". So respond with just \"OK\". Ensure no extra whitespace? Probably just \"OK\".",
+        "reasoning_details": [
+          {
+            "format": "unknown",
+            "index": 0,
+            "text": "User asks: \"Reply with exactly: OK\". So respond with just \"OK\". Ensure no extra whitespace? Probably just \"OK\".",
+            "type": "reasoning.text"
+          }
+        ],
+        "refusal": null,
+        "role": "assistant"
+      },
+      "native_finish_reason": "stop"
+    }
+  ],
+  "created": 0,
+  "id": "<redacted-id>",
+  "model": "openai/gpt-oss-120b",
+  "object": "chat.completion",
+  "provider": "AkashML",
+  "service_tier": null,
+  "system_fingerprint": "<redacted-system_fingerprint>",
+  "usage": {
+    "completion_tokens": 38,
+    "completion_tokens_details": {
+      "audio_tokens": 0,
+      "image_tokens": 0,
+      "reasoning_tokens": 28
+    },
+    "cost": 8.62e-06,
+    "cost_details": {
+      "upstream_inference_completions_cost": 6.46e-06,
+      "upstream_inference_cost": 8.62e-06,
+      "upstream_inference_prompt_cost": 2.16e-06
+    },
+    "is_byok": false,
+    "prompt_tokens": 72,
+    "prompt_tokens_details": {
+      "audio_tokens": 0,
+      "cache_write_tokens": 0,
+      "cached_tokens": 64,
+      "video_tokens": 0
+    },
+    "total_tokens": 110
+  }
+}

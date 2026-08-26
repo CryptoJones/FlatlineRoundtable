@@ -4,6 +4,9 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Manual only. The smoke job below spends money and depends on vendors being
+  # up, neither of which belongs in the gate every PR waits on.
+  workflow_dispatch:
 
 jobs:
   test:
@@ -42,3 +45,28 @@ jobs:
       - name: Shipped example config parses
         run: |
           python3 -c "import yaml; yaml.safe_load(open('FlatlineRoundtable.yaml.example')); print('example config OK')"
+
+  # Opt-in: answers "is the shape still right TODAY", which the golden fixtures
+  # cannot -- they answer "is it still what it was when captured". Allowed to
+  # fail without blocking anything, because a vendor being down is not a defect
+  # in this repo.
+  live-smoke:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install PyYAML
+        run: python3 -m pip install --quiet pyyaml
+      - name: Compare a live response against the fixture contract
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: |
+          if [ -z "${OPENROUTER_API_KEY}" ]; then
+            echo "No OPENROUTER_API_KEY secret set — skipping live smoke."
+            exit 0
+          fi
+          python3 scripts/live-smoke.py

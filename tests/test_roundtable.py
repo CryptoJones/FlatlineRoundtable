@@ -785,6 +785,101 @@ def _write_cfg_and_load(case, rpm):
     return rt.load_config(p)
 
 
+class TestGoldenResponses(unittest.TestCase):
+    """Replay real vendor responses through the real parsing path (#13).
+
+    The stub elsewhere in this file is hand-written, so it proves roundtable
+    handles the shape we *think* vendors return. These are captured from live
+    endpoints, so they prove it handles the shape they actually returned -- and
+    they fail if a vendor moves a field, which the stub never would.
+
+    Recapture with scripts/capture-fixtures.py when a vendor changes.
+    """
+
+    FIXTURES = sorted((ROOT / "tests" / "fixtures" / "responses").glob("*.json"))
+
+    def _serve(self, payload):
+        """A server that returns exactly these bytes, so http_lane does the
+        parsing rather than the test."""
+        raw = payload.encode()
+
+        class H(BaseHTTPRequestHandler):
+            def log_message(self, *a): pass
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+        srv = HTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        return f"http://127.0.0.1:{srv.server_port}/v1"
+
+    def test_fixtures_exist(self):
+        self.assertGreaterEqual(len(self.FIXTURES), 5,
+                                "golden fixtures missing -- run scripts/capture-fixtures.py")
+
+    def test_every_fixture_parses_into_a_lane_result(self):
+        for f in self.FIXTURES:
+            with self.subTest(fixture=f.name):
+                payload = f.read_text()
+                data = json.loads(payload)
+                url = self._serve(payload)
+                out = rt.http_lane(
+                    {"model": data["model"], "base_url": url, "timeout": 10}, "hi", None, 0)
+
+                expected = (data["choices"][0]["message"].get("content") or "").strip()
+                self.assertEqual(out["answer"], expected)
+                self.assertEqual(out["finish_reason"], data["choices"][0]["finish_reason"])
+                self.assertEqual(out["served_by"], data["provider"])
+                self.assertEqual(out["usage"]["prompt_tokens"],
+                                 data["usage"]["prompt_tokens"])
+
+    def test_fixtures_carry_the_fields_the_tool_depends_on(self):
+        """A shape contract. If a vendor drops one of these, this fails loudly
+        instead of the parser failing quietly in production."""
+        for f in self.FIXTURES:
+            with self.subTest(fixture=f.name):
+                d = json.loads(f.read_text())
+                self.assertIn("provider", d)            # served_by / lineage detection
+                self.assertIn("usage", d)               # spend + calibration
+                self.assertIn("prompt_tokens", d["usage"])
+                self.assertIn("completion_tokens", d["usage"])
+                ch = d["choices"][0]
+                self.assertIn("finish_reason", ch)      # truncation detection
+                self.assertIn("content", ch["message"])  # may be null; must exist
+
+    def test_fixtures_carry_no_credentials(self):
+        for f in self.FIXTURES:
+            with self.subTest(fixture=f.name):
+                body = f.read_text().lower()
+                for needle in ("authorization", "bearer ", "sk-", "api_key", "api-key"):
+                    self.assertNotIn(needle, body)
+
+    def test_a_reasoning_model_that_spent_its_budget_is_not_a_pass(self):
+        """Two captured fixtures came back finish_reason=length with empty
+        content -- the whole token budget went to `reasoning`. That must read as
+        a failed lane, not a silent empty answer."""
+        spent = [f for f in self.FIXTURES
+                 if (lambda d: d["choices"][0]["finish_reason"] == "length"
+                     and not (d["choices"][0]["message"].get("content") or "").strip())
+                    (json.loads(f.read_text()))]
+        self.assertTrue(spent, "expected at least one budget-exhausted fixture")
+        for f in spent:
+            with self.subTest(fixture=f.name):
+                payload = f.read_text()
+                url = self._serve(payload)
+                out = rt.http_lane(
+                    {"model": json.loads(payload)["model"], "base_url": url,
+                     "timeout": 10}, "hi", None, 0)
+                self.assertEqual(out["answer"], "")
+                self.assertEqual(out["finish_reason"], "length")
+
+
 class TestSecrets(unittest.TestCase):
     def _fake_pass(self, body):
         """Put a stub `pass` first on PATH.
