@@ -35,6 +35,11 @@ rest still need a human, and the env-scrub and orphan-kill checks especially.
 
 ## Done
 
+- [x] Corrected #46: an empty answer with `finish_reason: length` is variance,
+      not determinism — reasoning usage ranged 20–21,606 tokens across runs of
+      one identical brief. The retry is restored; the message naming
+      `max_tokens` is kept for when retries are exhausted.
+      ([#53](https://github.com/CryptoJones/FlatlineRoundtable/issues/53))
 - [x] `THE READERS DISAGREE` fired when readers merely differed in how liberally
       they named lanes, not in judgement — a conflict now requires disjoint
       placements rather than unequal ones. Found on a live run whose own reader
