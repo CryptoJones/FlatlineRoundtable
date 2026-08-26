@@ -205,6 +205,14 @@ def load_config(path: Path) -> dict:
             if not lane.get("args"):
                 die(f"{name}: cli lane needs args (use '{{prompt}}' or stdin: true)")
 
+        if lane.get("rpm") is not None:
+            try:
+                rpm = float(lane["rpm"])
+            except (TypeError, ValueError):
+                die(f"{name}: rpm must be a number, got {lane['rpm']!r}")
+            if rpm <= 0:
+                die(f"{name}: rpm must be greater than 0 (omit it for no pacing)")
+
         bad = EXTRA_BODY_DENY & set((lane.get("extra_body") or {}).keys())
         if bad:
             die(f"{name}: extra_body may not set {', '.join(sorted(bad))}")
@@ -253,6 +261,60 @@ def fetch_keys(lanes: list[dict]) -> dict[str, str]:
             die(f"pass entry {entry!r} is empty")
         keys[entry] = first
     return keys
+
+
+class Pacer:
+    """Spread one vendor's request *starts* to at least `interval` apart.
+
+    The semaphore in `ask` bounds how many requests are in flight at once. That
+    is a different quantity from how fast they arrive, and vendors meter the
+    second one. Ten lanes dispatched together are ten requests in the same
+    second even at concurrency 1, because each finishes and immediately frees
+    the slot -- so a per-minute cap can be tripped before any 429 comes back to
+    tell us about it.
+
+    Retrying after a 429 is the reactive half and already exists. This is the
+    proactive half: it costs a few seconds of wall clock and avoids burning a
+    lane's retries on a limit we could have simply not hit.
+
+    Bookkeeping happens under the lock; the sleep deliberately does not, so
+    waiting threads do not serialise behind each other's sleeps.
+    """
+
+    def __init__(self, interval: float):
+        self.interval = max(0.0, interval)
+        self._lock = threading.Lock()
+        self._next = 0.0
+
+    def wait(self) -> float:
+        """Block until this vendor's next slot. Returns seconds actually waited."""
+        if not self.interval:
+            return 0.0
+        with self._lock:
+            now = time.monotonic()
+            start = max(now, self._next)
+            self._next = start + self.interval
+        delay = start - now
+        if delay > 0:
+            time.sleep(delay)
+        return delay
+
+
+def build_pacers(lanes: list[dict]) -> dict[str, Pacer]:
+    """One Pacer per vendor group, keyed the same way the semaphores are.
+
+    Where lanes in a group disagree on `rpm`, the smallest wins: the cap belongs
+    to the vendor, not the lane, so the most conservative number is the only one
+    that can be correct for all of them.
+    """
+    rpms: dict[str, float] = {}
+    for l in lanes:
+        rpm = l.get("rpm")
+        if not rpm:
+            continue
+        gid = l.get("vendor") or l["name"]
+        rpms[gid] = min(rpms.get(gid, float("inf")), float(rpm))
+    return {gid: Pacer(60.0 / rpm) for gid, rpm in rpms.items()}
 
 
 # --------------------------------------------------------------------------- #
@@ -489,7 +551,7 @@ def acp_lane(lane: dict, prompt: str) -> dict:
             pass
 
 
-def ask(lane, prompt, keys, retries, deadline, sems, lock, spent, prices):
+def ask(lane, prompt, keys, retries, deadline, sems, lock, spent, prices, pacers=None):
     started = time.time()
     result = {
         "lane": lane["name"],
@@ -504,6 +566,14 @@ def ask(lane, prompt, keys, retries, deadline, sems, lock, spent, prices):
     try:
         if deadline and time.time() > deadline:
             raise RuntimeError("global deadline passed before dispatch")
+        pacer = (pacers or {}).get(lane.get("vendor") or lane["name"])
+        if pacer:
+            result["paced_s"] = round(pacer.wait(), 2)
+            # Pacing can push a lane past a deadline that it was inside when the
+            # run started. Re-check rather than dispatching a request whose
+            # answer we have already decided not to wait for.
+            if deadline and time.time() > deadline:
+                raise RuntimeError("global deadline passed while pacing")
         with sem:
             if lane["harness"] == "acp":
                 out = acp_lane(lane, prompt)
@@ -653,13 +723,15 @@ def main() -> int:
     for l in lanes:
         gid = l.get("vendor") or l["name"]
         sems.setdefault(gid, threading.Semaphore(int(l.get("concurrency", default_cc))))
+    # Concurrency bounds how many are in flight; rpm bounds how fast they start.
+    pacers = build_pacers(lanes)
 
     lock, spent = threading.Lock(), [0.0]
     t0 = time.time()
     with cf.ThreadPoolExecutor(max_workers=max(len(lanes), 1)) as pool:
         results = list(pool.map(
             lambda l: ask(l, prompt, keys, int(cfg.get("retries", 1)), deadline, sems, lock,
-                          spent, lane_prices(l, prices)),
+                          spent, lane_prices(l, prices), pacers),
             lanes,
         ))
 

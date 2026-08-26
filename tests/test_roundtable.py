@@ -322,6 +322,89 @@ class TestCliLane(unittest.TestCase):
             rt.cli_lane({"command": str(exe), "args": ["-p"], "timeout": 10}, "hi")
 
 
+class TestPacer(unittest.TestCase):
+    """Proactive per-vendor pacing.
+
+    The semaphore bounds how many requests are in flight; this bounds how fast
+    they start. A vendor's per-minute cap is tripped by the second quantity, and
+    can be tripped before any 429 arrives to warn us.
+    """
+
+    def test_first_call_does_not_wait(self):
+        self.assertEqual(rt.Pacer(5.0).wait(), 0.0)
+
+    def test_subsequent_calls_are_spaced(self):
+        p = rt.Pacer(0.25)
+        p.wait()
+        t0 = time.monotonic()
+        p.wait()
+        self.assertGreaterEqual(time.monotonic() - t0, 0.2)
+
+    def test_zero_interval_never_waits(self):
+        p = rt.Pacer(0)
+        self.assertEqual(p.wait(), 0.0)
+        self.assertEqual(p.wait(), 0.0)
+
+    def test_slots_are_handed_out_without_overlap(self):
+        # Under concurrency the reservations must still be distinct, or the
+        # burst this exists to prevent happens anyway.
+        p = rt.Pacer(0.05)
+        waits = []
+        lk = threading.Lock()
+
+        def go():
+            w = p.wait()
+            with lk:
+                waits.append(w)
+
+        threads = [threading.Thread(target=go) for _ in range(6)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(len(waits), 6)
+        # Six slots 0.05s apart: the last one waits at least 4 intervals.
+        self.assertGreaterEqual(max(waits), 0.2)
+
+    def test_pacers_are_per_vendor_and_take_the_smallest_rpm(self):
+        pacers = rt.build_pacers([
+            {"name": "A", "vendor": "openrouter", "rpm": 60},
+            {"name": "B", "vendor": "openrouter", "rpm": 20},   # stricter wins
+            {"name": "C", "vendor": "local"},                   # no rpm, no pacer
+        ])
+        self.assertEqual(set(pacers), {"openrouter"})
+        self.assertAlmostEqual(pacers["openrouter"].interval, 3.0)
+
+    def test_a_lane_without_a_vendor_paces_under_its_own_name(self):
+        pacers = rt.build_pacers([{"name": "Solo", "rpm": 30}])
+        self.assertAlmostEqual(pacers["Solo"].interval, 2.0)
+
+    def test_rpm_must_be_positive(self):
+        for bad in (0, -5):
+            with self.assertRaises(SystemExit):
+                _write_cfg_and_load(self, rpm=bad)
+
+    def test_rpm_must_be_a_number(self):
+        with self.assertRaises(SystemExit):
+            _write_cfg_and_load(self, rpm="soon")
+
+
+def _write_cfg_and_load(case, rpm):
+    d = Path(tempfile.mkdtemp())
+    case.addCleanup(shutil.rmtree, d, True)
+    p = d / "cfg.yaml"
+    p.write_text(textwrap.dedent(f"""
+        lanes:
+          - name: A
+            vendor: openrouter
+            harness: http
+            model: m
+            base_url: http://127.0.0.1:1/v1
+            rpm: {rpm!r}
+    """).lstrip())
+    return rt.load_config(p)
+
+
 class TestSecrets(unittest.TestCase):
     def _fake_pass(self, body):
         """Put a stub `pass` first on PATH.
@@ -423,6 +506,31 @@ class TestEndToEnd(unittest.TestCase):
             ])
             self.assertEqual(r.returncode, 1)
             self.assertIn("FAILED  Mute", r.stdout)
+
+    def test_rpm_paces_lanes_sharing_a_vendor(self):
+        """The wiring, not just the Pacer: three lanes, one vendor, one slot/sec."""
+        with StubServer() as s:
+            lanes = [{"name": f"L{i}", "harness": "http", "model": "m",
+                      "vendor": "stubco", "base_url": s.url, "rpm": 60}
+                     for i in range(3)]
+            t0 = time.monotonic()
+            r = self._run(lanes)
+            elapsed = time.monotonic() - t0
+        self.assertEqual(r.returncode, 0, r.stderr)
+        # Slots at 0s, 1s, 2s -- the third lane cannot start before 2s.
+        self.assertGreaterEqual(elapsed, 2.0)
+
+    def test_lanes_on_different_vendors_do_not_pace_each_other(self):
+        with StubServer() as s:
+            lanes = [{"name": f"L{i}", "harness": "http", "model": "m",
+                      "vendor": f"v{i}", "base_url": s.url, "rpm": 60}
+                     for i in range(3)]
+            t0 = time.monotonic()
+            r = self._run(lanes)
+            elapsed = time.monotonic() - t0
+        self.assertEqual(r.returncode, 0, r.stderr)
+        # Each vendor has its own slot 0, so nothing waits on anything else.
+        self.assertLess(elapsed, 2.0)
 
     def test_budget_refuses_before_dispatch(self):
         with StubServer() as s:
