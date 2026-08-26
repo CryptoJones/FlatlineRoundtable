@@ -32,6 +32,7 @@ import concurrent.futures as cf
 import datetime as dt
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -704,6 +705,23 @@ If they substantially agree, say so in one line rather than manufacturing a spli
 
 SYNTH_SECTIONS = ("AGREED", "SPLIT", "LONE CLAIMS")
 
+# A section header, and only at the start of a line.
+#
+# Matching the bare word anywhere used to be enough to relocate every finding: a
+# reader that opens with "I will report AGREED, SPLIT and LONE CLAIMS below"
+# put all three markers in its preamble, so every lane fell into whichever
+# section came last. Restating the instructions is the common case, not an
+# exotic one, and the result was a THE READERS DISAGREE block listing lanes that
+# both readers had in fact classified identically.
+#
+# Tolerates the shapes models actually emit: `AGREED`, `## AGREED`, `**AGREED**`,
+# `1. AGREED`, `### 2) SPLIT`.
+SECTION_RE = re.compile(
+    r"^[ \t]{0,3}(?:#{1,6}[ \t]*)?(?:\*\*)?(?:\d+[.)][ \t]*)?(?:\*\*)?"
+    r"(AGREED|SPLIT|LONE[ \t]+CLAIMS)\b",
+    re.IGNORECASE | re.MULTILINE,
+)
+
 
 def pick_synthesizers(lanes, want, n):
     """Choose up to n readers, preferring free lanes from *different* vendors.
@@ -748,19 +766,24 @@ def classify_mentions(text, lane_names):
     """
     if not text:
         return {}
-    upper = text.upper()
-    marks = sorted(
-        ((upper.find(sec), sec) for sec in SYNTH_SECTIONS if upper.find(sec) >= 0)
-    )
+    marks = [
+        (m.start(), " ".join(m.group(1).upper().split()))
+        for m in SECTION_RE.finditer(text)
+    ]
     if not marks:
         return {}
-    bounds = []
-    for i, (pos, sec) in enumerate(marks):
-        end = marks[i + 1][0] if i + 1 < len(marks) else len(text)
-        bounds.append((sec, upper[pos:end]))
+    # Segment on every header in document order. A section that appears twice
+    # contributes both of its spans rather than only the first.
+    bounds = [
+        (sec, text[pos:(marks[i + 1][0] if i + 1 < len(marks) else len(text))])
+        for i, (pos, sec) in enumerate(marks)
+    ]
     out = {}
     for name in lane_names:
-        hits = {sec for sec, chunk in bounds if name.upper() in chunk}
+        # Word-bounded: substring matching let a lane called `Chair` be claimed
+        # by the word "Chairman", and `Local` by the word "local".
+        pat = re.compile(rf"\b{re.escape(name)}\b", re.IGNORECASE)
+        hits = {sec for sec, chunk in bounds if pat.search(chunk)}
         if hits:
             out[name] = sorted(hits)
     return out
