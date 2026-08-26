@@ -263,14 +263,24 @@ def lane_prices(lane: dict, table: dict) -> tuple[float, float]:
 
 
 def estimate_run(lanes: list[dict], prompt: str, table: dict, defaults: dict,
-                 calib: dict | None = None) -> float:
+                 calib: dict | None = None, retries: int = 0) -> float:
     """Worst-case cost BEFORE dispatch (issue #4).
 
     Enforcing a budget only after responses return reports an overrun rather
     than preventing one -- the money is already spent by then. Assume every lane
     answers to its full max_tokens, which is the ceiling a run can actually hit.
+
+    The prompt is charged (1 + retries) times, because http_lane re-issues on a
+    200-carrying-an-error and on an empty answer, and both bill the prompt. This
+    was previously ignored entirely: with the shipped default of retries: 3 the
+    estimate could understate that term by 300%, while CALIBRATION_SAFETY shaved
+    a further 10% off it in the name of staying conservative.
+
+    Only the prompt side multiplies. A retry happens precisely when no usable
+    completion came back, so the completion ceiling is still one max_tokens.
     """
     calib = calib or {}
+    attempts = 1 + max(0, int(retries))
     total = 0.0
     for l in lanes:
         pin, pout = lane_prices(l, table)
@@ -279,7 +289,7 @@ def estimate_run(lanes: list[dict], prompt: str, table: dict, defaults: dict,
         in_tok = (len(prompt) + len(l.get("personality") or "")) / chars_per_token(
             l.get("model"), calib)
         out_tok = float(l.get("max_tokens", defaults.get("max_tokens", 2000)))
-        total += in_tok * pin + out_tok * pout
+        total += in_tok * pin * attempts + out_tok * pout
     return total
 
 
@@ -1139,7 +1149,8 @@ def main() -> int:
     # reports an overrun; it does not prevent one.
     calib = load_calibration()
     defaults = cfg.get("defaults") or {}
-    estimate = estimate_run(lanes, prompt, prices, defaults, calib)
+    estimate = estimate_run(lanes, prompt, prices, defaults, calib,
+                            retries=int(cfg.get("retries", 1)))
     if a.diff:
         # The readers are dispatched from inside this run, so their cost belongs
         # in the gate that decides whether to dispatch at all.
