@@ -6,6 +6,41 @@ neither side drifts.
 
 ## Open
 
+From a full-source roundtable review on 2026-08-26 (13 lanes, 8 answered).
+Every item below was reproduced locally before filing; three findings the
+panel agreed on were discarded as false.
+
+- [ ] `classify_mentions` anchors sections on the first occurrence anywhere in the
+      text, so a reader restating its instructions collapses every lane into one
+      bucket and manufactures phantom `THE READERS DISAGREE` rows. Lane matching
+      is unbounded substring. Regression from #16. ([#18](https://github.com/CryptoJones/FlatlineRoundtable/issues/18))
+- [ ] `--diff` synthesis runs outside the budget, semaphores, pacer and deadline.
+      It is the largest request of the run and, since #16, is sent twice. ([#19](https://github.com/CryptoJones/FlatlineRoundtable/issues/19))
+- [ ] A `cli` lane with neither `{prompt}` nor `stdin: true` sends no prompt at
+      all, and validation accepts it while its error text promises otherwise. A
+      lane can vote without seeing the question. ([#20](https://github.com/CryptoJones/FlatlineRoundtable/issues/20))
+- [ ] The per-vendor semaphore takes the first lane's `concurrency` rather than the
+      smallest; `build_pacers` gets the same problem right. ([#21](https://github.com/CryptoJones/FlatlineRoundtable/issues/21))
+- [ ] `SCRUB_ENV` covers API keys but not `CLAUDE_CODE_USE_BEDROCK` / `_VERTEX` or
+      `ANTHROPIC_BASE_URL`, which bill a subscription lane with no key involved. ([#22](https://github.com/CryptoJones/FlatlineRoundtable/issues/22))
+- [ ] Nothing detects that two lanes resolved to the same underlying model.
+      `served_by` is captured and never used, so an echo can be reported as
+      convergence — the one claim the tool exists to make. ([#23](https://github.com/CryptoJones/FlatlineRoundtable/issues/23))
+- [ ] `acp_lane` passes the real `cwd` to a coding agent, never drains its stderr,
+      and never reaps the killed process. ([#24](https://github.com/CryptoJones/FlatlineRoundtable/issues/24))
+- [ ] `deadline_seconds` bounds nothing: both checks run before the semaphore
+      acquire, so they pass at t=0 and never apply again. ([#25](https://github.com/CryptoJones/FlatlineRoundtable/issues/25))
+- [ ] A config whose lanes are all `active: false` reports `0/0 answered` and exits
+      0, claiming success having asked nobody anything. ([#26](https://github.com/CryptoJones/FlatlineRoundtable/issues/26))
+- [ ] The pre-flight estimate assumes one call per lane, but retries can bill the
+      prompt up to `(1 + retries)` times. ([#27](https://github.com/CryptoJones/FlatlineRoundtable/issues/27))
+- [ ] `cli_lane` filters a hardcoded clock emoji — one machine's shell-hook banner
+      baked into a public tool, silently deleting answer lines. ([#28](https://github.com/CryptoJones/FlatlineRoundtable/issues/28))
+- [ ] A lane named `Off`, `No`, `Yes` or `On` is coerced to a YAML 1.1 boolean and
+      fails with a misleading "has no name". ([#29](https://github.com/CryptoJones/FlatlineRoundtable/issues/29))
+- [ ] `Retry-After: 1.5` fails `.isdigit()` and is ignored in favour of the default
+      backoff. ([#30](https://github.com/CryptoJones/FlatlineRoundtable/issues/30))
+
 - [ ] The stub server in the test suite is hand-written, so its response *shape*
       can drift from what vendors actually return without CI noticing. Add
       golden fixtures captured from real responses, and optionally a
