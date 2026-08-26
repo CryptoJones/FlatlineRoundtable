@@ -146,6 +146,9 @@ class TestConfigValidation(unittest.TestCase):
             rt.load_config(self._cfg(lanes))
         self.assertIn(needle, str(e.exception))
 
+    def _loads(self, lanes):
+        return rt.load_config(self._cfg(lanes))
+
     def test_rejects_unknown_harness(self):
         self._dies([{"name": "A", "harness": "carrier-pigeon"}], "harness must be")
 
@@ -154,8 +157,8 @@ class TestConfigValidation(unittest.TestCase):
 
     def test_rejects_duplicate_lane_names(self):
         self._dies(
-            [{"name": "A", "harness": "cli", "command": "x", "args": ["-p"]},
-             {"name": "A", "harness": "cli", "command": "x", "args": ["-p"]}],
+            [{"name": "A", "harness": "cli", "command": "x", "args": ["-p"], "stdin": True},
+             {"name": "A", "harness": "cli", "command": "x", "args": ["-p"], "stdin": True}],
             "duplicate lane name",
         )
 
@@ -166,6 +169,26 @@ class TestConfigValidation(unittest.TestCase):
               "extra_body": {"model": "something-else"}}],
             "extra_body may not set",
         )
+
+    def test_cli_lane_must_actually_deliver_the_prompt(self):
+        """#20: args non-empty was the only check, so a lane could send nothing.
+
+        The dangerous outcome is not the CLI erroring -- that fails loudly. It is
+        a CLI answering an empty prompt with something plausible, giving a lane
+        that counts as a vote without having seen the question.
+        """
+        self._dies([{"name": "A", "harness": "cli", "command": "x", "args": ["-p"]}],
+                   "would send no prompt")
+
+    def test_prompt_placeholder_satisfies_the_check(self):
+        cfg = self._loads([{"name": "A", "harness": "cli", "command": "x",
+                            "args": ["-p", "{prompt}"]}])
+        self.assertEqual(cfg["lanes"][0]["name"], "A")
+
+    def test_stdin_satisfies_the_check(self):
+        cfg = self._loads([{"name": "A", "harness": "cli", "command": "x",
+                            "args": ["-p"], "stdin": True}])
+        self.assertEqual(cfg["lanes"][0]["name"], "A")
 
     def test_acp_lane_needs_only_a_command(self):
         cfg = rt.load_config(self._cfg([{"name": "A", "harness": "acp", "command": "x"}]))
@@ -292,7 +315,7 @@ class TestCliLane(unittest.TestCase):
         exe = write_exe(self.tmp / "fake", 'echo "KEY=[${ANTHROPIC_API_KEY:-unset}]"')
         os.environ["ANTHROPIC_API_KEY"] = "leaked-would-bill"
         try:
-            out = rt.cli_lane({"command": str(exe), "args": ["-p"], "timeout": 10}, "hi")
+            out = rt.cli_lane({"command": str(exe), "args": ["-p"], "stdin": True, "timeout": 10}, "hi")
         finally:
             os.environ.pop("ANTHROPIC_API_KEY", None)
         self.assertIn("KEY=[unset]", out["answer"])
@@ -304,7 +327,7 @@ class TestCliLane(unittest.TestCase):
         exe = write_exe(self.tmp / "hang", f'sleep 45 && touch "{marker}"')
         t0 = time.time()
         with self.assertRaises(RuntimeError) as e:
-            rt.cli_lane({"command": str(exe), "args": ["-p"], "timeout": 2}, "hi")
+            rt.cli_lane({"command": str(exe), "args": ["-p"], "stdin": True, "timeout": 2}, "hi")
         self.assertIn("timed out", str(e.exception))
         self.assertLess(time.time() - t0, 15, "did not return promptly on timeout")
         time.sleep(3)
@@ -313,13 +336,13 @@ class TestCliLane(unittest.TestCase):
     def test_nonzero_exit_is_an_error(self):
         exe = write_exe(self.tmp / "fail", 'echo "boom" >&2; exit 3')
         with self.assertRaises(RuntimeError) as e:
-            rt.cli_lane({"command": str(exe), "args": ["-p"], "timeout": 10}, "hi")
+            rt.cli_lane({"command": str(exe), "args": ["-p"], "stdin": True, "timeout": 10}, "hi")
         self.assertIn("exit 3", str(e.exception))
 
     def test_empty_output_is_an_error_not_a_pass(self):
         exe = write_exe(self.tmp / "quiet", 'true')
         with self.assertRaises(RuntimeError):
-            rt.cli_lane({"command": str(exe), "args": ["-p"], "timeout": 10}, "hi")
+            rt.cli_lane({"command": str(exe), "args": ["-p"], "stdin": True, "timeout": 10}, "hi")
 
 
 class TestSynthesis(unittest.TestCase):
