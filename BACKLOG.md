@@ -8,8 +8,6 @@ neither side drifts.
 
 - [ ] `--diff` synthesis is one lane's reading, not a neutral one. Consider
       running it on two lanes and reporting where the *syntheses* differ. ([#8](https://github.com/CryptoJones/FlatlineRoundtable/issues/8))
-- [ ] The pre-flight estimate uses ~4 chars/token rather than a real tokenizer,
-      so it overestimates. Safe direction, but a wide margin on long briefs. ([#9](https://github.com/CryptoJones/FlatlineRoundtable/issues/9))
 
 ## Verification set
 
@@ -37,6 +35,13 @@ rest still need a human, and the env-scrub and orphan-kill checks especially.
 
 ## Done
 
+- [x] Pre-flight estimate calibrates itself from observed `usage.prompt_tokens`
+      instead of assuming 4 chars/token, falling back to the constant until a
+      model has enough samples. Note the original premise was wrong: 4
+      chars/token **under**-estimates a markdown-heavy personality
+      (`gpt-oss-120b` measures 3.30), which is the unsafe direction for a budget
+      check, not a wide-but-safe margin.
+      ([#9](https://github.com/CryptoJones/FlatlineRoundtable/issues/9))
 - [x] Per-vendor rate-limit awareness — optional `rpm` per lane, shared across a
       vendor group and taking the smallest value, spacing request *starts* so a
       per-minute cap is not tripped before any 429 arrives. `concurrency` bounds
