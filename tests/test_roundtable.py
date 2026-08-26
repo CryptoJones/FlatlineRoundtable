@@ -137,6 +137,11 @@ class StubServer:
         self.srv.server_close()   # else the socket leaks a ResourceWarning per test
 
 
+PRINTF_ANSI = "printf '\\033[32mgreen\\033[0m answer\\n'\n"
+PRINTF_EMOJI = "printf '\\xf0\\x9f\\x95\\x90 the answer\\n'\n"
+PRINTF_BANNER = "printf '>> updating\\nreal answer\\n'\n"
+
+
 def write_exe(path: Path, body: str) -> Path:
     path.write_text("#!/usr/bin/env bash\n" + textwrap.dedent(body))
     path.chmod(0o755)
@@ -442,6 +447,35 @@ class TestCliLane(unittest.TestCase):
         self.assertLess(time.time() - t0, 15, "did not return promptly on timeout")
         time.sleep(3)
         self.assertFalse(marker.exists(), "child survived the kill and kept running")
+
+    def test_ansi_escapes_are_stripped_not_whole_lines(self):
+        """#28: the old filter dropped any line starting with an escape byte --
+        and with one machine's clock emoji. Deleting an answer line to dodge a
+        banner is the wrong trade in a tool that flags clipped answers."""
+        d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d, True)
+        exe = write_exe(d / "cli", PRINTF_ANSI)
+        out = rt.cli_lane({"command": str(exe), "args": ["-p"], "stdin": True,
+                           "timeout": 10}, "hi")
+        self.assertEqual(out["answer"], "green answer")
+
+    def test_an_answer_starting_with_an_emoji_survives(self):
+        # The hardcoded clock emoji deleted any line beginning with it, so a
+        # lane answering with an emoji, bullet or flag lost that line.
+        d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d, True)
+        exe = write_exe(d / "cli", PRINTF_EMOJI)
+        out = rt.cli_lane({"command": str(exe), "args": ["-p"], "stdin": True,
+                           "timeout": 10}, "hi")
+        self.assertIn("the answer", out["answer"])
+
+    def test_a_lane_may_declare_its_own_banner_prefixes(self):
+        d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d, True)
+        exe = write_exe(d / "cli", PRINTF_BANNER)
+        out = rt.cli_lane({"command": str(exe), "args": ["-p"], "stdin": True,
+                           "timeout": 10, "strip_prefixes": [">>"]}, "hi")
+        self.assertEqual(out["answer"], "real answer")
 
     def test_nonzero_exit_is_an_error(self):
         exe = write_exe(self.tmp / "fail", 'echo "boom" >&2; exit 3')

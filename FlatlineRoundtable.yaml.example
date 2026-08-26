@@ -101,6 +101,13 @@ lanes:
                     # model by the same provider -- this field is for the case
                     # only you can know.
 
+  # strip_prefixes: [">>"]   # cli lanes only: drop stdout lines starting with
+                             # any of these. For a CLI that prints an update
+                             # banner or progress marker the general ANSI strip
+                             # cannot catch. Per-lane on purpose -- one CLI's
+                             # quirk hardcoded into the shared harness silently
+                             # deletes another lane's answer line.
+
   # ----------------------------------------------------------------- cli ----
   # Subscription-backed assistants, driven in one-shot print mode.
   #
