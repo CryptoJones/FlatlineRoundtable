@@ -1046,6 +1046,24 @@ class TestPricing(unittest.TestCase):
         est = rt.estimate_run(lanes, "a" * 400, {"x": (0.0, 1e-6)}, {})
         self.assertAlmostEqual(est, 1000 * 1e-6, places=9)
 
+    def test_retries_multiply_the_prompt_charge(self):
+        """#27: http_lane re-issues on an error-body 200 and on an empty answer,
+        and both bill the prompt. The estimate assumed one call per lane."""
+        lanes = [{"name": "A", "harness": "http", "model": "m", "max_tokens": 0}]
+        table = {"m": (1.0, 0.0)}                    # price the prompt side only
+        once = rt.estimate_run(lanes, "z" * 4000, table, {}, {}, retries=0)
+        thrice = rt.estimate_run(lanes, "z" * 4000, table, {}, {}, retries=3)
+        self.assertAlmostEqual(thrice, once * 4)
+
+    def test_retries_do_not_multiply_the_completion_charge(self):
+        # A retry happens precisely because no usable completion came back, so
+        # the completion ceiling is still a single max_tokens.
+        lanes = [{"name": "A", "harness": "http", "model": "m", "max_tokens": 1000}]
+        table = {"m": (0.0, 1.0)}                    # price the completion side only
+        once = rt.estimate_run(lanes, "z" * 4000, table, {}, {}, retries=0)
+        thrice = rt.estimate_run(lanes, "z" * 4000, table, {}, {}, retries=3)
+        self.assertAlmostEqual(once, thrice)
+
     def test_free_lanes_contribute_nothing(self):
         lanes = [{"name": "A", "harness": "cli", "model": "x", "max_tokens": 99999}]
         self.assertEqual(rt.estimate_run(lanes, "hello", {}, {}), 0.0)
