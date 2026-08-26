@@ -258,6 +258,28 @@ class TestFreeLaneResilience(unittest.TestCase):
                     {"model": "ratelimited", "base_url": s.url, "timeout": 10}, "hi", None, 1)
         self.assertEqual(slept, [60.0])
 
+    def test_retry_after_parses_the_forms_vendors_actually_send(self):
+        """#30: `.isdigit()` accepted neither legal form reliably."""
+        self.assertEqual(rt.parse_retry_after("60"), 60.0)
+        self.assertEqual(rt.parse_retry_after("1.5"), 1.5)     # was silently ignored
+        self.assertEqual(rt.parse_retry_after("  30  "), 30.0)
+        self.assertIsNone(rt.parse_retry_after(None))
+        self.assertIsNone(rt.parse_retry_after(""))
+        self.assertIsNone(rt.parse_retry_after("soon"))
+
+    def test_retry_after_accepts_the_http_date_form(self):
+        import datetime as dt, email.utils
+        when = dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=45)
+        got = rt.parse_retry_after(email.utils.format_datetime(when))
+        self.assertIsNotNone(got)
+        self.assertGreater(got, 30)
+        self.assertLess(got, 60)
+
+    def test_a_retry_after_date_in_the_past_is_not_negative(self):
+        import datetime as dt, email.utils
+        when = dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=120)
+        self.assertEqual(rt.parse_retry_after(email.utils.format_datetime(when)), 0.0)
+
     def test_retry_after_is_still_capped(self):
         # Honour the vendor, but never park a lane for an hour.
         slept = self._no_sleep()

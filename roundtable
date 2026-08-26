@@ -30,6 +30,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures as cf
 import datetime as dt
+import email.utils
 import json
 import os
 import shutil
@@ -399,6 +400,32 @@ def build_pacers(lanes: list[dict]) -> dict[str, Pacer]:
 # --------------------------------------------------------------------------- #
 # transport
 # --------------------------------------------------------------------------- #
+def parse_retry_after(value: str | None) -> float | None:
+    """Seconds to wait, from a Retry-After header, or None if it says nothing.
+
+    The header has two legal forms and the previous `.isdigit()` test accepted
+    neither reliably: "1.5" is not all digits, and the HTTP-date form is not
+    either, so both silently fell back to the default backoff -- under a comment
+    promising the vendor's own number would be honoured.
+    """
+    if not value:
+        return None
+    value = value.strip()
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        pass
+    try:
+        when = email.utils.parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return None
+    if when is None:
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=dt.timezone.utc)
+    return max(0.0, (when - dt.datetime.now(dt.timezone.utc)).total_seconds())
+
+
 def http_lane(lane: dict, prompt: str, key: str | None, retries: int) -> dict:
     body = {
         "model": lane["model"],
@@ -460,8 +487,9 @@ def http_lane(lane: dict, prompt: str, key: str | None, retries: int) -> dict:
             if transient and attempt < retries:
                 attempt += 1
                 # Honour Retry-After rather than hammering a rate-limited vendor.
-                time.sleep(min(float(retry_after), RETRY_AFTER_CAP)
-                           if retry_after and retry_after.isdigit() else RETRY_BACKOFF * attempt)
+                wait = parse_retry_after(retry_after)
+                time.sleep(min(wait, RETRY_AFTER_CAP) if wait is not None
+                           else RETRY_BACKOFF * attempt)
                 continue
             raise RuntimeError(f"HTTP {e.code}: {e.read()[:200].decode(errors='replace')}") from None
         except urllib.error.URLError as e:
