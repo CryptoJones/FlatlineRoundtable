@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures as cf
+import contextlib
 import datetime as dt
 import json
 import os
@@ -642,7 +643,9 @@ def ask(lane, prompt, keys, retries, deadline, sems, lock, spent, prices, pacers
         "error": None,
         "finish_reason": None,
     }
-    sem = sems.get(lane.get("vendor") or lane["name"])
+    # A vendor with no configured semaphore must not crash the lane: `with None`
+    # raises, and ask() is now called from synthesize() as well as the fan-out.
+    sem = sems.get(lane.get("vendor") or lane["name"]) or contextlib.nullcontext()
     try:
         if deadline and time.time() > deadline:
             raise RuntimeError("global deadline passed before dispatch")
@@ -734,8 +737,11 @@ def pick_synthesizers(lanes, want, n):
     pool = [l for l in lanes if l["name"] != want]
 
     def rank(l):
-        # cli rides a subscription; :free costs nothing; everything else bills.
-        return (0 if l["harness"] == "cli"
+        # cli and acp ride a subscription; :free costs nothing; the rest bill.
+        # acp used to rank alongside metered http, which made reader choice
+        # roster-order dependent and contradicted "prefers free lanes".
+        # lane_prices already treats acp as free -- this now agrees with it.
+        return (0 if l["harness"] in ("cli", "acp")
                 else 1 if str(l.get("model", "")).endswith(":free")
                 else 2)
 
@@ -803,7 +809,40 @@ def compare_readings(readings, lane_names):
     return conflicts
 
 
-def synthesize(results, brief, cfg, lanes, keys, prices, count=2):
+def estimate_synthesis(lanes, brief, table, defaults, calib, want, count):
+    """Worst-case cost of the --diff readers.
+
+    This used to be invisible to the budget. Each reader is sent the brief plus
+    *every* lane's answer, so it is the largest single request of the run -- and
+    since two readers became the default, it is sent twice. Gating the panel and
+    ignoring the synthesis made `--max-spend` a check on the cheap half.
+
+    Bounded before dispatch the same way the panel is: assume every lane fills
+    its max_tokens, which is the ceiling its answer can reach.
+    """
+    readers = pick_synthesizers(lanes, want, count)
+    if not readers:
+        return 0.0
+    body_chars = sum(
+        float(l.get("max_tokens", defaults.get("max_tokens", 2000)))
+        * chars_per_token(l.get("model"), calib)
+        for l in lanes
+    )
+    prompt_chars = min(len(brief), 4000) + body_chars + len(SYNTH_PROMPT)
+    total = 0.0
+    for r in readers:
+        pin, pout = lane_prices(r, table)
+        if not (pin or pout):
+            continue
+        in_tok = prompt_chars / chars_per_token(r.get("model"), calib)
+        # synthesize() raises a reader's ceiling to at least 1500; match it.
+        out_tok = max(float(r.get("max_tokens", defaults.get("max_tokens", 2000))), 1500)
+        total += in_tok * pin + out_tok * pout
+    return total
+
+
+def synthesize(results, brief, cfg, lanes, keys, prices, count=2,
+               sems=None, lock=None, spent=None, deadline=None, pacers=None, retries=1):
     """Ask N lanes to report where the others diverged (issues #6, #8).
 
     Reading N full answers does not scale, and disagreement is the actual
@@ -832,25 +871,27 @@ def synthesize(results, brief, cfg, lanes, keys, prices, count=2):
                         for r in answered)
     ask_text = SYNTH_PROMPT.format(n=len(answered), brief=brief.strip()[:4000], answers=body)
 
+    # Route readers through ask() rather than calling the transports directly.
+    # Going around it meant synthesis ignored the per-vendor semaphore (so it
+    # could overrun a single-slot local server), ignored rpm pacing, ignored the
+    # deadline, and -- worst -- never added its tokens to `spent`, so the run's
+    # reported cost omitted its largest request.
     def read(lane):
         synth_lane = {**lane, "max_tokens": max(int(lane.get("max_tokens", 2000)), 1500),
                       "personality": None}
-        if synth_lane["harness"] == "cli":
-            out = cli_lane(synth_lane, ask_text)
-        elif synth_lane["harness"] == "acp":
-            out = acp_lane(synth_lane, ask_text)
-        else:
-            key = keys.get(synth_lane["key_entry"]) if synth_lane.get("key_entry") else None
-            out = http_lane(synth_lane, ask_text, key, 1)
-        return {"by": lane["name"], "text": out["answer"]}
+        return ask(synth_lane, ask_text, keys, retries, deadline,
+                   sems if sems is not None else {}, lock or threading.Lock(),
+                   spent if spent is not None else [0.0],
+                   lane_prices(lane, prices), pacers)
 
     readings, errors = [], []
     with cf.ThreadPoolExecutor(max_workers=len(chosen)) as pool:
         for lane, fut in [(l, pool.submit(read, l)) for l in chosen]:
-            try:
-                readings.append(fut.result())
-            except Exception as e:
-                errors.append(f"{lane['name']}: {e}")
+            r = fut.result()          # ask() never raises; it reports via "error"
+            if r.get("answer"):
+                readings.append({"by": lane["name"], "text": r["answer"]})
+            else:
+                errors.append(f"{lane['name']}: {r.get('error') or 'empty answer'}")
 
     if not readings:
         return None, f"synthesis failed ({'; '.join(errors)})"
@@ -908,7 +949,14 @@ def main() -> int:
     # Refuse BEFORE spending, not after. A budget checked only on the way out
     # reports an overrun; it does not prevent one.
     calib = load_calibration()
-    estimate = estimate_run(lanes, prompt, prices, cfg.get("defaults") or {}, calib)
+    defaults = cfg.get("defaults") or {}
+    estimate = estimate_run(lanes, prompt, prices, defaults, calib)
+    if a.diff:
+        # The readers are dispatched from inside this run, so their cost belongs
+        # in the gate that decides whether to dispatch at all.
+        estimate += estimate_synthesis(lanes, prompt, prices, defaults, calib,
+                                       cfg.get("synthesizer"),
+                                       int(cfg.get("synthesizers", 2)))
     if budget is not None and estimate > budget:
         die(
             f"estimated worst case ${estimate:.4f} exceeds budget ${budget:.2f} — refusing to dispatch\n"
@@ -943,7 +991,10 @@ def main() -> int:
     synth = None
     if a.diff:
         synth, synth_err = synthesize(results, prompt, cfg, lanes, keys, prices,
-                                      count=int(cfg.get("synthesizers", 2)))
+                                      count=int(cfg.get("synthesizers", 2)),
+                                      sems=sems, lock=lock, spent=spent,
+                                      deadline=deadline, pacers=pacers,
+                                      retries=int(cfg.get("retries", 1)))
 
     if not a.no_transcript:
         TRANSCRIPT_DIR.mkdir(parents=True, exist_ok=True)
