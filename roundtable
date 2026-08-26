@@ -107,6 +107,9 @@ RETRY_BACKOFF = 3
 # CLAUDE_CODE_USE_VERTEX route `claude` to AWS/GCP metered billing using ambient
 # cloud credentials, with no API key involved at all -- a key-only denylist does
 # nothing about them. A *_BASE_URL points the CLI at an arbitrary proxy.
+# CSI sequences (colour, cursor moves) and the OSC form used for titles and
+# hyperlinks. NO_COLOR=1 covers most CLIs; this covers the ones it does not.
+ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
 SCRUB_ENV = (
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_AUTH_TOKEN",
@@ -708,10 +711,21 @@ def cli_lane(lane: dict, prompt: str) -> dict:
 
     if proc.returncode != 0:
         raise RuntimeError(f"{lane['command']} exit {proc.returncode}: {err.strip()[:200]}")
-    # Shell profiles and CLI update banners pollute stdout. Drop obvious
-    # non-answer noise rather than trusting the stream to be clean.
-    lines = [l for l in out.splitlines() if not l.strip().startswith(("🕐", "\x1b"))]
-    text = "\n".join(lines).strip()
+    # Shell profiles and CLI banners pollute stdout with escape sequences. Strip
+    # them rather than dropping whole lines: deleting an answer line to dodge a
+    # banner is the wrong trade in a tool that treats a clipped answer as a
+    # failure worth surfacing.
+    #
+    # There used to be a hardcoded clock emoji here too -- one machine's
+    # shell-hook banner, baked into a general-purpose tool, silently deleting any
+    # answer line that happened to begin with that glyph. A per-CLI quirk belongs
+    # in that lane's config, which is what `strip_prefixes` is for, and the
+    # general rule belongs here.
+    text = ANSI_RE.sub("", out)
+    drop = tuple(lane.get("strip_prefixes") or ())
+    if drop:
+        text = "\n".join(l for l in text.splitlines() if not l.strip().startswith(drop))
+    text = text.strip()
     if not text:
         raise RuntimeError("produced no output")
     return {"answer": text, "finish_reason": "stop", "served_by": lane["command"], "usage": None}
