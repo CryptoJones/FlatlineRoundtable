@@ -155,6 +155,34 @@ class TestConfigValidation(unittest.TestCase):
     def test_rejects_http_lane_without_base_url(self):
         self._dies([{"name": "A", "harness": "http", "model": "m"}], "needs base_url")
 
+    def test_a_yaml_boolean_name_is_explained_not_just_rejected(self):
+        """#29: `name: Off` arrives as False and reported "has no name" -- an
+        error naming neither the cause nor the fix."""
+        f = Path(tempfile.mkdtemp()) / "c.yaml"
+        f.write_text("lanes:\n  - name: Off\n    harness: cli\n"
+                     "    command: x\n    args: ['-p']\n    stdin: true\n")
+        with self.assertRaises(SystemExit) as e:
+            rt.load_config(f)
+        msg = str(e.exception)
+        self.assertIn("name must be a string", msg)
+        self.assertIn("quote the name", msg)
+
+    def test_yes_and_on_are_caught_too(self):
+        for word in ("Yes", "On", "No"):
+            with self.subTest(word=word):
+                f = Path(tempfile.mkdtemp()) / "c.yaml"
+                f.write_text(f"lanes:\n  - name: {word}\n    harness: cli\n"
+                             "    command: x\n    args: ['-p']\n    stdin: true\n")
+                with self.assertRaises(SystemExit) as e:
+                    rt.load_config(f)
+                self.assertIn("name must be a string", str(e.exception))
+
+    def test_a_quoted_boolean_word_is_a_valid_name(self):
+        f = Path(tempfile.mkdtemp()) / "c.yaml"
+        f.write_text('lanes:\n  - name: "Off"\n    harness: cli\n'
+                     "    command: x\n    args: ['-p']\n    stdin: true\n")
+        self.assertEqual(rt.load_config(f)["lanes"][0]["name"], "Off")
+
     def test_rejects_duplicate_lane_names(self):
         self._dies(
             [{"name": "A", "harness": "cli", "command": "x", "args": ["-p"], "stdin": True},

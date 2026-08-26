@@ -307,6 +307,16 @@ def load_config(path: Path) -> dict:
             die(f"lane #{i + 1} is not a mapping")
         lane = {**defaults, **raw}
         name = lane.get("name")
+        # YAML 1.1 reads Off/No as False and Yes/On as True, so an unquoted
+        # lane called `Off` arrives here as a boolean and the truthiness check
+        # below reported "has no name" -- an error naming neither the cause nor
+        # the fix, for a plausible name for a parked lane.
+        if name is not None and not isinstance(name, str):
+            # The original text is already gone -- the parser handed us a bool --
+            # so name the rule rather than echoing a useless {name!r}.
+            die(f"lane #{i + 1}: name must be a string, got the boolean {name!r}. "
+                f"YAML reads Off/No as false and Yes/On as true; "
+                f"quote the name to keep it a string.")
         if not name:
             die(f"lane #{i + 1} has no name")
         if name in seen:
