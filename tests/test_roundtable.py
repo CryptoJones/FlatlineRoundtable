@@ -355,6 +355,67 @@ class TestSynthesis(unittest.TestCase):
     def test_never_returns_more_than_asked(self):
         self.assertEqual(len(rt.pick_synthesizers(self.LANES, None, 1)), 1)
 
+    def test_acp_ranks_as_free_like_cli(self):
+        # lane_prices treats acp as free; rank used to put it alongside metered
+        # http, making reader choice depend on roster order.
+        lanes = [{"name": "Paid", "harness": "http", "vendor": "m", "model": "big"},
+                 {"name": "Acp",  "harness": "acp",  "vendor": "p", "model": "x"}]
+        self.assertEqual(rt.pick_synthesizers(lanes, None, 1)[0]["name"], "Acp")
+        self.assertEqual(rt.pick_synthesizers(list(reversed(lanes)), None, 1)[0]["name"], "Acp")
+
+    def test_synthesis_cost_is_estimated_before_dispatch(self):
+        lanes = [{"name": f"L{i}", "harness": "http", "vendor": f"v{i}",
+                  "model": "paid", "max_tokens": 2000} for i in range(3)]
+        table = {"paid": (1.0, 1.0)}
+        est = rt.estimate_synthesis(lanes, "brief", table, {}, {}, None, 2)
+        self.assertGreater(est, 0)
+
+    def test_synthesis_estimate_scales_with_reader_count(self):
+        lanes = [{"name": f"L{i}", "harness": "http", "vendor": f"v{i}",
+                  "model": "paid", "max_tokens": 2000} for i in range(3)]
+        table = {"paid": (1.0, 1.0)}
+        one = rt.estimate_synthesis(lanes, "brief", table, {}, {}, None, 1)
+        two = rt.estimate_synthesis(lanes, "brief", table, {}, {}, None, 2)
+        self.assertGreater(two, one)
+
+    def test_free_readers_estimate_to_nothing(self):
+        lanes = [{"name": "Cli", "harness": "cli", "vendor": "a", "model": "sonnet"},
+                 {"name": "Acp", "harness": "acp", "vendor": "b", "model": "x"}]
+        self.assertEqual(
+            rt.estimate_synthesis(lanes, "brief", {"sonnet": (1.0, 1.0)}, {}, {}, None, 2),
+            0.0)
+
+    def test_synthesis_spend_lands_in_the_run_total(self):
+        """The hole in #19: synthesis tokens never reached `spent`."""
+        with StubServer() as s:
+            lanes = [{"name": f"L{i}", "harness": "http", "vendor": f"v{i}",
+                      "model": "m", "base_url": s.url, "timeout": 10}
+                     for i in range(2)]
+            results = [{"lane": "L0", "model": "m", "answer": "a", "usage": {}},
+                       {"lane": "L1", "model": "m", "answer": "b", "usage": {}}]
+            spent = [0.0]
+            synth, err = rt.synthesize(
+                results, "brief", {}, lanes, {}, {"m": (1.0, 1.0)}, count=2,
+                sems={}, lock=threading.Lock(), spent=spent, retries=0)
+            self.assertIsNone(err)
+            self.assertEqual(len(synth["readings"]), 2)
+        self.assertGreater(spent[0], 0.0)
+
+    def test_a_reader_failing_reports_rather_than_raising(self):
+        with StubServer() as s:
+            lanes = [{"name": "Good", "harness": "http", "vendor": "a",
+                      "model": "m", "base_url": s.url, "timeout": 10},
+                     {"name": "Bad", "harness": "http", "vendor": "b",
+                      "model": "always_error_body", "base_url": s.url, "timeout": 10}]
+            results = [{"lane": "X", "model": "m", "answer": "a"},
+                       {"lane": "Y", "model": "m", "answer": "b"}]
+            synth, err = rt.synthesize(
+                results, "brief", {}, lanes, {}, {}, count=2,
+                sems={}, lock=threading.Lock(), spent=[0.0], retries=0)
+        self.assertIsNone(err)
+        self.assertEqual(len(synth["readings"]), 1)
+        self.assertEqual(len(synth["errors"]), 1)
+
     def test_classify_mentions_buckets_lanes_by_section(self):
         text = ("AGREED\nAlpha and Beta both say yes.\n"
                 "SPLIT\nGamma disagrees.\n"
