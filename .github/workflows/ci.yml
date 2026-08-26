@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # PyYAML is the tool's only dependency and it is deliberately the only one.
+      # If this line ever grows a second package, that is a signal the
+      # dependency budget was breached, not a routine change.
+      - name: Install PyYAML
+        run: python3 -m pip install --quiet pyyaml
+
+      - name: Test suite
+        run: python3 -m unittest discover -s tests -v
+
+      # --list must resolve every route from config alone. Point the process at
+      # a dead proxy: if any lane dials out here it fails loudly, rather than
+      # silently costing money the first time someone adds a real key.
+      # --config is used rather than seeding $HOME so the check cannot be
+      # affected by, or affect, a real config on the runner.
+      - name: '--list makes no network calls'
+        run: |
+          HTTP_PROXY=http://127.0.0.1:9 HTTPS_PROXY=http://127.0.0.1:9 \
+          ALL_PROXY=http://127.0.0.1:9 \
+          ./roundtable --config tests/fixtures/ci-config.yaml --list
+
+      - name: Shipped example config parses
+        run: |
+          python3 -c "import yaml; yaml.safe_load(open('FlatlineRoundtable.yaml.example')); print('example config OK')"

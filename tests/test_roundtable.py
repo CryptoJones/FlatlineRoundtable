@@ -64,17 +64,49 @@ class StubHandler(BaseHTTPRequestHandler):
         if model == "empty":
             self._send(200, {"choices": [{"message": {"content": ""}, "finish_reason": "stop"}]})
             return
+        # Behaviours below count attempts so a retry can be observed directly.
+        self.server.hits[model] = self.server.hits.get(model, 0) + 1
+        if model == "always_error_body":
+            # HTTP 200 carrying an error payload -- an upstream failure behind a
+            # gateway that itself succeeded.
+            self._send(200, {"error": {"message": "Upstream error from StubCo"}})
+            return
+        if model == "error_body_once":
+            if self.server.hits[model] == 1:
+                self._send(200, {"error": {"message": "Upstream error from StubCo"}})
+                return
+            self._send(200, {"choices": [{"message": {"content": "recovered"},
+                                          "finish_reason": "stop"}]})
+            return
+        if model == "empty_once":
+            if self.server.hits[model] == 1:
+                self._send(200, {"choices": [{"message": {"content": ""},
+                                              "finish_reason": "stop"}]})
+                return
+            self._send(200, {"choices": [{"message": {"content": "recovered"},
+                                          "finish_reason": "stop"}]})
+            return
+        if model == "ratelimited":
+            self._send(429, {"error": {"message": "rate-limited upstream"}},
+                       extra={"Retry-After": "60"})
+            return
+        if model == "ratelimited_forever":
+            self._send(429, {"error": {"message": "rate-limited upstream"}},
+                       extra={"Retry-After": "3600"})
+            return
         self._send(200, {
             "choices": [{"message": {"content": "stub answer"}, "finish_reason": "stop"}],
             "usage": {"prompt_tokens": 100, "completion_tokens": 200},
             "provider": "StubCo",
         })
 
-    def _send(self, code, payload):
+    def _send(self, code, payload, extra=None):
         raw = json.dumps(payload).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(raw)))
+        for k, v in (extra or {}).items():
+            self.send_header(k, v)
         self.end_headers()
         self.wfile.write(raw)
 
@@ -83,6 +115,7 @@ class StubServer:
     def __enter__(self):
         self.srv = HTTPServer(("127.0.0.1", 0), StubHandler)
         self.srv.last_request = self.srv.last_auth = None
+        self.srv.hits = {}
         threading.Thread(target=self.srv.serve_forever, daemon=True).start()
         self.url = f"http://127.0.0.1:{self.srv.server_port}/v1"
         return self
@@ -163,6 +196,75 @@ class TestHttpLane(unittest.TestCase):
         with StubServer() as s:
             with self.assertRaises(RuntimeError):
                 rt.http_lane({"model": "boom", "base_url": s.url, "timeout": 10}, "hi", None, 0)
+
+
+class TestFreeLaneResilience(unittest.TestCase):
+    """The failure modes free endpoints actually produce under load.
+
+    Each of these used to end the lane on the first attempt, which fails the
+    whole run -- a lane that delivered nothing is the bug this tool exists to
+    eliminate, so it is worth one more call to avoid it.
+    """
+
+    def _no_sleep(self):
+        """Patch out the backoff and record what it was asked to wait."""
+        slept = []
+        orig = rt.time.sleep
+        rt.time.sleep = lambda n: slept.append(n)
+        self.addCleanup(lambda: setattr(rt.time, "sleep", orig))
+        return slept
+
+    def test_error_body_in_a_200_is_retried(self):
+        self._no_sleep()
+        with StubServer() as s:
+            out = rt.http_lane(
+                {"model": "error_body_once", "base_url": s.url, "timeout": 10}, "hi", None, 2)
+            self.assertEqual(out["answer"], "recovered")
+            self.assertEqual(s.srv.hits["error_body_once"], 2)
+
+    def test_error_body_still_raises_once_retries_are_spent(self):
+        self._no_sleep()
+        with StubServer() as s:
+            with self.assertRaises(RuntimeError):
+                rt.http_lane(
+                    {"model": "always_error_body", "base_url": s.url, "timeout": 10}, "hi", None, 1)
+            self.assertEqual(s.srv.hits["always_error_body"], 2)
+
+    def test_empty_answer_is_retried(self):
+        self._no_sleep()
+        with StubServer() as s:
+            out = rt.http_lane(
+                {"model": "empty_once", "base_url": s.url, "timeout": 10}, "hi", None, 2)
+            self.assertEqual(out["answer"], "recovered")
+            self.assertEqual(s.srv.hits["empty_once"], 2)
+
+    def test_exhausted_empty_answer_is_still_reported_empty(self):
+        # It must not start raising -- ask() turns this into "empty answer",
+        # and a silent lane still has to fail the run.
+        self._no_sleep()
+        with StubServer() as s:
+            out = rt.http_lane(
+                {"model": "empty", "base_url": s.url, "timeout": 10}, "hi", None, 0)
+            self.assertEqual(out["answer"], "")
+
+    def test_retry_after_is_honoured_past_the_old_30s_cap(self):
+        # Vendors advertise 60s free-tier windows. Sleeping 30 and retrying into
+        # a window that has not reopened burns the retry for nothing.
+        slept = self._no_sleep()
+        with StubServer() as s:
+            with self.assertRaises(RuntimeError):
+                rt.http_lane(
+                    {"model": "ratelimited", "base_url": s.url, "timeout": 10}, "hi", None, 1)
+        self.assertEqual(slept, [60.0])
+
+    def test_retry_after_is_still_capped(self):
+        # Honour the vendor, but never park a lane for an hour.
+        slept = self._no_sleep()
+        with StubServer() as s:
+            with self.assertRaises(RuntimeError):
+                rt.http_lane(
+                    {"model": "ratelimited_forever", "base_url": s.url, "timeout": 10}, "hi", None, 1)
+        self.assertEqual(slept, [rt.RETRY_AFTER_CAP])
 
 
 class TestCliLane(unittest.TestCase):

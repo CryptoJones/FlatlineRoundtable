@@ -62,6 +62,14 @@ CHARS_PER_TOKEN = 4
 # silently overwriting them turns a config typo into a call you did not intend.
 EXTRA_BODY_DENY = {"model", "messages", "stream", "max_tokens"}
 
+# Ceiling on a vendor-supplied Retry-After, in seconds. Free tiers advertise 60s
+# windows; a cap below that sleeps, wakes inside the window that has not
+# reopened, and burns the retry. The old value was 30, which made "honour
+# Retry-After" a no-op for precisely the lanes that depend on it.
+RETRY_AFTER_CAP = 90
+# Base for linear backoff when the vendor gives us nothing to go on.
+RETRY_BACKOFF = 3
+
 # Scrubbed from every CLI lane's environment.
 #
 # THIS IS LOAD-BEARING. `claude -p` authenticates against a Max/Pro subscription
@@ -275,11 +283,32 @@ def http_lane(lane: dict, prompt: str, key: str | None, retries: int) -> dict:
         try:
             with urllib.request.urlopen(req, timeout=lane.get("timeout", 300)) as r:
                 data = json.load(r)
+            # A 200 carrying an error body is how an upstream failure arrives when
+            # the gateway itself succeeded -- "Upstream error from Nvidia" on a
+            # free endpoint under load. No completion was produced, so nothing
+            # billed and another attempt is safe. Previously this raised straight
+            # out of the retry loop, so the single most common free-lane failure
+            # was the one failure that never got a second try.
             if "error" in data:
+                if attempt < retries:
+                    attempt += 1
+                    time.sleep(RETRY_BACKOFF * attempt)
+                    continue
                 raise RuntimeError(str(data["error"])[:300])
             choice = data["choices"][0]
+            answer = (choice["message"].get("content") or "").strip()
+            # An empty body is a lane that delivered nothing, which fails the whole
+            # run -- and free endpoints return it under load (measured: 1 call in 6
+            # on one provider, 1 completion token, finish_reason "stop"). The dead
+            # call billed its prompt only, so a retry is far cheaper than losing
+            # the lane. It IS a second charge on a metered lane, so it is bounded
+            # by `retries` exactly like every other path here.
+            if not answer and attempt < retries:
+                attempt += 1
+                time.sleep(RETRY_BACKOFF * attempt)
+                continue
             return {
-                "answer": (choice["message"].get("content") or "").strip(),
+                "answer": answer,
                 "finish_reason": choice.get("finish_reason"),
                 "served_by": data.get("provider"),
                 "usage": data.get("usage"),
@@ -290,13 +319,14 @@ def http_lane(lane: dict, prompt: str, key: str | None, retries: int) -> dict:
             if transient and attempt < retries:
                 attempt += 1
                 # Honour Retry-After rather than hammering a rate-limited vendor.
-                time.sleep(min(float(retry_after), 30) if retry_after and retry_after.isdigit() else 3 * attempt)
+                time.sleep(min(float(retry_after), RETRY_AFTER_CAP)
+                           if retry_after and retry_after.isdigit() else RETRY_BACKOFF * attempt)
                 continue
             raise RuntimeError(f"HTTP {e.code}: {e.read()[:200].decode(errors='replace')}") from None
         except urllib.error.URLError as e:
             if attempt < retries:
                 attempt += 1
-                time.sleep(3 * attempt)
+                time.sleep(RETRY_BACKOFF * attempt)
                 continue
             raise RuntimeError(f"connection failed: {e.reason}") from None
         except TimeoutError:
