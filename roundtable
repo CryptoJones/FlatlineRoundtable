@@ -1135,6 +1135,15 @@ def main() -> int:
 
     cfg = load_config(a.config)
     lanes = [l for l in cfg["lanes"] if l.get("active", True)]
+    # `0/0 lanes answered` used to exit 0, reporting success for a run that
+    # asked nobody anything. len(answered) == len(results) is true of two empty
+    # lists. That is the same shape as partial delivery -- a lane that silently
+    # did not run -- and in a cron or CI context the exit code is the only
+    # signal anyone sees. --list is exempt: showing an empty roster is a fair
+    # answer to "what is configured".
+    if not lanes and not a.list:
+        die(f"{a.config} has lanes, but none are active — "
+            f"set active: true on at least one")
     if a.lanes:
         want = {n.strip().lower() for n in a.lanes.split(",")}
         lanes = [l for l in lanes if l["name"].lower() in want]

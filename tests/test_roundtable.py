@@ -1193,6 +1193,24 @@ class TestEndToEnd(unittest.TestCase):
         # And a run that could not deliver every lane must still fail.
         self.assertEqual(r.returncode, 1)
 
+    def test_a_roster_with_no_active_lanes_fails(self):
+        """#26: `0/0 answered` exited 0 -- success for a run that asked nobody.
+
+        `len(answered) == len(results)` is true of two empty lists. Same shape as
+        partial delivery, and in cron the exit code is the only signal."""
+        r = self._run([{"name": "Parked", "harness": "http", "model": "m",
+                        "base_url": "http://127.0.0.1:1/v1", "active": False}])
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("none are active", r.stdout + r.stderr)
+
+    def test_list_still_shows_an_empty_roster(self):
+        # "what is configured" is a fair question even when the answer is none.
+        r = self._run([{"name": "Parked", "harness": "http", "model": "m",
+                        "base_url": "http://127.0.0.1:1/v1", "active": False}],
+                      "--list")
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("0 active lane(s)", r.stdout)
+
     def test_budget_refuses_before_dispatch(self):
         with StubServer() as s:
             r = self._run(
