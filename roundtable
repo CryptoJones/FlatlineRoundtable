@@ -285,6 +285,16 @@ def load_config(path: Path) -> dict:
                 die(f"{name}: cli lane needs a command")
             if not lane.get("args"):
                 die(f"{name}: cli lane needs args (use '{{prompt}}' or stdin: true)")
+            # The line above only proved args is non-empty. Without one of these
+            # two, the brief is never delivered: cmd carries no prompt, stdin is
+            # DEVNULL, and the personality-prepend finds nothing to attach to.
+            # The dangerous outcome is not the CLI erroring -- that fails loudly.
+            # It is a CLI that answers an empty prompt with something plausible,
+            # producing a lane that counts as a vote without having seen the
+            # question.
+            if "{prompt}" not in lane["args"] and not lane.get("stdin"):
+                die(f"{name}: cli lane would send no prompt — "
+                    f"put '{{prompt}}' in args, or set stdin: true")
 
         if lane.get("rpm") is not None:
             try:
