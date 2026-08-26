@@ -350,6 +350,9 @@ def load_config(path: Path) -> dict:
                 die(f"{name}: cli lane would send no prompt — "
                     f"put '{{prompt}}' in args, or set stdin: true")
 
+        if lane.get("lineage") is not None and not isinstance(lane["lineage"], str):
+            die(f"{name}: lineage must be a string naming a model family")
+
         if lane.get("rpm") is not None:
             try:
                 rpm = float(lane["rpm"])
@@ -463,6 +466,46 @@ def build_semaphores(lanes: list[dict], default_cc: int) -> dict[str, threading.
         cc = int(l.get("concurrency", default_cc))
         caps[gid] = min(caps.get(gid, cc), cc)
     return {gid: threading.Semaphore(cc) for gid, cc in caps.items()}
+def lineage_collisions(results: list[dict], lanes: list[dict]) -> list[dict]:
+    """Lanes that answered from the same place, and so do not vote independently.
+
+    The product claim is that convergence between independently-trained models
+    is evidence. Every other guard in this tool protects the plumbing of that
+    claim -- the cost gates, the orphan kills, the partial-delivery exit --
+    while nothing protected the claim itself.
+
+    A gateway routes one model string to whatever provider is cheapest at that
+    moment, and a roster can name the same model twice by accident. When either
+    happens the panel reports agreement and the agreement is an echo.
+
+    Two lanes collide when they resolved to the same (served_by, model), or when
+    they declare the same `lineage:`. Reported, never fatal: a deliberate
+    duplicate is a legitimate thing to want, it just must not be silent.
+    """
+    by_name = {l["name"]: l for l in lanes}
+    groups: dict[tuple, list[str]] = {}
+    for r in results:
+        if not r.get("answer"):
+            continue
+        lane = by_name.get(r.get("lane")) or {}
+        lineage = lane.get("lineage")
+        # A declared lineage is the operator's own claim and outranks whatever
+        # the gateway happened to report.
+        key = (("lineage", lineage) if lineage
+               else ("served", r.get("served_by"), r.get("model")))
+        if key[1] is None:
+            continue
+        groups.setdefault(key, []).append(r["lane"])
+    out = []
+    for key, names in groups.items():
+        if len(names) < 2:
+            continue
+        out.append({
+            "lanes": sorted(names),
+            "kind": key[0],
+            "detail": key[1] if key[0] == "lineage" else f"{key[1]} / {key[2]}",
+        })
+    return sorted(out, key=lambda c: c["lanes"])
 
 
 def build_pacers(lanes: list[dict]) -> dict[str, Pacer]:
@@ -1128,6 +1171,12 @@ def main() -> int:
     # estimate is measured rather than assumed.
     record_calibration(results, prompt, lanes)
 
+    # Convergence between lanes that turn out to be the same model is an echo,
+    # not evidence. Never fatal -- a deliberate duplicate is a legitimate thing
+    # to want -- but it must not be silent, because it is invisible in the
+    # answers themselves.
+    collisions = lineage_collisions(results, lanes)
+
     synth = None
     if a.diff:
         synth, synth_err = synthesize(results, prompt, cfg, lanes, keys, prices,
@@ -1141,7 +1190,8 @@ def main() -> int:
         stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
         path = TRANSCRIPT_DIR / f"{stamp}.json"
         path.write_text(json.dumps(
-            {"brief": prompt, "results": results, "synthesis": synth}, indent=2))
+            {"brief": prompt, "results": results, "synthesis": synth,
+             "collisions": collisions}, indent=2))
 
     if a.json:
         print(json.dumps({"results": results, "synthesis": synth} if a.diff else results, indent=2))
@@ -1174,7 +1224,11 @@ def main() -> int:
             print(f"\n  !! {synth_err}", file=sys.stderr)
     else:
         for r in results:
-            print(f"\n{'=' * 74}\n{r['lane']}  ({r['model'] or r['harness']})  {r['seconds']}s")
+            # served_by was captured on every http response and never shown.
+            # Who actually answered is the evidence for the independence claim.
+            via = f"  via {r['served_by']}" if r.get("served_by") else ""
+            print(f"\n{'=' * 74}\n{r['lane']}  ({r['model'] or r['harness']})"
+                  f"{via}  {r['seconds']}s")
             print("=" * 74)
             print(r["answer"] if r["answer"] else f"  !! {r['error']}")
             if r.get("truncated"):
@@ -1188,6 +1242,16 @@ def main() -> int:
         for r in results:
             if not r["answer"]:
                 print(f"  FAILED  {r['lane']}: {r['error']}")
+        # Next to the summary rather than above the answers: a warning printed
+        # before the reader has seen anything is a warning they scroll past.
+        if collisions:
+            print(f"\n  LANES THAT ARE NOT INDEPENDENT", file=sys.stderr)
+            for c in collisions:
+                how = "declared lineage" if c["kind"] == "lineage" else "answered from"
+                print(f"    {', '.join(c['lanes'])} — {how} {c['detail']}",
+                      file=sys.stderr)
+            print("    Agreement between these is an echo, not convergence.",
+                  file=sys.stderr)
 
     # Backstop only -- the pre-flight gate above is what actually protects the
     # budget. This catches an estimate that was too optimistic.

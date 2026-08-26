@@ -92,6 +92,14 @@ lanes:
                                       # them. Over-scrubbing fails a lane
                                       # loudly; under-scrubbing costs money
                                       # silently.
+  # lineage: qwen   # optional: name the model FAMILY, not the model. Two lanes
+                    # sharing a lineage do not vote independently even when
+                    # their model ids differ and their providers differ, so
+                    # after a run roundtable says so rather than letting their
+                    # agreement read as convergence. Collisions are also
+                    # detected automatically when two lanes are served the same
+                    # model by the same provider -- this field is for the case
+                    # only you can know.
 
   # ----------------------------------------------------------------- cli ----
   # Subscription-backed assistants, driven in one-shot print mode.

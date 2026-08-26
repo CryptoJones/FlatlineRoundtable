@@ -725,6 +725,71 @@ class TestVendorSemaphores(unittest.TestCase):
     def test_the_default_applies_when_no_lane_sets_one(self):
         sems = rt.build_semaphores([{"name": "A", "vendor": "v"}], 3)
         self.assertEqual(self._slots(sems["v"]), 3)
+class TestLineageCollisions(unittest.TestCase):
+    """#23: convergence between two lanes that are the same model is an echo.
+
+    Every other guard protects the plumbing of the independence claim. This one
+    protects the claim.
+    """
+
+    LANES = [{"name": "A"}, {"name": "B"}, {"name": "C"}]
+
+    def test_same_provider_and_model_collide(self):
+        results = [
+            {"lane": "A", "answer": "x", "served_by": "DeepInfra", "model": "m"},
+            {"lane": "B", "answer": "y", "served_by": "DeepInfra", "model": "m"},
+            {"lane": "C", "answer": "z", "served_by": "Novita", "model": "other"},
+        ]
+        got = rt.lineage_collisions(results, self.LANES)
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0]["lanes"], ["A", "B"])
+        self.assertIn("DeepInfra", got[0]["detail"])
+
+    def test_same_provider_different_model_does_not_collide(self):
+        results = [
+            {"lane": "A", "answer": "x", "served_by": "DeepInfra", "model": "m1"},
+            {"lane": "B", "answer": "y", "served_by": "DeepInfra", "model": "m2"},
+        ]
+        self.assertEqual(rt.lineage_collisions(results, self.LANES), [])
+
+    def test_declared_lineage_collides_across_providers(self):
+        # The point of the field: two Qwen derivatives served by different
+        # gateways still share priors.
+        lanes = [{"name": "A", "lineage": "qwen"}, {"name": "B", "lineage": "qwen"},
+                 {"name": "C", "lineage": "mistral"}]
+        results = [
+            {"lane": "A", "answer": "x", "served_by": "Alibaba", "model": "q1"},
+            {"lane": "B", "answer": "y", "served_by": "DeepInfra", "model": "q2"},
+            {"lane": "C", "answer": "z", "served_by": "Mistral", "model": "m"},
+        ]
+        got = rt.lineage_collisions(results, lanes)
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0]["lanes"], ["A", "B"])
+        self.assertEqual(got[0]["kind"], "lineage")
+
+    def test_a_failed_lane_cannot_collide(self):
+        results = [
+            {"lane": "A", "answer": "x", "served_by": "DeepInfra", "model": "m"},
+            {"lane": "B", "answer": None, "served_by": "DeepInfra", "model": "m"},
+        ]
+        self.assertEqual(rt.lineage_collisions(results, self.LANES), [])
+
+    def test_unknown_provider_is_not_a_collision(self):
+        # cli/acp lanes and any endpoint that does not name a provider.
+        results = [
+            {"lane": "A", "answer": "x", "served_by": None, "model": "m"},
+            {"lane": "B", "answer": "y", "served_by": None, "model": "m"},
+        ]
+        self.assertEqual(rt.lineage_collisions(results, self.LANES), [])
+
+    def test_lineage_must_be_a_string(self):
+        f = Path(tempfile.mkdtemp()) / "c.yaml"
+        f.write_text(json.dumps({"lanes": [
+            {"name": "A", "harness": "http", "model": "m",
+             "base_url": "http://x/v1", "lineage": 3}]}))
+        with self.assertRaises(SystemExit) as e:
+            rt.load_config(f)
+        self.assertIn("lineage must be a string", str(e.exception))
 
 
 class TestPacer(unittest.TestCase):
