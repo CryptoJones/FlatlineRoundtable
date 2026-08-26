@@ -650,6 +650,34 @@ class TestSynthesis(unittest.TestCase):
         got = rt.compare_readings(readings, ["Alpha", "Beta"])
         self.assertEqual({c["lane"] for c in got}, {"Alpha", "Beta"})
 
+    def test_overlapping_placements_are_not_a_conflict(self):
+        """#51: readers differ in how liberally they name lanes.
+
+        One writes "all four land on the same core" and names every lane in every
+        section; another names lanes only under LONE CLAIMS. Observed live on a
+        panel whose own reader said "no genuine disagreement" -- and every lane
+        was flagged."""
+        readings = [
+            {"by": "Wordy", "text": "AGREED\nAlpha\nSPLIT\nAlpha\nLONE CLAIMS\nAlpha"},
+            {"by": "Terse", "text": "AGREED\nnobody named\nLONE CLAIMS\nAlpha"},
+        ]
+        self.assertEqual(rt.compare_readings(readings, ["Alpha"]), [])
+
+    def test_disjoint_placements_are_still_a_conflict(self):
+        readings = [
+            {"by": "R1", "text": "AGREED\nAlpha"},
+            {"by": "R2", "text": "SPLIT\nAlpha"},
+        ]
+        got = rt.compare_readings(readings, ["Alpha"])
+        self.assertEqual([c["lane"] for c in got], ["Alpha"])
+
+    def test_one_reader_silent_on_a_lane_is_not_a_conflict(self):
+        readings = [
+            {"by": "R1", "text": "AGREED\nAlpha"},
+            {"by": "R2", "text": "AGREED\nsomething else entirely"},
+        ]
+        self.assertEqual(rt.compare_readings(readings, ["Alpha"]), [])
+
     def test_no_conflict_when_readers_agree(self):
         readings = [
             {"by": "R1", "text": "AGREED\nAlpha\nSPLIT\nBeta"},
