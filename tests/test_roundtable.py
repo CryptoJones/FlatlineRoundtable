@@ -322,6 +322,72 @@ class TestCliLane(unittest.TestCase):
             rt.cli_lane({"command": str(exe), "args": ["-p"], "timeout": 10}, "hi")
 
 
+class TestTokenCalibration(unittest.TestCase):
+    """The pre-flight estimate measures itself instead of assuming 4 chars/token.
+
+    The budget check refuses runs that would overspend, so the one thing this
+    must never do is come in *under* the truth.
+    """
+
+    def setUp(self):
+        self.cache = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.cache, True)
+        self._orig = rt.TOKENIZER_CACHE
+        rt.TOKENIZER_CACHE = self.cache / "tokens.json"
+        self.addCleanup(lambda: setattr(rt, "TOKENIZER_CACHE", self._orig))
+
+    def test_unmeasured_model_uses_the_pessimistic_constant(self):
+        self.assertEqual(rt.chars_per_token("never-seen", {}), rt.CHARS_PER_TOKEN)
+
+    def test_too_few_samples_still_uses_the_constant(self):
+        calib = {"m": {"chars": 400, "tokens": 100, "samples": 1}}
+        self.assertEqual(rt.chars_per_token("m", calib), rt.CHARS_PER_TOKEN)
+
+    def test_measured_ratio_is_used_once_there_are_enough_samples(self):
+        # 300 chars for 100 tokens = 3.0, shrunk by the safety factor.
+        calib = {"m": {"chars": 300, "tokens": 100, "samples": 5}}
+        self.assertAlmostEqual(rt.chars_per_token("m", calib),
+                               3.0 * rt.CALIBRATION_SAFETY)
+
+    def test_the_safety_factor_errs_high_never_low(self):
+        # A measured ratio must translate into an estimate at or above the one
+        # the raw measurement implies -- fewer chars per token means more
+        # tokens, means a bigger number.
+        calib = {"m": {"chars": 300, "tokens": 100, "samples": 5}}
+        self.assertLess(rt.chars_per_token("m", calib), 3.0)
+
+    def test_a_corrupt_cache_is_ignored_not_fatal(self):
+        rt.TOKENIZER_CACHE.parent.mkdir(parents=True, exist_ok=True)
+        rt.TOKENIZER_CACHE.write_text("{ this is not json")
+        self.assertEqual(rt.load_calibration(), {})
+
+    def test_recording_accumulates_across_runs(self):
+        lanes = [{"name": "A", "model": "m", "personality": "x" * 100}]
+        results = [{"lane": "A", "model": "m", "usage": {"prompt_tokens": 50}}]
+        rt.record_calibration(results, "y" * 100, lanes)
+        rt.record_calibration(results, "y" * 100, lanes)
+        calib = rt.load_calibration()
+        self.assertEqual(calib["m"]["samples"], 2)
+        self.assertEqual(calib["m"]["chars"], 400)     # (100 + 100) * 2
+        self.assertEqual(calib["m"]["tokens"], 100)    # 50 * 2
+
+    def test_lanes_without_usage_are_not_recorded(self):
+        # cli/acp lanes report no usage; recording a zero would skew the ratio.
+        lanes = [{"name": "A", "model": "m"}]
+        rt.record_calibration([{"lane": "A", "model": "m", "usage": None}], "hi", lanes)
+        self.assertEqual(rt.load_calibration(), {})
+
+    def test_estimate_shrinks_once_a_model_is_measured(self):
+        lanes = [{"name": "A", "harness": "http", "model": "m", "max_tokens": 0}]
+        table = {"m": (1.0, 0.0)}          # price the prompt side only
+        prompt = "z" * 4000
+        naive = rt.estimate_run(lanes, prompt, table, {}, {})
+        measured = rt.estimate_run(
+            lanes, prompt, table, {}, {"m": {"chars": 8000, "tokens": 1000, "samples": 9}})
+        # 8 chars/token measured vs the constant 4: half the tokens, half the cost.
+        self.assertLess(measured, naive)
+
+
 class TestPacer(unittest.TestCase):
     """Proactive per-vendor pacing.
 
@@ -483,13 +549,17 @@ class TestEndToEnd(unittest.TestCase):
 
     def _run(self, lanes, *args, extra_cfg=None):
         d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d, True)
         cfg = {"lanes": lanes}
         cfg.update(extra_cfg or {})
         (d / "c.yaml").write_text(json.dumps(cfg))
+        # Point the caches at the throwaway dir. A test must not fold its stub's
+        # fake usage numbers into the developer's real token calibration.
+        env = {**os.environ, "XDG_CACHE_HOME": str(d / "cache")}
         return subprocess.run(
             [sys.executable, str(ROOT / "roundtable"), "--config", str(d / "c.yaml"),
              "--no-transcript", *args, "brief"],
-            capture_output=True, text=True, timeout=90,
+            capture_output=True, text=True, timeout=90, env=env,
         )
 
     def test_all_answered_exits_zero(self):

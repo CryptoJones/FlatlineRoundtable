@@ -19,6 +19,11 @@ deadline_seconds: 600   # whole-run wall clock
 # synthesizer: Chair    # lane used by --diff to report where the others split;
                         # defaults to a free lane so the convenience is free
 # budget_usd: 0.50      # refuse to finish over this (needs price_per_mtok on metered lanes)
+                        # The pre-flight estimate calibrates itself: every http
+                        # response reports usage.prompt_tokens for a prompt whose
+                        # length is known, so the real chars-per-token ratio is
+                        # measured per model and cached. Until a model has a few
+                        # samples a pessimistic constant is used instead.
 
 lanes:
   # ---------------------------------------------------------------- http ----

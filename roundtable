@@ -49,14 +49,34 @@ except ImportError:
 
 DEFAULT_CONFIG = Path.home() / ".config" / "flatline-roundtable" / "FlatlineRoundtable.yaml"
 TRANSCRIPT_DIR = Path.home() / ".local" / "share" / "flatline-roundtable" / "transcripts"
-PRICING_CACHE = Path.home() / ".cache" / "flatline-roundtable" / "pricing.json"
+# Honours XDG_CACHE_HOME, which is both correct on Linux and what lets the tests
+# point the caches somewhere disposable instead of writing to a real one.
+CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "flatline-roundtable"
+PRICING_CACHE = CACHE_DIR / "pricing.json"
+TOKENIZER_CACHE = CACHE_DIR / "tokens.json"
 PRICING_TTL = 24 * 3600
 OPENROUTER_MODELS = "https://openrouter.ai/api/v1/models"
 
-# Rough, deliberately pessimistic. Real tokenizers vary by model and we would
-# need one per vendor to do better; ~4 chars/token overestimates for English
-# prose, which is the safe direction for a budget check.
+# Fallback when a model has never been measured. Deliberately pessimistic:
+# ~4 chars/token overestimates for English prose, which is the safe direction
+# for a budget check.
+#
+# Shipping a real tokenizer was considered and rejected. tiktoken only covers
+# OpenAI, and this roster spans DeepSeek, Mistral, Gemini, Qwen, Cohere and
+# MiniMax -- each with its own vocabulary, so one tokenizer would be wrong for
+# almost every lane while adding a dependency. Instead the tool measures itself:
+# every http response reports usage.prompt_tokens for a prompt whose length we
+# know exactly, so the real ratio is observable for free. Same principle as
+# load_pricing -- prefer measured reality to a hand-maintained constant.
 CHARS_PER_TOKEN = 4
+
+# A measured ratio is shrunk by this before use, so the estimate keeps erring
+# high. The budget check exists to refuse a run that would overspend; an
+# estimate that came in under the truth would defeat it.
+CALIBRATION_SAFETY = 0.9
+
+# One run of one lane is not a ratio. Below this, keep using the constant.
+MIN_CALIBRATION_SAMPLES = 3
 
 # Keys a lane's `extra_body` must never set: they define the request itself, and
 # silently overwriting them turns a config typo into a call you did not intend.
@@ -130,6 +150,62 @@ def load_pricing(lanes: list[dict]) -> dict[str, tuple[float, float]]:
     return out
 
 
+def load_calibration() -> dict:
+    """Observed chars-per-token per model, accumulated across past runs."""
+    try:
+        return json.loads(TOKENIZER_CACHE.read_text())
+    except Exception:
+        # A missing or corrupt cache must never fail a run: the constant is a
+        # perfectly serviceable fallback, it is just wider than it needs to be.
+        return {}
+
+
+def chars_per_token(model: str | None, calib: dict) -> float:
+    """Measured ratio for this model, or the pessimistic constant."""
+    rec = calib.get(model or "")
+    if not rec or rec.get("samples", 0) < MIN_CALIBRATION_SAMPLES:
+        return CHARS_PER_TOKEN
+    tokens = rec.get("tokens", 0)
+    if tokens <= 0:
+        return CHARS_PER_TOKEN
+    # Shrink toward more-tokens-per-char so the estimate stays on the safe side.
+    return max(1.0, (rec["chars"] / tokens) * CALIBRATION_SAFETY)
+
+
+def record_calibration(results: list[dict], prompt: str, lanes: list[dict]) -> None:
+    """Fold this run's real prompt_tokens back into the cache.
+
+    Only http lanes report usage, and only the prompt side is measurable this
+    way -- the completion side is already bounded by max_tokens, which is the
+    worst case the budget check needs anyway.
+    """
+    by_name = {l["name"]: l for l in lanes}
+    calib = load_calibration()
+    touched = False
+    for r in results:
+        usage = r.get("usage") or {}
+        ptok = usage.get("prompt_tokens")
+        model = r.get("model")
+        lane = by_name.get(r.get("lane"))
+        if not (ptok and model and lane):
+            continue
+        chars = len(prompt) + len(lane.get("personality") or "")
+        if chars <= 0:
+            continue
+        rec = calib.setdefault(model, {"chars": 0, "tokens": 0, "samples": 0})
+        rec["chars"] += chars
+        rec["tokens"] += int(ptok)
+        rec["samples"] += 1
+        touched = True
+    if not touched:
+        return
+    try:
+        TOKENIZER_CACHE.parent.mkdir(parents=True, exist_ok=True)
+        TOKENIZER_CACHE.write_text(json.dumps(calib, indent=2, sort_keys=True))
+    except OSError:
+        pass      # a cache we cannot write is a slightly wider estimate, nothing more
+
+
 def lane_prices(lane: dict, table: dict) -> tuple[float, float]:
     """(prompt, completion) per-token price for a lane, or (0, 0) if free/unknown."""
     if lane.get("price_per_mtok") is not None:      # explicit override
@@ -140,19 +216,22 @@ def lane_prices(lane: dict, table: dict) -> tuple[float, float]:
     return table.get(lane.get("model"), (0.0, 0.0))
 
 
-def estimate_run(lanes: list[dict], prompt: str, table: dict, defaults: dict) -> float:
+def estimate_run(lanes: list[dict], prompt: str, table: dict, defaults: dict,
+                 calib: dict | None = None) -> float:
     """Worst-case cost BEFORE dispatch (issue #4).
 
     Enforcing a budget only after responses return reports an overrun rather
     than preventing one -- the money is already spent by then. Assume every lane
     answers to its full max_tokens, which is the ceiling a run can actually hit.
     """
+    calib = calib or {}
     total = 0.0
     for l in lanes:
         pin, pout = lane_prices(l, table)
         if not (pin or pout):
             continue
-        in_tok = (len(prompt) + len(l.get("personality") or "")) / CHARS_PER_TOKEN
+        in_tok = (len(prompt) + len(l.get("personality") or "")) / chars_per_token(
+            l.get("model"), calib)
         out_tok = float(l.get("max_tokens", defaults.get("max_tokens", 2000)))
         total += in_tok * pin + out_tok * pout
     return total
@@ -709,7 +788,8 @@ def main() -> int:
 
     # Refuse BEFORE spending, not after. A budget checked only on the way out
     # reports an overrun; it does not prevent one.
-    estimate = estimate_run(lanes, prompt, prices, cfg.get("defaults") or {})
+    calib = load_calibration()
+    estimate = estimate_run(lanes, prompt, prices, cfg.get("defaults") or {}, calib)
     if budget is not None and estimate > budget:
         die(
             f"estimated worst case ${estimate:.4f} exceeds budget ${budget:.2f} — refusing to dispatch\n"
@@ -736,6 +816,10 @@ def main() -> int:
         ))
 
     answered = [r for r in results if r["answer"]]
+
+    # Fold this run's real prompt_tokens back in, so the next pre-flight
+    # estimate is measured rather than assumed.
+    record_calibration(results, prompt, lanes)
 
     synth = None
     if a.diff:
