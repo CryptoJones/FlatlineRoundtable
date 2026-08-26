@@ -322,6 +322,73 @@ class TestCliLane(unittest.TestCase):
             rt.cli_lane({"command": str(exe), "args": ["-p"], "timeout": 10}, "hi")
 
 
+class TestSynthesis(unittest.TestCase):
+    """--diff runs two readers, and compares them mechanically.
+
+    One reader cannot show its own bias: with a single reading you cannot tell a
+    real split from that model's taste in splits. Comparing the two with a THIRD
+    model would just move the problem, so the comparison is structural.
+    """
+
+    LANES = [
+        {"name": "Cli",   "harness": "cli",  "vendor": "anthropic", "model": "sonnet"},
+        {"name": "Free",  "harness": "http", "vendor": "openrouter", "model": "x/y:free"},
+        {"name": "Paid",  "harness": "http", "vendor": "mistral",    "model": "big"},
+        {"name": "Free2", "harness": "http", "vendor": "openrouter", "model": "z/w:free"},
+    ]
+
+    def test_prefers_free_lanes_and_spreads_across_vendors(self):
+        got = rt.pick_synthesizers(self.LANES, None, 2)
+        self.assertEqual([l["name"] for l in got], ["Cli", "Free"])
+        self.assertEqual(len({l["vendor"] for l in got}), 2)
+
+    def test_an_explicit_synthesizer_is_kept_and_joined_by_another_vendor(self):
+        got = rt.pick_synthesizers(self.LANES, "Paid", 2)
+        self.assertEqual(got[0]["name"], "Paid")
+        self.assertNotEqual(got[1]["vendor"], "mistral")
+
+    def test_repeats_a_vendor_only_when_spread_cannot_fill_the_quota(self):
+        two_lanes = [l for l in self.LANES if l["vendor"] == "openrouter"]
+        got = rt.pick_synthesizers(two_lanes, None, 2)
+        self.assertEqual(len(got), 2)      # correlated beats having only one
+
+    def test_never_returns_more_than_asked(self):
+        self.assertEqual(len(rt.pick_synthesizers(self.LANES, None, 1)), 1)
+
+    def test_classify_mentions_buckets_lanes_by_section(self):
+        text = ("AGREED\nAlpha and Beta both say yes.\n"
+                "SPLIT\nGamma disagrees.\n"
+                "LONE CLAIMS\nDelta invented a number.")
+        got = rt.classify_mentions(text, ["Alpha", "Beta", "Gamma", "Delta"])
+        self.assertEqual(got["Alpha"], ["AGREED"])
+        self.assertEqual(got["Gamma"], ["SPLIT"])
+        self.assertEqual(got["Delta"], ["LONE CLAIMS"])
+
+    def test_classify_mentions_survives_an_unstructured_reading(self):
+        # A model that ignores the format must not crash the comparison.
+        self.assertEqual(rt.classify_mentions("they all basically agree", ["Alpha"]), {})
+        self.assertEqual(rt.classify_mentions("", ["Alpha"]), {})
+
+    def test_conflicts_are_reported_when_readers_disagree(self):
+        readings = [
+            {"by": "R1", "text": "AGREED\nAlpha\nSPLIT\nBeta"},
+            {"by": "R2", "text": "AGREED\nBeta\nSPLIT\nAlpha"},
+        ]
+        got = rt.compare_readings(readings, ["Alpha", "Beta"])
+        self.assertEqual({c["lane"] for c in got}, {"Alpha", "Beta"})
+
+    def test_no_conflict_when_readers_agree(self):
+        readings = [
+            {"by": "R1", "text": "AGREED\nAlpha\nSPLIT\nBeta"},
+            {"by": "R2", "text": "AGREED\nAlpha\nSPLIT\nBeta"},
+        ]
+        self.assertEqual(rt.compare_readings(readings, ["Alpha", "Beta"]), [])
+
+    def test_a_single_reading_yields_no_conflicts(self):
+        readings = [{"by": "R1", "text": "AGREED\nAlpha"}]
+        self.assertEqual(rt.compare_readings(readings, ["Alpha"]), [])
+
+
 class TestTokenCalibration(unittest.TestCase):
     """The pre-flight estimate measures itself instead of assuming 4 chars/token.
 

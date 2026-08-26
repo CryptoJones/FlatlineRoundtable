@@ -6,8 +6,6 @@ neither side drifts.
 
 ## Open
 
-- [ ] `--diff` synthesis is one lane's reading, not a neutral one. Consider
-      running it on two lanes and reporting where the *syntheses* differ. ([#8](https://github.com/CryptoJones/FlatlineRoundtable/issues/8))
 
 ## Verification set
 
@@ -35,6 +33,11 @@ rest still need a human, and the env-scrub and orphan-kill checks especially.
 
 ## Done
 
+- [x] `--diff` uses two independent readers from different vendors and reports
+      where the *readings* disagree about a lane's classification, so the
+      synthesizer's own bias is visible rather than invisible. The comparison is
+      mechanical — a third model judging the first two would only move the
+      problem. ([#8](https://github.com/CryptoJones/FlatlineRoundtable/issues/8))
 - [x] Pre-flight estimate calibrates itself from observed `usage.prompt_tokens`
       instead of assuming 4 chars/token, falling back to the constant until a
       model has enough samples. Note the original premise was wrong: 4

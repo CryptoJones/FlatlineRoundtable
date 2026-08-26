@@ -115,12 +115,21 @@ roundtable --diff                  # report only where the lanes disagree
 roundtable --no-transcript
 ```
 
-`--diff` asks one lane to report AGREED / SPLIT / LONE CLAIMS across the others,
+`--diff` asks lanes to report AGREED / SPLIT / LONE CLAIMS across the others,
 because reading N full answers does not scale and disagreement is the product.
-It is opt-in and it is not neutral — the synthesizer is one model with its own
-priors deciding what counts as a disagreement, so the raw answers still go to the
-transcript. It prefers a free lane, so the convenience does not quietly cost
-money.
+
+It is opt-in and it is not neutral — a synthesizer is one model with its own
+priors deciding what counts as a disagreement, so the raw answers still go to
+the transcript. That is also why it uses **two** readers by default, picked from
+different vendors: with a single reading you cannot tell a real split from that
+model's taste in splits. Where the two place the same lane differently,
+roundtable says so under `THE READERS DISAGREE` — that is the reading doing the
+work rather than the evidence, and a signal to go read that lane's raw answer.
+
+The comparison is mechanical on purpose. Handing it to a third model would just
+move the problem one level up. Set `synthesizers: 1` to go back to a single
+reader, or name a specific one with `synthesizer: <lane>`. It prefers free
+lanes, so the convenience does not quietly cost money.
 
 Every run writes a transcript to
 `~/.local/share/flatline-roundtable/transcripts/`, because answers that exist
