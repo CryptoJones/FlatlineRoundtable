@@ -19,6 +19,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -322,14 +323,52 @@ class TestCliLane(unittest.TestCase):
 
 
 class TestSecrets(unittest.TestCase):
+    def _fake_pass(self, body):
+        """Put a stub `pass` first on PATH.
+
+        This test used to depend on the host having a real `pass` installed --
+        it passed on a developer machine and failed the moment it ran anywhere
+        else, because roundtable dies on "pass is not installed" before it can
+        reach the missing-entry branch. Supplying the binary keeps the test
+        hermetic and lets each branch be exercised on purpose.
+        """
+        d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d, True)
+        write_exe(d / "pass", body)
+        orig = os.environ["PATH"]
+        os.environ["PATH"] = f"{d}{os.pathsep}{orig}"
+        self.addCleanup(lambda: os.environ.__setitem__("PATH", orig))
+
     def test_missing_pass_entry_aborts_the_run(self):
         """It must never proceed unauthenticated."""
+        self._fake_pass('echo "pass: xyzzy is not in the password store" >&2\nexit 1\n')
         lanes = [{"name": "A", "harness": "http", "model": "m",
                   "base_url": "http://127.0.0.1:1/v1",
                   "key_entry": "definitely/not/a/real/entry/xyzzy"}]
         with self.assertRaises(SystemExit) as e:
             rt.fetch_keys(lanes)
         self.assertIn("xyzzy", str(e.exception))
+
+    def test_absent_pass_binary_aborts_the_run(self):
+        """The other way to have no secret: no `pass` at all."""
+        d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d, True)
+        orig = os.environ["PATH"]
+        os.environ["PATH"] = str(d)          # an empty dir -- no `pass` anywhere
+        self.addCleanup(lambda: os.environ.__setitem__("PATH", orig))
+        lanes = [{"name": "A", "harness": "http", "model": "m",
+                  "base_url": "http://127.0.0.1:1/v1", "key_entry": "some/entry"}]
+        with self.assertRaises(SystemExit) as e:
+            rt.fetch_keys(lanes)
+        self.assertIn("not installed", str(e.exception))
+
+    def test_only_the_first_line_of_a_pass_entry_is_used(self):
+        """`pass` returns the whole file; a blob would land in an auth header."""
+        self._fake_pass('printf "THE-SECRET\nurl: https://example.invalid\n"\n')
+        keys = rt.fetch_keys([{"name": "A", "harness": "http", "model": "m",
+                               "base_url": "http://127.0.0.1:1/v1",
+                               "key_entry": "some/entry"}])
+        self.assertEqual(keys["some/entry"], "THE-SECRET")
 
     def test_lanes_without_keys_need_no_pass(self):
         self.assertEqual(rt.fetch_keys([{"name": "A", "harness": "cli"}]), {})
