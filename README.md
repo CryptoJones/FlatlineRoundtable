@@ -144,6 +144,11 @@ declare the same `lineage:`. It is never fatal — a deliberate duplicate is a
 legitimate thing to want — but it must not be silent, because it is invisible in
 the answers themselves and it falsifies the one claim the tool makes.
 
+Two config files ship with the repo. `FlatlineRoundtable.yaml.example` is the
+annotated template — every option, with the reasoning for each. `examples/full-roster.yaml`
+is a real thirteen-lane roster, kept because a tuned config is mostly *numbers
+you had to measure*, and those are worth reading before you pick your own.
+
 Every run writes a transcript to
 `~/.local/share/flatline-roundtable/transcripts/`, because answers that exist
 only in a terminal scrollback are answers waiting to be lost.
