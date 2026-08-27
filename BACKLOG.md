@@ -6,8 +6,9 @@ neither side drifts.
 
 ## Open
 
-Nothing open. Every item from the 2026-08-26 roundtable review
-shipped; see Done below.
+- [ ] `acp` harness: pool-acp lane times out waiting for session/prompt while
+      poolside streams a full answer — generated, billed, never delivered
+      ([#56](https://github.com/CryptoJones/FlatlineRoundtable/issues/56))
 
 ## Verification set
 
