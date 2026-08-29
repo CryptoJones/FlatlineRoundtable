@@ -1240,12 +1240,60 @@ def main() -> int:
 
     lock, spent = threading.Lock(), [0.0]
     t0 = time.time()
+
+    # The transcript path is claimed BEFORE the fan-out, not after it, so that a
+    # run which dies mid-flight still leaves its finished lanes on disk. This
+    # used to be `list(pool.map(...))` followed by a single write at the end:
+    # every completed answer was held in memory until the last lane returned, so
+    # a SIGKILL, a closed terminal, a harness timeout or a Ctrl-C anywhere in the
+    # fan-out threw away every answer already collected -- including paid http
+    # lanes that had billed for tokens nobody would ever read. The symptom is a
+    # run that "randomly dies" with zero output and no transcript.
+    path = None
+    if not a.no_transcript:
+        TRANSCRIPT_DIR.mkdir(parents=True, exist_ok=True)
+        stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+        path = TRANSCRIPT_DIR / f"{stamp}.json"
+
+    def save(results_so_far, synthesis=None, collisions=None, partial=True):
+        """Write the transcript. Called after every lane, and again at the end.
+
+        Atomic via write-then-replace: a kill during the write leaves the previous
+        good transcript rather than a truncated one.
+        """
+        if path is None:
+            return
+        payload = {"brief": prompt, "results": results_so_far,
+                   "synthesis": synthesis, "collisions": collisions}
+        if partial:
+            payload["partial"] = True
+            payload["note"] = ("run did not finish — these are the lanes that had "
+                               "answered when the transcript was last written")
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(payload, indent=2))
+        tmp.replace(path)
+
+    ordered = [None] * len(lanes)
     with cf.ThreadPoolExecutor(max_workers=max(len(lanes), 1)) as pool:
-        results = list(pool.map(
-            lambda l: ask(l, prompt, keys, int(cfg.get("retries", 1)), deadline, sems, lock,
-                          spent, lane_prices(l, prices), pacers),
-            lanes,
-        ))
+        futures = {
+            pool.submit(ask, l, prompt, keys, int(cfg.get("retries", 1)), deadline,
+                        sems, lock, spent, lane_prices(l, prices), pacers): i
+            for i, l in enumerate(lanes)
+        }
+        for fut in cf.as_completed(futures):
+            i = futures[fut]
+            try:
+                ordered[i] = fut.result()
+            except Exception as e:  # noqa: BLE001 — mirror ask()'s own contract
+                ordered[i] = {"lane": lanes[i]["name"], "model": lanes[i].get("model"),
+                              "vendor": lanes[i].get("vendor"), "harness": lanes[i]["harness"],
+                              "answer": None, "error": str(e), "finish_reason": None}
+            # Persist after every lane. Order is preserved by writing into the
+            # slot the lane was dispatched from, so a partial transcript reads
+            # the same way a complete one does, with `null` for lanes still out.
+            save(ordered)
+
+    results = ordered
 
     answered = [r for r in results if r["answer"]]
 
@@ -1267,13 +1315,9 @@ def main() -> int:
                                       deadline=deadline, pacers=pacers,
                                       retries=int(cfg.get("retries", 1)))
 
-    if not a.no_transcript:
-        TRANSCRIPT_DIR.mkdir(parents=True, exist_ok=True)
-        stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
-        path = TRANSCRIPT_DIR / f"{stamp}.json"
-        path.write_text(json.dumps(
-            {"brief": prompt, "results": results, "synthesis": synth,
-             "collisions": collisions}, indent=2))
+    # Final write: same file the fan-out has been updating, now complete and with
+    # the synthesis attached. Clears the `partial` marker.
+    save(results, synthesis=synth, collisions=collisions, partial=False)
 
     if a.json:
         print(json.dumps({"results": results, "synthesis": synth} if a.diff else results, indent=2))
