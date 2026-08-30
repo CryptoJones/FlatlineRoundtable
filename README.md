@@ -104,7 +104,9 @@ rather than reported.
 ## Usage
 
 ```console
-roundtable "the brief"                  # every active lane, in parallel
+roundtable --each "the brief"           # each lane its own process (do this)
+roundtable --lanes Skeptic "..."        # one lane
+roundtable --panel "the brief"          # all lanes, one shared deadline
 cat brief.md | roundtable -             # long briefs on stdin
 roundtable --lanes Skeptic,Chair "..."  # a subset
 roundtable --list                       # roster + route; no network calls
