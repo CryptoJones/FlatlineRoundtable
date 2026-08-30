@@ -5,10 +5,33 @@ description: Put a question to a panel of independent AI models in parallel and 
 
 # FlatlineRoundtable
 
+## ONE RUN PER LANE. This is not optional.
+
+**Never invoke the whole panel in one command.** Loop, one lane per invocation:
+
 ```bash
-roundtable "the brief"                    # every active lane, parallel
-cat brief.md | roundtable -               # long briefs on stdin
-roundtable --lanes Skeptic,Chair "..."    # a subset
+for lane in $(roundtable --list | awk '{print $2}'); do
+  cat brief.md | roundtable --lanes "$lane" - > "answers/$lane.txt" 2>&1
+done
+```
+
+CJ has given this instruction repeatedly, and it keeps getting violated because
+`roundtable -` looks like the obvious call. It is the wrong call.
+
+A single invocation finishes when its **slowest** lane finishes. That couples every
+lane's fate to the worst one: one slow lane sets the wall-clock for all of them,
+raising its timeout pushes the whole run past the 10-minute foreground Bash cap into
+the background where the task supervisor reaps it, and a lane that dies cannot be
+retried without rerunning everything. Lanes are supposed to be independent; sharing a
+deadline makes their failures dependent.
+
+Measured 2026-08-30: the poolside/ACP lane needs ~400s alone on a 110KB brief and
+exceeded 780s under 12-lane contention. Four consecutive rounds lost it. Every loss
+was avoidable.
+
+```bash
+roundtable --lanes Skeptic "..."          # ONE lane -- the normal call
+cat brief.md | roundtable --lanes X -     # long briefs on stdin
 roundtable --json > answers.json          # structured
 roundtable --list                         # roster + route; no network calls
 ```

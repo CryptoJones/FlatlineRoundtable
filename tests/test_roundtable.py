@@ -1240,6 +1240,13 @@ class TestEndToEnd(unittest.TestCase):
         # Point the caches at the throwaway dir. A test must not fold its stub's
         # fake usage numbers into the developer's real token calibration.
         env = {**os.environ, "XDG_CACHE_HOME": str(d / "cache")}
+        # These end-to-end tests exercise the shared-deadline machinery on
+        # purpose -- pacing, per-vendor semaphores, silent-lane detection -- so
+        # they are exactly the case --panel names. Without it the multi-lane ones
+        # trip the one-run-per-lane guard, which is the guard working.
+        args = list(args)
+        if len(lanes) > 1 and not any(a in ("--each", "--panel", "--lanes") for a in args):
+            args.insert(0, "--panel")
         return subprocess.run(
             [sys.executable, str(ROOT / "roundtable"), "--config", str(d / "c.yaml"),
              "--no-transcript", *args, "brief"],

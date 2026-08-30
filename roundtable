@@ -1170,6 +1170,8 @@ def main() -> int:
     ap.add_argument("brief", nargs="*")
     ap.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     ap.add_argument("--lanes")
+    ap.add_argument("--each", action="store_true")
+    ap.add_argument("--panel", action="store_true")
     ap.add_argument("--list", action="store_true")
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--max-spend", type=float)
@@ -1197,6 +1199,51 @@ def main() -> int:
         lanes = [l for l in lanes if l["name"].lower() in want]
         if not lanes:
             die(f"--lanes matched nothing in {a.config}")
+
+    # ONE RUN PER LANE.
+    #
+    # A single invocation finishes when its SLOWEST lane finishes, which couples
+    # every lane's fate to the worst one: one slow lane sets the wall-clock for
+    # all of them, raising its timeout pushes the run past a caller's timeout, and
+    # a lane that dies cannot be retried without rerunning everything. Lanes are
+    # meant to be independent; sharing a deadline makes their failures dependent.
+    #
+    # Measured 2026-08-30: the poolside/ACP lane needs ~400s alone on a 110KB
+    # brief and exceeded 780s under 12-lane contention, losing its answer in four
+    # consecutive rounds. Every one of those losses was avoidable.
+    #
+    # So multi-lane runs must say which they want. --each is the right answer and
+    # is what the refusal points at; --panel is the escape hatch for anyone who
+    # genuinely wants the old shared-deadline behaviour.
+    if len(lanes) > 1 and not a.list and not (a.each or a.panel):
+        die("refusing to run {n} lanes in one invocation.\n"
+            "  A shared deadline makes independent lanes fail together: the run is\n"
+            "  only as fast as its slowest lane, and one death costs every answer.\n"
+            "\n"
+            "  --each                run each lane as its own process (what you want)\n"
+            "  --lanes NAME          one lane\n"
+            "  --panel               the old shared-deadline behaviour, if you mean it"
+            .format(n=len(lanes)))
+
+    if a.each and not a.list:
+        # Re-invoke ourselves once per lane. Separate processes, separate
+        # deadlines, separate transcripts: a lane can be slow, or die, alone.
+        brief_text = sys.stdin.read() if a.brief[:1] == ["-"] else " ".join(a.brief)
+        if not brief_text.strip():
+            die("empty brief")
+        rc = 0
+        for l in lanes:
+            print(f"\n=== {l['name']} " + "=" * (66 - len(l['name'])), flush=True)
+            argv = [sys.executable, str(Path(__file__).resolve()),
+                    "--lanes", l["name"], "--config", str(a.config)]
+            if a.json:
+                argv.append("--json")
+            if a.no_transcript:
+                argv.append("--no-transcript")
+            argv.append("-")
+            r = subprocess.run(argv, input=brief_text, text=True)
+            rc = rc or r.returncode
+        return rc
 
     if a.list:
         for l in lanes:
