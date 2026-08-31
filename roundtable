@@ -803,8 +803,27 @@ def acp_lane(lane: dict, prompt: str) -> dict:
                     # delivered (#56). Lanes have no tools, so the honest
                     # answers are "no" and "no such method".
                     if m["method"] == "session/request_permission":
-                        send({"jsonrpc": "2.0", "id": m["id"],
-                              "result": {"outcome": {"outcome": "cancelled"}}})
+                        # "cancelled" means the USER cancelled the whole turn,
+                        # and agents honour it: Laguna's first delivered
+                        # full-brief turn ended after one sentence on exactly
+                        # that reply (#62). The no-tools answer is to SELECT a
+                        # reject option -- "denied, carry on" -- and fall back
+                        # to cancelled only when the request offers no options.
+                        opts = ((m.get("params") or {}).get("options")) or []
+                        rej = next((o for o in opts
+                                    if str(o.get("kind", "")).startswith("reject")),
+                                   None) or next(
+                            (o for o in opts
+                             if any(w in str(o.get("name", "")).lower()
+                                    for w in ("reject", "deny"))), None)
+                        if rej is not None and rej.get("optionId") is not None:
+                            send({"jsonrpc": "2.0", "id": m["id"],
+                                  "result": {"outcome": {
+                                      "outcome": "selected",
+                                      "optionId": rej["optionId"]}}})
+                        else:
+                            send({"jsonrpc": "2.0", "id": m["id"],
+                                  "result": {"outcome": {"outcome": "cancelled"}}})
                     else:
                         send({"jsonrpc": "2.0", "id": m["id"],
                               "error": {"code": -32601,
