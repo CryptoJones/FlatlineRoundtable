@@ -777,7 +777,13 @@ def acp_lane(lane: dict, prompt: str) -> dict:
         stderr=subprocess.DEVNULL,
         text=True, bufsize=1, env=env, cwd=workdir, start_new_session=True,
     )
-    lk, replies, chunks = threading.Lock(), {}, []
+    lk, wlk, replies, chunks = threading.Lock(), threading.Lock(), {}, []
+    thoughts = [0]
+
+    def send(msg):
+        with wlk:
+            proc.stdin.write(json.dumps(msg) + "\n")
+            proc.stdin.flush()
 
     def reader():
         try:
@@ -789,12 +795,28 @@ def acp_lane(lane: dict, prompt: str) -> dict:
                 if "id" in m and ("result" in m or "error" in m):
                     with lk:
                         replies[m["id"]] = m
+                elif "id" in m and "method" in m:
+                    # ACP is bidirectional: the agent can call US, and it BLOCKS
+                    # its turn until we respond. Ignoring these (the old
+                    # behaviour) stalls the turn forever while generation keeps
+                    # streaming -- the answer is produced, billed, and never
+                    # delivered (#56). Lanes have no tools, so the honest
+                    # answers are "no" and "no such method".
+                    if m["method"] == "session/request_permission":
+                        send({"jsonrpc": "2.0", "id": m["id"],
+                              "result": {"outcome": {"outcome": "cancelled"}}})
+                    else:
+                        send({"jsonrpc": "2.0", "id": m["id"],
+                              "error": {"code": -32601,
+                                        "message": f"{m['method']} not supported"}})
                 elif m.get("method") == "session/update":
                     u = (m.get("params") or {}).get("update") or {}
                     if u.get("sessionUpdate") == "agent_message_chunk":
                         t = (u.get("content") or {}).get("text")
                         if t:
                             chunks.append(t)
+                    elif u.get("sessionUpdate") == "agent_thought_chunk":
+                        thoughts[0] += 1   # diagnostics only, never the answer
         except (ValueError, OSError):
             pass                       # stream closed under us on kill
 
@@ -802,9 +824,7 @@ def acp_lane(lane: dict, prompt: str) -> dict:
     deadline = time.time() + lane.get("timeout", 300)
 
     def call(rid, method, params):
-        proc.stdin.write(json.dumps(
-            {"jsonrpc": "2.0", "id": rid, "method": method, "params": params}) + "\n")
-        proc.stdin.flush()
+        send({"jsonrpc": "2.0", "id": rid, "method": method, "params": params})
         while time.time() < deadline:
             with lk:
                 if rid in replies:
@@ -812,7 +832,12 @@ def acp_lane(lane: dict, prompt: str) -> dict:
             if proc.poll() is not None:
                 raise RuntimeError(f"{lane['command']} exited during {method}")
             time.sleep(0.05)
-        raise RuntimeError(f"timed out waiting for {method}")
+        # Say what WAS seen: "31733 thought chunks, 0 answer chunks" is a model
+        # still reasoning at the deadline; "0 and 0" is a dead handshake. The
+        # bare message made those look identical for four days.
+        raise RuntimeError(
+            f"timed out waiting for {method} "
+            f"({len(chunks)} answer chunks, {thoughts[0]} thought chunks streamed)")
 
     try:
         call(0, "initialize", {"protocolVersion": lane.get("protocol_version", 1),
@@ -825,8 +850,19 @@ def acp_lane(lane: dict, prompt: str) -> dict:
         text = prompt
         if lane.get("personality"):
             text = f"{lane['personality']}\n\n---\n\n{prompt}"
-        r = call(2, "session/prompt",
-                 {"sessionId": sid, "prompt": [{"type": "text", "text": text}]})
+        try:
+            r = call(2, "session/prompt",
+                     {"sessionId": sid, "prompt": [{"type": "text", "text": text}]})
+        except RuntimeError as e:
+            # The turn's deadline passed, but answer text already streamed in.
+            # Discarding it is the project's cardinal sin inverted: a billed
+            # generation delivered to nobody (#56). Return what arrived, marked
+            # truncated -- the summary must not read it as complete.
+            if str(e).startswith("timed out") and chunks:
+                return {"answer": "".join(chunks).strip(),
+                        "finish_reason": "timeout",
+                        "served_by": lane["command"], "usage": None}
+            raise
         if "error" in r:
             raise RuntimeError(str(r["error"])[:200])
         stop = (r.get("result") or {}).get("stopReason")
@@ -913,7 +949,7 @@ def ask(lane, prompt, keys, retries, deadline, sems, lock, spent, prices, pacers
         if not result["answer"]:
             result["error"] = "empty answer"
         # A clipped answer is a silent failure: it reads as complete and is not.
-        if result.get("finish_reason") == "length":
+        if result.get("finish_reason") in ("length", "timeout"):
             result["truncated"] = True
         # Charge prompt and completion separately: completion is typically 2-4x
         # the prompt rate, so a blended per-token figure understates a long answer.
@@ -1361,7 +1397,9 @@ def main() -> int:
             print("=" * 74)
             print(r["answer"] if r["answer"] else f"  !! {r['error']}")
             if r.get("truncated"):
-                print("\n  !! TRUNCATED — hit max_tokens; raise it for this lane")
+                print("\n  !! TRUNCATED — salvaged at the lane timeout; the turn never finished"
+                      if r.get("finish_reason") == "timeout" else
+                      "\n  !! TRUNCATED — hit max_tokens; raise it for this lane")
         print(f"\n{'=' * 74}")
         print(f"{len(answered)}/{len(results)} lanes answered in {time.time() - t0:.1f}s")
         if spent[0] or estimate:

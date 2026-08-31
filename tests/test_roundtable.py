@@ -1136,6 +1136,54 @@ class TestAcpLane(unittest.TestCase):
         used = Path(Path(self.cwd_file).read_text().strip())
         self.assertFalse(used.exists(), "acp workdir outlived the lane")
 
+    def _custom_agent(self, on_prompt: str) -> Path:
+        """An agent whose session/prompt behaviour is the test's to script."""
+        d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d, True)
+        return write_exe(d / "agent", """            while IFS= read -r line; do
+              case "$line" in
+                *initialize*)
+                    echo '{"jsonrpc":"2.0","id":0,"result":{}}' ;;
+                *session/new*)
+                    echo '{"jsonrpc":"2.0","id":1,"result":{"sessionId":"s1"}}' ;;
+__ON_PROMPT__
+              esac
+            done""".replace("__ON_PROMPT__", on_prompt))
+
+    def test_a_streamed_answer_is_salvaged_when_the_turn_never_finishes(self):
+        """#56: pool-acp streamed a full answer and never sent the
+        session/prompt response. Discarding text that already arrived is a
+        billed generation delivered to nobody -- the cardinal sin inverted."""
+        exe = self._custom_agent("""                *session/prompt*)
+                    echo '{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"text":"salvaged text"}}}}' ;;""")
+        out = rt.acp_lane({"command": str(exe), "args": [], "timeout": 3}, "hi")
+        self.assertEqual(out["answer"], "salvaged text")
+        self.assertEqual(out["finish_reason"], "timeout")
+
+    def test_an_agent_initiated_request_is_answered_not_ignored(self):
+        """#56: ACP is bidirectional -- an agent's own request (e.g.
+        session/request_permission) blocks its turn until the client responds.
+        The old reader ignored it and the turn stalled forever. The agent below
+        completes its turn only after seeing our 'cancelled' response."""
+        exe = self._custom_agent("""                *session/prompt*)
+                    echo '{"jsonrpc":"2.0","id":"perm1","method":"session/request_permission","params":{}}' ;;
+                *perm1*cancelled*)
+                    echo '{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"text":"after permission"}}}}'
+                    echo '{"jsonrpc":"2.0","id":2,"result":{"stopReason":"end_turn"}}' ;;""")
+        out = rt.acp_lane({"command": str(exe), "args": [], "timeout": 10}, "hi")
+        self.assertEqual(out["answer"], "after permission")
+        self.assertEqual(out["finish_reason"], "stop")
+
+    def test_the_timeout_error_reports_what_streamed(self):
+        """A model still reasoning at the deadline and a dead handshake must not
+        produce the same error line -- that ambiguity cost four days on #56."""
+        exe = self._custom_agent("""                *session/prompt*)
+                    echo '{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_thought_chunk","content":{"text":"hmm"}}}}'
+                    echo '{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_thought_chunk","content":{"text":"hmm2"}}}}' ;;""")
+        with self.assertRaisesRegex(RuntimeError,
+                                    r"0 answer chunks, 2 thought chunks"):
+            rt.acp_lane({"command": str(exe), "args": [], "timeout": 3}, "hi")
+
 
 class TestSecrets(unittest.TestCase):
     def _fake_pass(self, body):
