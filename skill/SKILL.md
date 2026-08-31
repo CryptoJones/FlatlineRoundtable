@@ -25,6 +25,8 @@ the background where the task supervisor reaps it, and a lane that dies cannot b
 retried without rerunning everything. Lanes are supposed to be independent; sharing a
 deadline makes their failures dependent.
 
+**Lane order: CmdrData (poolside Laguna) runs LAST, and in the FOREGROUND — CJ SOP, 2026-08-30.** Run every other lane first (backgrounded loop is fine), then CmdrData as its own FOREGROUND Bash call with `timeout: 600000` (the 10-minute harness maximum). Never background this lane: the Claude Code task supervisor reaps backgrounded roundtable runs intermittently, and on 2026-08-30 it reaped two CmdrData attempts mid-flight. CJ's preferred cap is 10000s ("poolside is free to me and is genuinely novel perspective") but foreground's 600s ceiling is the binding limit; if the lane times out silent, re-attempt once, then report the round as N−1 with the lane named — never quietly summarize. Underlying defect was FlatlineRoundtable#56 — the acp harness ignored agent-initiated requests (stalling the turn) and discarded answer text already streamed when the deadline hit. Both fixed 2026-08-30: a turn that times out now returns whatever answer streamed, marked TRUNCATED — so on a huge brief the lane delivers a partial instead of nothing.
+
 Measured 2026-08-30: the poolside/ACP lane needs ~400s alone on a 110KB brief and
 exceeded 780s under 12-lane contention. Four consecutive rounds lost it. Every loss
 was avoidable.
