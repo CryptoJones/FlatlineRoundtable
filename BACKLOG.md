@@ -6,10 +6,10 @@ neither side drifts.
 
 ## Open
 
-- [ ] Optional second round: `--revise latest:N` replays a finished run so each
+- [x] Optional second round: `--revise latest:N` replays a finished run so each
       lane sees the locked answers (own marked YOURS, peers anonymised) and
       opens with HOLD or REVISE; report marks the round non-independent
-      ([#64](https://github.com/CryptoJones/FlatlineRoundtable/issues/64))
+      ([#64](https://github.com/CryptoJones/FlatlineRoundtable/issues/64)) — shipped in PR #65
 - [ ] `acp` harness: pool-acp lane times out waiting for session/prompt while
       poolside streams a full answer — generated, billed, never delivered
       ([#56](https://github.com/CryptoJones/FlatlineRoundtable/issues/56))
