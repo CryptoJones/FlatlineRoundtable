@@ -77,6 +77,20 @@ defects as suspect before treating it as insight. Record defects in that lane's
 answered a general architecture question by citing a specific file and line
 number that does not exist. Verify any concrete claim before repeating it.
 
+## The optional second round — `--revise`
+
+`roundtable --each --revise latest:N` (N = the prior run's lane count) reruns
+the panel with every lane shown the locked round-1 answers, its own marked
+`YOURS`, peers anonymised as PANELIST letters. Lanes open with `HOLD` or
+`REVISE`; the report tallies who moved.
+
+Use it AFTER reading round 1, when the split itself is the question — you want
+to know which positions survive the others' arguments, not just where lanes
+land. Never skip straight to it: round-1 blindness is the tool's entire
+epistemic claim, and a round-2 consensus is persuasion, not convergence. Report
+round-2 agreement to the user as "the panel converged after debate", never as
+"N independent models agree".
+
 ## Cost
 
 `harness` decides cost, not `model`. `cli` lanes ride an existing subscription

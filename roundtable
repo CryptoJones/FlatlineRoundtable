@@ -24,6 +24,16 @@ Usage:
     roundtable --json > answers.json
     roundtable --config PATH
     roundtable --max-spend 0.50
+    roundtable --each --revise latest:12   optional second round: each lane sees
+                                           the locked round-1 answers and may
+                                           HOLD or REVISE
+
+  * Round 1 is blind by construction — a lane cannot see the others because
+    their answers do not exist yet in its process. `--revise` is the only path
+    to cross-lane visibility: it replays a *finished* run's transcript(s), so
+    the packet each lane receives is locked before any lane reads it. Round-2
+    answers are not independent and the report says so; convergence there is
+    persuasion, not evidence.
 """
 from __future__ import annotations
 
@@ -1201,6 +1211,149 @@ def synthesize(results, brief, cfg, lanes, keys, prices, count=2,
     }, None
 
 
+
+# --------------------------------------------------------------------------- #
+# revision round
+# --------------------------------------------------------------------------- #
+
+REVISE_PROMPT = """This is round {round} of a panel. In round {prev} you answered the brief
+below in isolation. Now — and only now — the full panel's answers are in front
+of you, anonymised as PANELIST letters. Yours is marked.
+
+Open your reply with exactly one word on its own line: HOLD or REVISE.
+Then give your full current answer. It REPLACES your round-{prev} answer, so it
+must stand alone. If you REVISE, name the specific argument that moved you and
+the panelist letter it came from. If you HOLD, engage the strongest point made
+against your position instead of restating yourself.
+
+Do not converge for politeness, and do not defer to the majority or to any
+model you think you recognise in an answer's style. Move only for a reason you
+can state.
+{extra}
+--- THE BRIEF ---
+{brief}
+
+--- ROUND {prev} ANSWERS ---
+{answers}"""
+
+
+# The verdict the lane was told to open with. Tolerates the same decoration
+# models actually emit around SECTION_RE's headers: `HOLD`, `**REVISE**`,
+# `## HOLD`, `> REVISE`. Searched only near the top so a lane *quoting* the
+# instructions mid-answer is not misread as a verdict.
+VERDICT_RE = re.compile(r"^[ \t>#*]*(?:\*\*)?(HOLD|REVISE|NEW)\b", re.MULTILINE)
+
+
+def parse_verdict(answer: str | None) -> str | None:
+    m = VERDICT_RE.search((answer or "")[:400])
+    return m.group(1) if m else None
+
+
+def load_transcripts(arg: str) -> tuple[list[Path], dict]:
+    """Resolve --revise's argument into one merged prior round.
+
+    Accepts explicit paths (comma-separated), `latest`, and `latest:N`. The
+    multi-file forms exist because `--each` — the recommended way to run a
+    panel — writes ONE TRANSCRIPT PER LANE by design, so "the previous round"
+    of a 12-lane run is 12 files, and `latest:12` is how you name them without
+    listing them.
+
+    Briefs must match across the files: mixing transcripts of different
+    questions is only ever an accident (a `latest:N` that reached past the run
+    boundary into someone else's transcripts), and the merge would silently
+    hand every lane a packet half about the wrong question.
+    """
+    paths: list[Path] = []
+    for spec in (s.strip() for s in arg.split(",")):
+        if not spec:
+            continue
+        if spec == "latest" or spec.startswith("latest:"):
+            n = 1 if spec == "latest" else int(spec.split(":", 1)[1])
+            cands = sorted(TRANSCRIPT_DIR.glob("*.json"))
+            if len(cands) < n:
+                die(f"--revise {spec}: only {len(cands)} transcript(s) in {TRANSCRIPT_DIR}")
+            paths.extend(cands[-n:])
+        else:
+            paths.append(Path(spec).expanduser())
+    # Dedupe, then chronological order (transcript names are timestamps), so
+    # that when the same lane appears twice the later answer wins below.
+    paths = sorted(set(paths), key=lambda p: p.name)
+    if not paths:
+        die("--revise: no transcript named")
+
+    briefs: set[str] = set()
+    by_lane: dict[str, dict] = {}
+    round_no = 1
+    rounds_seen: set[int] = set()
+    for p in paths:
+        try:
+            data = json.loads(p.read_text())
+        except (OSError, json.JSONDecodeError) as e:
+            die(f"cannot read transcript {p}: {e}")
+        if not isinstance(data, dict) or "brief" not in data or "results" not in data:
+            die(f"{p} is not a roundtable transcript (needs brief + results)")
+        briefs.add(data["brief"].strip())
+        round_no = max(round_no, int(data.get("round") or 1))
+        rounds_seen.add(int(data.get("round") or 1))
+        for r in data["results"]:
+            # An answer never loses to a later failure of the same lane.
+            if r.get("answer") or r["lane"] not in by_lane:
+                by_lane[r["lane"]] = r
+    if len(briefs) > 1:
+        die("--revise: transcripts answer different briefs — refusing to mix them.\n"
+            "  name the files explicitly, or use latest:N with N = that run's lane count")
+    if len(rounds_seen) > 1:
+        # Found in first live use: retrying one failed lane of a revision round
+        # with latest:N swept in the siblings' round-2 transcripts. The brief
+        # guard cannot catch that — a revision round records the SAME brief —
+        # and the merge would hand the lane its peers' round-2 answers labelled
+        # as the round it is trying to redo.
+        die("--revise: transcripts span rounds {} — refusing to mix them.\n"
+            "  name the files of ONE round explicitly".format(sorted(rounds_seen)))
+
+    merged = {"brief": briefs.pop(), "results": list(by_lane.values()), "round": round_no}
+    if not any(r.get("answer") for r in merged["results"]):
+        die("--revise: no answers in the named transcript(s) to revise against")
+    return paths, merged
+
+
+def alias_map(results: list[dict]) -> dict[str, str]:
+    """Stable anonymous letters for every lane that answered.
+
+    Anonymised because attribution invites authority-weighting — "the Anthropic
+    lane said so" is exactly the deference the revision instructions forbid.
+    One global map rather than per-viewer letters, so a lane writing "Panelist
+    C's cost argument moved me" means the same C in every packet and in the
+    transcript's audit record.
+    """
+    answered = [r["lane"] for r in results if r.get("answer")]
+    return {name: (chr(ord("A") + i) if i < 26 else f"P{i + 1}")
+            for i, name in enumerate(answered)}
+
+
+def build_revision_prompt(lane_name: str, prior: dict, aliases: dict[str, str],
+                          round_no: int, focus: str = "") -> str:
+    own = next((r for r in prior["results"]
+                if r["lane"] == lane_name and r.get("answer")), None)
+    sections = []
+    if own:
+        sections.append(f"YOUR ROUND-{round_no - 1} ANSWER "
+                        f"(you are PANELIST {aliases[lane_name]} to the others):\n"
+                        f"{own['answer']}")
+    else:
+        sections.append(f"YOU GAVE NO ROUND-{round_no - 1} ANSWER (your lane failed or "
+                        f"was absent). Treat this as your first answer, and open with "
+                        f"the word NEW instead of HOLD or REVISE.")
+    for r in prior["results"]:
+        if not r.get("answer") or r["lane"] == lane_name:
+            continue
+        sections.append(f"PANELIST {aliases[r['lane']]}:\n{r['answer']}")
+    extra = f"\n--- ADDITIONAL FOCUS FOR THIS ROUND ---\n{focus}\n" if focus else ""
+    return REVISE_PROMPT.format(round=round_no, prev=round_no - 1,
+                                brief=prior["brief"], extra=extra,
+                                answers="\n\n".join(sections))
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(add_help=False)
     ap.add_argument("brief", nargs="*")
@@ -1213,6 +1366,7 @@ def main() -> int:
     ap.add_argument("--max-spend", type=float)
     ap.add_argument("--no-transcript", action="store_true")
     ap.add_argument("--diff", action="store_true")
+    ap.add_argument("--revise", metavar="TRANSCRIPT")
     ap.add_argument("-h", "--help", action="store_true")
     a = ap.parse_args()
     if a.help:
@@ -1235,6 +1389,15 @@ def main() -> int:
         lanes = [l for l in lanes if l["name"].lower() in want]
         if not lanes:
             die(f"--lanes matched nothing in {a.config}")
+
+    # Resolve `latest`/`latest:N` to concrete paths HERE, before --each fans
+    # out. Children run sequentially and each writes a transcript, so a child
+    # resolving "latest" for itself would pick up a sibling's round-2 output —
+    # the exact self-echo this feature must not create.
+    prior = None
+    if a.revise and not a.list:
+        prior_paths, prior = load_transcripts(a.revise)
+        a.revise = ",".join(str(p) for p in prior_paths)
 
     # ONE RUN PER LANE.
     #
@@ -1265,7 +1428,7 @@ def main() -> int:
         # Re-invoke ourselves once per lane. Separate processes, separate
         # deadlines, separate transcripts: a lane can be slow, or die, alone.
         brief_text = sys.stdin.read() if a.brief[:1] == ["-"] else " ".join(a.brief)
-        if not brief_text.strip():
+        if not brief_text.strip() and not a.revise:
             die("empty brief")
         rc = 0
         for l in lanes:
@@ -1276,6 +1439,8 @@ def main() -> int:
                 argv.append("--json")
             if a.no_transcript:
                 argv.append("--no-transcript")
+            if a.revise:
+                argv += ["--revise", a.revise]
             argv.append("-")
             r = subprocess.run(argv, input=brief_text, text=True)
             rc = rc or r.returncode
@@ -1291,8 +1456,25 @@ def main() -> int:
         return 0
 
     prompt = sys.stdin.read() if a.brief[:1] == ["-"] else " ".join(a.brief)
-    if not prompt.strip():
+    if not prompt.strip() and not a.revise:
         die("empty brief")
+
+    # In a revision round the brief on record stays the ORIGINAL question; any
+    # brief text passed alongside --revise rides in the packet as extra focus.
+    prompts = aliases = None
+    round_no = 1
+    brief_on_record = prompt
+    est_prompt = prompt
+    if a.revise:
+        aliases = alias_map(prior["results"])
+        round_no = int(prior.get("round") or 1) + 1
+        prompts = {l["name"]: build_revision_prompt(l["name"], prior, aliases,
+                                                    round_no, focus=prompt.strip())
+                   for l in lanes}
+        brief_on_record = prior["brief"]
+        # Packets differ per lane only by which answer is marked YOURS; the
+        # longest one is the honest worst case for the budget gate.
+        est_prompt = max(prompts.values(), key=len)
 
     budget = a.max_spend if a.max_spend is not None else cfg.get("budget_usd")
     deadline = time.time() + cfg["deadline_seconds"] if cfg.get("deadline_seconds") else None
@@ -1303,12 +1485,12 @@ def main() -> int:
     # reports an overrun; it does not prevent one.
     calib = load_calibration()
     defaults = cfg.get("defaults") or {}
-    estimate = estimate_run(lanes, prompt, prices, defaults, calib,
+    estimate = estimate_run(lanes, est_prompt, prices, defaults, calib,
                             retries=int(cfg.get("retries", 1)))
     if a.diff:
         # The readers are dispatched from inside this run, so their cost belongs
         # in the gate that decides whether to dispatch at all.
-        estimate += estimate_synthesis(lanes, prompt, prices, defaults, calib,
+        estimate += estimate_synthesis(lanes, brief_on_record, prices, defaults, calib,
                                        cfg.get("synthesizer"),
                                        int(cfg.get("synthesizers", 2)))
     if budget is not None and estimate > budget:
@@ -1325,7 +1507,8 @@ def main() -> int:
     t0 = time.time()
     with cf.ThreadPoolExecutor(max_workers=max(len(lanes), 1)) as pool:
         results = list(pool.map(
-            lambda l: ask(l, prompt, keys, int(cfg.get("retries", 1)), deadline, sems, lock,
+            lambda l: ask(l, prompts[l["name"]] if prompts else prompt,
+                          keys, int(cfg.get("retries", 1)), deadline, sems, lock,
                           spent, lane_prices(l, prices), pacers),
             lanes,
         ))
@@ -1334,7 +1517,11 @@ def main() -> int:
 
     # Fold this run's real prompt_tokens back in, so the next pre-flight
     # estimate is measured rather than assumed.
-    record_calibration(results, prompt, lanes)
+    # Calibration pairs one prompt length with each lane's measured
+    # prompt_tokens; in a revision round every lane got a different packet, so
+    # feeding any single length would poison the ratio for the next estimate.
+    if not prompts:
+        record_calibration(results, prompt, lanes)
 
     # Convergence between lanes that turn out to be the same model is an echo,
     # not evidence. Never fatal -- a deliberate duplicate is a legitimate thing
@@ -1344,7 +1531,7 @@ def main() -> int:
 
     synth = None
     if a.diff:
-        synth, synth_err = synthesize(results, prompt, cfg, lanes, keys, prices,
+        synth, synth_err = synthesize(results, brief_on_record, cfg, lanes, keys, prices,
                                       count=int(cfg.get("synthesizers", 2)),
                                       sems=sems, lock=lock, spent=spent,
                                       deadline=deadline, pacers=pacers,
@@ -1354,9 +1541,13 @@ def main() -> int:
         TRANSCRIPT_DIR.mkdir(parents=True, exist_ok=True)
         stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
         path = TRANSCRIPT_DIR / f"{stamp}.json"
-        path.write_text(json.dumps(
-            {"brief": prompt, "results": results, "synthesis": synth,
-             "collisions": collisions}, indent=2))
+        record = {"brief": brief_on_record, "results": results, "synthesis": synth,
+                  "collisions": collisions}
+        if prompts:
+            record.update({"round": round_no,
+                           "parent": [str(p) for p in prior_paths],
+                           "aliases": aliases})
+        path.write_text(json.dumps(record, indent=2))
 
     if a.json:
         print(json.dumps({"results": results, "synthesis": synth} if a.diff else results, indent=2))
@@ -1400,6 +1591,16 @@ def main() -> int:
                 print("\n  !! TRUNCATED — salvaged at the lane timeout; the turn never finished"
                       if r.get("finish_reason") == "timeout" else
                       "\n  !! TRUNCATED — hit max_tokens; raise it for this lane")
+        if prompts:
+            moves = [(r["lane"], parse_verdict(r["answer"]) or "?")
+                     for r in results if r["answer"]]
+            held = sum(1 for _, v in moves if v == "HOLD")
+            print(f"\n{'=' * 74}")
+            print(f"ROUND {round_no} — lanes saw the round-{round_no - 1} answers."
+                  f" Agreement here is persuasion, not independent convergence.")
+            print(f"  {held} HOLD, {len(moves) - held} moved:")
+            for lane, v in moves:
+                print(f"    {lane:<18} {v}")
         print(f"\n{'=' * 74}")
         print(f"{len(answered)}/{len(results)} lanes answered in {time.time() - t0:.1f}s")
         if spent[0] or estimate:
