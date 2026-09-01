@@ -1409,5 +1409,120 @@ class TestEndToEnd(unittest.TestCase):
             self.assertIsNone(s.srv.last_request)
 
 
+# --------------------------------------------------------------------------- #
+# revision round
+# --------------------------------------------------------------------------- #
+class TestRevisionRound(unittest.TestCase):
+    """--revise: round 1 stays blind; round 2 sees locked, anonymised answers."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self._old_dir = rt.TRANSCRIPT_DIR
+        rt.TRANSCRIPT_DIR = self.tmp
+        self.addCleanup(setattr, rt, "TRANSCRIPT_DIR", self._old_dir)
+
+    def _transcript(self, name, brief, results, **extra):
+        p = self.tmp / name
+        p.write_text(json.dumps({"brief": brief, "results": results, **extra}))
+        return p
+
+    @staticmethod
+    def _r(lane, answer):
+        return {"lane": lane, "answer": answer, "model": "m", "harness": "http"}
+
+    def test_latest_n_merges_per_lane_transcripts(self):
+        """--each writes one transcript per lane; latest:N is that whole run."""
+        self._transcript("20260901-000001.json", "q", [self._r("A", "a1")])
+        self._transcript("20260901-000002.json", "q", [self._r("B", "b1")])
+        paths, merged = rt.load_transcripts("latest:2")
+        self.assertEqual(len(paths), 2)
+        self.assertEqual({r["lane"] for r in merged["results"]}, {"A", "B"})
+
+    def test_mixed_briefs_are_refused(self):
+        """A latest:N that reaches past the run boundary must fail loudly, not
+        hand every lane a packet half about the wrong question."""
+        self._transcript("20260901-000001.json", "question one", [self._r("A", "a")])
+        self._transcript("20260901-000002.json", "question two", [self._r("B", "b")])
+        with self.assertRaises(SystemExit):
+            rt.load_transcripts("latest:2")
+
+    def test_an_answer_never_loses_to_a_later_failure(self):
+        self._transcript("20260901-000001.json", "q", [self._r("A", "kept")])
+        self._transcript("20260901-000002.json", "q",
+                         [{"lane": "A", "answer": None, "error": "timeout"}])
+        _, merged = rt.load_transcripts("latest:2")
+        self.assertEqual(merged["results"][0]["answer"], "kept")
+
+    def test_no_answers_at_all_is_refused(self):
+        self._transcript("20260901-000001.json", "q",
+                         [{"lane": "A", "answer": None, "error": "died"}])
+        with self.assertRaises(SystemExit):
+            rt.load_transcripts("latest")
+
+    def test_aliases_skip_lanes_that_gave_no_answer(self):
+        aliases = rt.alias_map([self._r("A", "yes"),
+                                {"lane": "dead", "answer": None},
+                                self._r("C", "also")])
+        self.assertEqual(aliases, {"A": "A", "C": "B"})
+
+    def test_packet_marks_own_answer_and_hides_peer_names(self):
+        prior = {"brief": "the question",
+                 "results": [self._r("sonnet", "sonnet's take"),
+                             self._r("qwen", "qwen's take")]}
+        packet = rt.build_revision_prompt("sonnet", prior, rt.alias_map(prior["results"]), 2)
+        self.assertIn("YOUR ROUND-1 ANSWER", packet)
+        self.assertIn("sonnet's take", packet)
+        self.assertIn("PANELIST B:", packet)
+        self.assertIn("qwen's take", packet)
+        # The peer's LANE NAME must not leak — anonymity is the point.
+        self.assertNotIn("qwen:", packet)
+        self.assertNotIn("PANELIST qwen", packet)
+
+    def test_a_lane_absent_from_round_one_is_told_to_open_with_new(self):
+        prior = {"brief": "q", "results": [self._r("A", "a")]}
+        packet = rt.build_revision_prompt("newcomer", prior,
+                                          rt.alias_map(prior["results"]), 2)
+        self.assertIn("NEW instead of HOLD", packet)
+
+    def test_verdict_parses_the_shapes_models_emit(self):
+        for text, want in [("HOLD\nbecause...", "HOLD"),
+                           ("**REVISE**\n\nnew answer", "REVISE"),
+                           ("## HOLD", "HOLD"),
+                           ("> NEW", "NEW"),
+                           ("I decline to say", None)]:
+            self.assertEqual(rt.parse_verdict(text), want, text)
+
+    def test_a_verdict_quoted_deep_in_the_answer_is_not_a_verdict(self):
+        self.assertIsNone(rt.parse_verdict("x" * 500 + "\nHOLD"))
+
+
+class TestRevisionEndToEnd(unittest.TestCase):
+    def test_revise_run_sends_the_packet_and_reports_the_round(self):
+        d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d, True)
+        prior = d / "prior.json"
+        prior.write_text(json.dumps({"brief": "the original question", "results": [
+            {"lane": "A", "answer": "round-one answer from A", "model": "m", "harness": "http"},
+            {"lane": "B", "answer": "round-one answer from B", "model": "m", "harness": "http"},
+        ]}))
+        with StubServer() as s:
+            cfg = d / "c.yaml"
+            cfg.write_text(json.dumps({"lanes": [
+                {"name": "A", "harness": "http", "model": "m", "base_url": s.url}]}))
+            env = {**os.environ, "XDG_CACHE_HOME": str(d / "cache")}
+            r = subprocess.run(
+                [sys.executable, str(ROOT / "roundtable"), "--config", str(cfg),
+                 "--no-transcript", "--lanes", "A", "--revise", str(prior)],
+                capture_output=True, text=True, timeout=90, env=env)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            sent = s.srv.last_request["messages"][-1]["content"]
+            self.assertIn("YOUR ROUND-1 ANSWER", sent)
+            self.assertIn("round-one answer from B", sent)
+            self.assertNotIn("PANELIST B is B", sent)
+            self.assertIn("ROUND 2", r.stdout)
+            self.assertIn("persuasion, not independent convergence", r.stdout)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

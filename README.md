@@ -115,6 +115,7 @@ roundtable --config PATH
 roundtable --max-spend 0.50        # refuses BEFORE dispatch if the estimate exceeds it
 roundtable --diff                  # report only where the lanes disagree
 roundtable --no-transcript
+roundtable --each --revise latest:12    # optional second round — see below
 ```
 
 `--diff` asks lanes to report AGREED / SPLIT / LONE CLAIMS across the others,
@@ -155,13 +156,49 @@ Every run writes a transcript to
 `~/.local/share/flatline-roundtable/transcripts/`, because answers that exist
 only in a terminal scrollback are answers waiting to be lost.
 
+### `--revise` — the optional second round
+
+Round 1 is blind by construction: a lane cannot see the others because their
+answers do not exist yet in its process. `--revise` is the one deliberate
+exception. It replays a **finished** run's transcript(s), handing every lane
+the locked round-1 answers — its own marked `YOURS`, the rest anonymised as
+`PANELIST A/B/C` — and instructions to open with `HOLD` or `REVISE` and to move
+only for a reason it can state. Anonymised, because "the Anthropic lane said
+so" is exactly the deference the instructions forbid.
+
+```console
+roundtable --each "the brief"             # round 1, blind, 12 lanes
+roundtable --each --revise latest:12      # round 2: the whole prior run
+roundtable --each --revise latest:12 "focus on the cost claims"   # extra focus
+roundtable --lanes Chair --revise ~/.local/share/.../20260901-*.json
+```
+
+`--each` writes one transcript per lane, which is why `--revise` takes
+`latest:N` and comma-separated paths and merges them; it refuses to mix
+transcripts whose briefs differ, because that is only ever an accident. The
+report ends with who held and who moved, under a banner that says the thing
+that matters:
+
+```
+ROUND 2 — lanes saw the round-1 answers. Agreement here is persuasion,
+not independent convergence.
+```
+
+Treat round-2 convergence accordingly. Round 1 tells you where independent
+models land; round 2 tells you which positions survive contact with the
+others' arguments. Both are useful; only the first is evidence of
+independence. A round-2 transcript records `round`, its parent transcripts,
+and the alias map, so the anonymity is auditable after the fact. `--revise
+latest:12` on a round-2 run produces round 3; nothing caps it, but each round
+is another full panel spend, and the returns fall fast.
+
 ## Tests
 
 ```console
 $ python3 -m unittest discover -s tests
 ```
 
-25 tests against a stub HTTP server and fake CLI binaries — no vendor is
+132 tests against a stub HTTP server and fake CLI binaries — no vendor is
 contacted, nothing is spent, no credential is needed. They cover the behaviours
 that silently cost money or leak processes: the env scrub, the process-group
 kill, the missing-secret abort, and partial delivery failing the run.
