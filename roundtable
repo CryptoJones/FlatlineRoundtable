@@ -1284,6 +1284,7 @@ def load_transcripts(arg: str) -> tuple[list[Path], dict]:
     briefs: set[str] = set()
     by_lane: dict[str, dict] = {}
     round_no = 1
+    rounds_seen: set[int] = set()
     for p in paths:
         try:
             data = json.loads(p.read_text())
@@ -1293,6 +1294,7 @@ def load_transcripts(arg: str) -> tuple[list[Path], dict]:
             die(f"{p} is not a roundtable transcript (needs brief + results)")
         briefs.add(data["brief"].strip())
         round_no = max(round_no, int(data.get("round") or 1))
+        rounds_seen.add(int(data.get("round") or 1))
         for r in data["results"]:
             # An answer never loses to a later failure of the same lane.
             if r.get("answer") or r["lane"] not in by_lane:
@@ -1300,6 +1302,14 @@ def load_transcripts(arg: str) -> tuple[list[Path], dict]:
     if len(briefs) > 1:
         die("--revise: transcripts answer different briefs — refusing to mix them.\n"
             "  name the files explicitly, or use latest:N with N = that run's lane count")
+    if len(rounds_seen) > 1:
+        # Found in first live use: retrying one failed lane of a revision round
+        # with latest:N swept in the siblings' round-2 transcripts. The brief
+        # guard cannot catch that — a revision round records the SAME brief —
+        # and the merge would hand the lane its peers' round-2 answers labelled
+        # as the round it is trying to redo.
+        die("--revise: transcripts span rounds {} — refusing to mix them.\n"
+            "  name the files of ONE round explicitly".format(sorted(rounds_seen)))
 
     merged = {"brief": briefs.pop(), "results": list(by_lane.values()), "round": round_no}
     if not any(r.get("answer") for r in merged["results"]):

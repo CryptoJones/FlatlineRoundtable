@@ -1454,6 +1454,15 @@ class TestRevisionRound(unittest.TestCase):
         _, merged = rt.load_transcripts("latest:2")
         self.assertEqual(merged["results"][0]["answer"], "kept")
 
+    def test_mixed_rounds_are_refused(self):
+        """Retrying one lane of a revision round with latest:N sweeps in the
+        siblings' round-2 transcripts; the brief guard cannot catch that
+        because a revision round records the same brief."""
+        self._transcript("20260901-000001.json", "q", [self._r("A", "a1")])
+        self._transcript("20260901-000002.json", "q", [self._r("B", "b2")], round=2)
+        with self.assertRaises(SystemExit):
+            rt.load_transcripts("latest:2")
+
     def test_no_answers_at_all_is_refused(self):
         self._transcript("20260901-000001.json", "q",
                          [{"lane": "A", "answer": None, "error": "died"}])
