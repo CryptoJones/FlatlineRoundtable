@@ -208,8 +208,12 @@ kill, the missing-secret abort, and partial delivery failing the run.
 - Three harnesses: `http` (any OpenAI-compatible endpoint), `cli` (one-shot
   subscription CLIs), and `acp` (JSON-RPC-over-stdio agents, driven for exactly
   one turn).
-- Lanes have **no tools and no file access**. This is "read this and tell me what
-  you think," not "go investigate the repo." Put the material in the brief.
+- Tool access is a property of the harness, not the panel. `http` and `acp`
+  lanes see the brief and nothing else — put the material in it. `cli` lanes run
+  the vendor's CLI with its normal tools and may read, run, and write in the
+  directory they are launched from; commit first, and expect them to
+  investigate. A lane keeps its tools until it cheats (reads another lane's
+  answer, edits the code under review, games the question); then it loses them.
 - Lanes never see each other's answers. That is the point; it is also why they
   cannot build on one another.
 - A weak lane is worse than an absent one — it still gets counted. Prune the

@@ -52,8 +52,21 @@ correctly from a corrupted excerpt.
 Excerpt contiguous blocks — whole functions, or line ranges — and mark every
 elision. **A mangled excerpt is a false fact.**
 
-Lanes have no tools and no file access. Whatever they need to see must be in the
-brief.
+**Tool access is a property of the harness, not the panel.** `http` and `acp`
+lanes see the brief and nothing else: whatever they need must be in it. `cli`
+lanes run the vendor's own CLI (`claude`, `agy`) with its normal tools, and they
+will use them. On 2026-09-05 HAL9000 decided the brief was stale, read the
+checkout instead, wrote `zz_review_probe_test.go` into the reviewed repo, ran
+`go test`, deleted the file, and produced the best review of the round. That is
+by design: a lane keeps its tools until it cheats (reads another lane's answer,
+edits the code under review, games the question), and then that lane loses them
+(launch `claude` with `--safe-mode --disallowedTools ...`, or run from an empty
+directory with `CLAUDE_CODE_*` scrubbed). So, before a round on a checked-out
+repo: commit or stash everything, or snapshot the tree (`git diff > snap.patch;
+git status --short --untracked-files=all > snap.status`) and compare after the
+lane exits. Never commit while a `cli` lane is running. And write the brief for
+the `http` lanes regardless — a `cli` lane's review of the tree is not a review
+of the brief the others saw, so its findings are not evidence of convergence.
 
 Ask for something falsifiable. "What is missing, what is wrong, what should be
 cut" beats "what do you think", which returns nine summaries.
@@ -73,7 +86,8 @@ vibe.
 defects as suspect before treating it as insight. Record defects in that lane's
 `notes` in the config so the next reader inherits the warning.
 
-**Watch for confident fabrication.** Lanes have not seen your codebase. One
+**Watch for confident fabrication.** `http` and `acp` lanes have not seen your
+codebase (a `cli` lane may have — check its answer for what it says it did). One
 answered a general architecture question by citing a specific file and line
 number that does not exist. Verify any concrete claim before repeating it.
 
