@@ -67,9 +67,11 @@ lane is being queried. The real config lives at
 
 ## Scope
 
-Lanes have no tools and no file access, and this is not an agent framework. If a
-change requires a long-lived process, a message bus, or a publish step, it
-belongs in a different project — those are precisely what was removed.
+The roundtable gives lanes no tools of its own — an `http` or `acp` lane has
+nothing but the brief, a `cli` lane has whatever the vendor CLI has — and this is
+not an agent framework. If a change requires a long-lived process, a message
+bus, or a publish step, it belongs in a different project — those are precisely
+what was removed.
 
 ## Contributing
 

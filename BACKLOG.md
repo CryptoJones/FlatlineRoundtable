@@ -13,6 +13,11 @@ neither side drifts.
 - [ ] `acp` harness: pool-acp lane times out waiting for session/prompt while
       poolside streams a full answer — generated, billed, never delivered
       ([#56](https://github.com/CryptoJones/FlatlineRoundtable/issues/56))
+- [ ] Docs say lanes have no tools; `cli` lanes run the vendor CLI with its full
+      toolset (HAL9000 wrote and deleted a probe test inside a reviewed checkout,
+      2026-09-05). Scope the claim to `http`/`acp`, document revoke-on-cheating
+      and pre-round hygiene
+      ([#66](https://github.com/CryptoJones/FlatlineRoundtable/issues/66))
 
 ## Verification set
 
