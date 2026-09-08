@@ -7,33 +7,48 @@ description: Put a question to a panel of independent AI models in parallel and 
 
 ## ONE RUN PER LANE. This is not optional.
 
-**Never invoke the whole panel in one command.** Loop, one lane per invocation:
+**Never invoke the whole panel in one command.** Use `--each`, which re-invokes
+the tool once per lane:
 
 ```bash
-for lane in $(roundtable --list | awk '{print $2}'); do
-  cat brief.md | roundtable --lanes "$lane" - > "answers/$lane.txt" 2>&1
-done
+cat brief.md | roundtable --each -              # one lane at a time
+cat brief.md | roundtable --each -j 8 -         # up to 8 at a time
 ```
 
 CJ has given this instruction repeatedly, and it keeps getting violated because
-`roundtable -` looks like the obvious call. It is the wrong call.
+`roundtable -` looks like the obvious call. It is the wrong call, and the tool
+now refuses it.
 
-A single invocation finishes when its **slowest** lane finishes. That couples every
-lane's fate to the worst one: one slow lane sets the wall-clock for all of them,
-raising its timeout pushes the whole run past the 10-minute foreground Bash cap into
-the background where the task supervisor reaps it, and a lane that dies cannot be
-retried without rerunning everything. Lanes are supposed to be independent; sharing a
-deadline makes their failures dependent.
+A single invocation (`--panel`) finishes when its **slowest** lane finishes. That
+couples every lane's fate to the worst one: one slow lane sets the wall-clock for all
+of them, raising its timeout pushes the whole run past the 10-minute foreground Bash
+cap into the background where the task supervisor reaps it, and a lane that dies
+cannot be retried without rerunning everything. Lanes are supposed to be independent;
+sharing a deadline makes their failures dependent.
 
-**Lane order: CmdrData (poolside Laguna) runs LAST, and in the FOREGROUND — CJ SOP, 2026-08-30.** Run every other lane first (backgrounded loop is fine), then CmdrData as its own FOREGROUND Bash call with `timeout: 600000` (the 10-minute harness maximum). Never background this lane: the Claude Code task supervisor reaps backgrounded roundtable runs intermittently, and on 2026-08-30 it reaped two CmdrData attempts mid-flight. CJ's preferred cap is 10000s ("poolside is free to me and is genuinely novel perspective") but foreground's 600s ceiling is the binding limit; if the lane times out silent, re-attempt once, then report the round as N−1 with the lane named — never quietly summarize. Underlying defect was FlatlineRoundtable#56 — the acp harness ignored agent-initiated requests (stalling the turn) and discarded answer text already streamed when the deadline hit. Both fixed 2026-08-30: a turn that times out now returns whatever answer streamed, marked TRUNCATED — so on a huge brief the lane delivers a partial instead of nothing.
+`--each` is what keeps them independent — every lane gets its own process, its own
+deadline and its own transcript. **`-j N` does not change that**; it only lets N of
+those processes be in flight at once. Parallel and independent are not in tension
+here, and before `-j` existed the only way to get parallelism was `--panel`, which
+gave up the independence.
 
-Measured 2026-08-30: the poolside/ACP lane needs ~400s alone on a 110KB brief and
-exceeded 780s under 12-lane contention. Four consecutive rounds lost it. Every loss
-was avoidable.
+**Choose N by the box, not by the roster.** Measured 2026-08-30, on a 16 GB machine
+shared with other work: the poolside/ACP lane needed ~400s alone on a 110KB brief and
+exceeded 780s under 12-lane contention, losing its answer four rounds running. A
+2026-09-05 fan-out of 11 lanes alongside a Whisper job was killed outright for low
+memory. Measured 2026-09-07: an HTTP lane peaks at ~42 MB, but a CLI lane (claude,
+codex, agy) peaks at 400-750 MB because each spawns a whole agent runtime. Count the
+CLI lanes, not the total. Default `-j1` on a small box; a 128 GB host runs 15 lanes
+flat out without noticing.
+
+Per-lane and per-vendor caps still apply on top of `-j`: a lane with
+`concurrency: 1` holds its whole vendor group to one at a time, which is what stops
+two local-model lanes hitting the same GPU together.
 
 ```bash
 roundtable --lanes Skeptic "..."          # ONE lane -- the normal call
 cat brief.md | roundtable --lanes X -     # long briefs on stdin
+cat brief.md | roundtable --each -j 8 -   # whole panel, 8 concurrent
 roundtable --json > answers.json          # structured
 roundtable --list                         # roster + route; no network calls
 ```
