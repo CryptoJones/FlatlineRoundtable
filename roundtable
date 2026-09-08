@@ -24,6 +24,8 @@ Usage:
     roundtable --json > answers.json
     roundtable --config PATH
     roundtable --max-spend 0.50
+    cat brief.md | roundtable --each -j 8 -  eight lanes at a time, each still
+                                           its own process and its own deadline
     roundtable --each --revise latest:12   optional second round: each lane sees
                                            the locked round-1 answers and may
                                            HOLD or REVISE
@@ -1360,6 +1362,9 @@ def main() -> int:
     ap.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     ap.add_argument("--lanes")
     ap.add_argument("--each", action="store_true")
+    ap.add_argument("-j", "--concurrency", type=int, default=None,
+                    help="with --each, run up to N lanes at once (default 1). "
+                         "Per-lane and per-vendor caps still apply.")
     ap.add_argument("--panel", action="store_true")
     ap.add_argument("--list", action="store_true")
     ap.add_argument("--json", action="store_true")
@@ -1420,6 +1425,7 @@ def main() -> int:
             "  only as fast as its slowest lane, and one death costs every answer.\n"
             "\n"
             "  --each                run each lane as its own process (what you want)\n"
+            "  --each -j N           the same, up to N lanes at once\n"
             "  --lanes NAME          one lane\n"
             "  --panel               the old shared-deadline behaviour, if you mean it"
             .format(n=len(lanes)))
@@ -1427,12 +1433,42 @@ def main() -> int:
     if a.each and not a.list:
         # Re-invoke ourselves once per lane. Separate processes, separate
         # deadlines, separate transcripts: a lane can be slow, or die, alone.
+        #
+        # Serial by DEFAULT, still: the measurement in the block above is why,
+        # and a config that predates this flag must not silently start fanning
+        # out. `--concurrency N` is the opt-in, and it is the only way to get
+        # parallel lanes without the shared deadline --panel imposes.
+        #
+        # Before this flag existed there was no such way: this loop was a
+        # blocking subprocess.run, so --each was always serial, and anyone who
+        # wanted lanes in parallel had to reach for --panel and give up the
+        # per-lane deadlines that are the entire point of --each. The `concurrency:`
+        # key in the config is deliberately NOT read here -- it is documented as
+        # the panel-mode default, the shipped example sets it to 8, and quietly
+        # honouring it would flip every existing caller from serial to eight-way.
+        #
+        # The per-vendor cap IS applied, by the same smallest-in-group rule
+        # build_semaphores uses, so a `concurrency: 1` local lane still cannot be
+        # run beside its neighbour on the same GPU while the API lanes fan out.
+        #
+        # Output stays in roster order: a lane's block is printed whole, once
+        # every lane before it has been printed, so a concurrent run reads
+        # exactly like a serial one instead of interleaving. At -j1 the child
+        # keeps the terminal directly, so the familiar live streaming is intact.
         brief_text = sys.stdin.read() if a.brief[:1] == ["-"] else " ".join(a.brief)
         if not brief_text.strip() and not a.revise:
             die("empty brief")
-        rc = 0
+
+        default_cc = max(int(a.concurrency or 1), 1)
+        caps: dict[str, int] = {}
         for l in lanes:
-            print(f"\n=== {l['name']} " + "=" * (66 - len(l['name'])), flush=True)
+            gid = l.get("vendor") or l["name"]
+            cc = int(l.get("concurrency", default_cc))
+            caps[gid] = min(caps.get(gid, cc), cc)
+        vendor_sems = {gid: threading.Semaphore(cc) for gid, cc in caps.items()}
+        overall = threading.Semaphore(max(default_cc, 1))
+
+        def run_one(l: dict) -> tuple[int, str]:
             argv = [sys.executable, str(Path(__file__).resolve()),
                     "--lanes", l["name"], "--config", str(a.config)]
             if a.json:
@@ -1442,8 +1478,41 @@ def main() -> int:
             if a.revise:
                 argv += ["--revise", a.revise]
             argv.append("-")
-            r = subprocess.run(argv, input=brief_text, text=True)
-            rc = rc or r.returncode
+            gid = l.get("vendor") or l["name"]
+            with overall, vendor_sems[gid]:
+                r = subprocess.run(argv, input=brief_text, text=True,
+                                   capture_output=True)
+            return r.returncode, (r.stdout or "") + (r.stderr or "")
+
+        rc = 0
+        if default_cc == 1:
+            # Unchanged path: the child inherits this terminal and streams.
+            for l in lanes:
+                print(f"\n=== {l['name']} " + "=" * (66 - len(l['name'])), flush=True)
+                argv = [sys.executable, str(Path(__file__).resolve()),
+                        "--lanes", l["name"], "--config", str(a.config)]
+                if a.json:
+                    argv.append("--json")
+                if a.no_transcript:
+                    argv.append("--no-transcript")
+                if a.revise:
+                    argv += ["--revise", a.revise]
+                argv.append("-")
+                r = subprocess.run(argv, input=brief_text, text=True)
+                rc = rc or r.returncode
+            return rc
+
+        with cf.ThreadPoolExecutor(max_workers=max(len(lanes), 1)) as pool:
+            futures = [pool.submit(run_one, l) for l in lanes]
+            for l, fut in zip(lanes, futures):
+                print(f"\n=== {l['name']} " + "=" * (66 - len(l['name'])), flush=True)
+                try:
+                    code, out = fut.result()
+                except Exception as exc:                      # noqa: BLE001
+                    code, out = 1, f"  !! lane crashed: {exc}\n"
+                sys.stdout.write(out)
+                sys.stdout.flush()
+                rc = rc or code
         return rc
 
     if a.list:
