@@ -104,7 +104,9 @@ rather than reported.
 ## Usage
 
 ```console
-roundtable "the brief"                  # every active lane, in parallel
+roundtable --each "the brief"           # each lane its own process (do this)
+roundtable --lanes Skeptic "..."        # one lane
+roundtable --panel "the brief"          # all lanes, one shared deadline
 cat brief.md | roundtable -             # long briefs on stdin
 roundtable --lanes Skeptic,Chair "..."  # a subset
 roundtable --list                       # roster + route; no network calls
@@ -113,6 +115,7 @@ roundtable --config PATH
 roundtable --max-spend 0.50        # refuses BEFORE dispatch if the estimate exceeds it
 roundtable --diff                  # report only where the lanes disagree
 roundtable --no-transcript
+roundtable --each --revise latest:12    # optional second round — see below
 ```
 
 `--diff` asks lanes to report AGREED / SPLIT / LONE CLAIMS across the others,
@@ -153,13 +156,49 @@ Every run writes a transcript to
 `~/.local/share/flatline-roundtable/transcripts/`, because answers that exist
 only in a terminal scrollback are answers waiting to be lost.
 
+### `--revise` — the optional second round
+
+Round 1 is blind by construction: a lane cannot see the others because their
+answers do not exist yet in its process. `--revise` is the one deliberate
+exception. It replays a **finished** run's transcript(s), handing every lane
+the locked round-1 answers — its own marked `YOURS`, the rest anonymised as
+`PANELIST A/B/C` — and instructions to open with `HOLD` or `REVISE` and to move
+only for a reason it can state. Anonymised, because "the Anthropic lane said
+so" is exactly the deference the instructions forbid.
+
+```console
+roundtable --each "the brief"             # round 1, blind, 12 lanes
+roundtable --each --revise latest:12      # round 2: the whole prior run
+roundtable --each --revise latest:12 "focus on the cost claims"   # extra focus
+roundtable --lanes Chair --revise ~/.local/share/.../20260901-*.json
+```
+
+`--each` writes one transcript per lane, which is why `--revise` takes
+`latest:N` and comma-separated paths and merges them; it refuses to mix
+transcripts whose briefs differ, because that is only ever an accident. The
+report ends with who held and who moved, under a banner that says the thing
+that matters:
+
+```
+ROUND 2 — lanes saw the round-1 answers. Agreement here is persuasion,
+not independent convergence.
+```
+
+Treat round-2 convergence accordingly. Round 1 tells you where independent
+models land; round 2 tells you which positions survive contact with the
+others' arguments. Both are useful; only the first is evidence of
+independence. A round-2 transcript records `round`, its parent transcripts,
+and the alias map, so the anonymity is auditable after the fact. `--revise
+latest:12` on a round-2 run produces round 3; nothing caps it, but each round
+is another full panel spend, and the returns fall fast.
+
 ## Tests
 
 ```console
 $ python3 -m unittest discover -s tests
 ```
 
-25 tests against a stub HTTP server and fake CLI binaries — no vendor is
+132 tests against a stub HTTP server and fake CLI binaries — no vendor is
 contacted, nothing is spent, no credential is needed. They cover the behaviours
 that silently cost money or leak processes: the env scrub, the process-group
 kill, the missing-secret abort, and partial delivery failing the run.
@@ -169,8 +208,12 @@ kill, the missing-secret abort, and partial delivery failing the run.
 - Three harnesses: `http` (any OpenAI-compatible endpoint), `cli` (one-shot
   subscription CLIs), and `acp` (JSON-RPC-over-stdio agents, driven for exactly
   one turn).
-- Lanes have **no tools and no file access**. This is "read this and tell me what
-  you think," not "go investigate the repo." Put the material in the brief.
+- Tool access is a property of the harness, not the panel. `http` and `acp`
+  lanes see the brief and nothing else — put the material in it. `cli` lanes run
+  the vendor's CLI with its normal tools and may read, run, and write in the
+  directory they are launched from; commit first, and expect them to
+  investigate. A lane keeps its tools until it cheats (reads another lane's
+  answer, edits the code under review, games the question); then it loses them.
 - Lanes never see each other's answers. That is the point; it is also why they
   cannot build on one another.
 - A weak lane is worse than an absent one — it still gets counted. Prune the

@@ -6,9 +6,18 @@ neither side drifts.
 
 ## Open
 
+- [x] Optional second round: `--revise latest:N` replays a finished run so each
+      lane sees the locked answers (own marked YOURS, peers anonymised) and
+      opens with HOLD or REVISE; report marks the round non-independent
+      ([#64](https://github.com/CryptoJones/FlatlineRoundtable/issues/64)) — shipped in PR #65
 - [ ] `acp` harness: pool-acp lane times out waiting for session/prompt while
       poolside streams a full answer — generated, billed, never delivered
       ([#56](https://github.com/CryptoJones/FlatlineRoundtable/issues/56))
+- [ ] Docs say lanes have no tools; `cli` lanes run the vendor CLI with its full
+      toolset (HAL9000 wrote and deleted a probe test inside a reviewed checkout,
+      2026-09-05). Scope the claim to `http`/`acp`, document revoke-on-cheating
+      and pre-round hygiene
+      ([#66](https://github.com/CryptoJones/FlatlineRoundtable/issues/66))
 
 - [x] A run that dies mid-fan-out lost every answer it already collected
       ([#58](https://github.com/CryptoJones/FlatlineRoundtable/issues/58)) —

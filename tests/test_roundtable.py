@@ -1136,6 +1136,66 @@ class TestAcpLane(unittest.TestCase):
         used = Path(Path(self.cwd_file).read_text().strip())
         self.assertFalse(used.exists(), "acp workdir outlived the lane")
 
+    def _custom_agent(self, on_prompt: str) -> Path:
+        """An agent whose session/prompt behaviour is the test's to script."""
+        d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d, True)
+        return write_exe(d / "agent", """            while IFS= read -r line; do
+              case "$line" in
+                *initialize*)
+                    echo '{"jsonrpc":"2.0","id":0,"result":{}}' ;;
+                *session/new*)
+                    echo '{"jsonrpc":"2.0","id":1,"result":{"sessionId":"s1"}}' ;;
+__ON_PROMPT__
+              esac
+            done""".replace("__ON_PROMPT__", on_prompt))
+
+    def test_a_streamed_answer_is_salvaged_when_the_turn_never_finishes(self):
+        """#56: pool-acp streamed a full answer and never sent the
+        session/prompt response. Discarding text that already arrived is a
+        billed generation delivered to nobody -- the cardinal sin inverted."""
+        exe = self._custom_agent("""                *session/prompt*)
+                    echo '{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"text":"salvaged text"}}}}' ;;""")
+        out = rt.acp_lane({"command": str(exe), "args": [], "timeout": 3}, "hi")
+        self.assertEqual(out["answer"], "salvaged text")
+        self.assertEqual(out["finish_reason"], "timeout")
+
+    def test_an_agent_initiated_request_is_answered_not_ignored(self):
+        """#56: ACP is bidirectional -- an agent's own request (e.g.
+        session/request_permission) blocks its turn until the client responds.
+        The old reader ignored it and the turn stalled forever. The agent below
+        completes its turn only after seeing our 'cancelled' response."""
+        exe = self._custom_agent("""                *session/prompt*)
+                    echo '{"jsonrpc":"2.0","id":"perm1","method":"session/request_permission","params":{}}' ;;
+                *perm1*cancelled*)
+                    echo '{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"text":"after permission"}}}}'
+                    echo '{"jsonrpc":"2.0","id":2,"result":{"stopReason":"end_turn"}}' ;;""")
+        out = rt.acp_lane({"command": str(exe), "args": [], "timeout": 10}, "hi")
+        self.assertEqual(out["answer"], "after permission")
+        self.assertEqual(out["finish_reason"], "stop")
+
+    def test_a_permission_request_with_options_gets_a_reject_not_a_cancel(self):
+        """#62: 'cancelled' tells the agent the user cancelled the TURN, and
+        Laguna wrapped up after one sentence. With options present the client
+        must select a reject option -- denied, carry on."""
+        exe = self._custom_agent("""                *session/prompt*)
+                    echo '{"jsonrpc":"2.0","id":"perm2","method":"session/request_permission","params":{"options":[{"optionId":"ok1","name":"Allow","kind":"allow_once"},{"optionId":"rej1","name":"Reject","kind":"reject_once"}]}}' ;;
+                *perm2*rej1*)
+                    echo '{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"text":"denied and finished"}}}}'
+                    echo '{"jsonrpc":"2.0","id":2,"result":{"stopReason":"end_turn"}}' ;;""")
+        out = rt.acp_lane({"command": str(exe), "args": [], "timeout": 10}, "hi")
+        self.assertEqual(out["answer"], "denied and finished")
+
+    def test_the_timeout_error_reports_what_streamed(self):
+        """A model still reasoning at the deadline and a dead handshake must not
+        produce the same error line -- that ambiguity cost four days on #56."""
+        exe = self._custom_agent("""                *session/prompt*)
+                    echo '{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_thought_chunk","content":{"text":"hmm"}}}}'
+                    echo '{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_thought_chunk","content":{"text":"hmm2"}}}}' ;;""")
+        with self.assertRaisesRegex(RuntimeError,
+                                    r"0 answer chunks, 2 thought chunks"):
+            rt.acp_lane({"command": str(exe), "args": [], "timeout": 3}, "hi")
+
 
 class TestSecrets(unittest.TestCase):
     def _fake_pass(self, body):
@@ -1240,6 +1300,13 @@ class TestEndToEnd(unittest.TestCase):
         # Point the caches at the throwaway dir. A test must not fold its stub's
         # fake usage numbers into the developer's real token calibration.
         env = {**os.environ, "XDG_CACHE_HOME": str(d / "cache")}
+        # These end-to-end tests exercise the shared-deadline machinery on
+        # purpose -- pacing, per-vendor semaphores, silent-lane detection -- so
+        # they are exactly the case --panel names. Without it the multi-lane ones
+        # trip the one-run-per-lane guard, which is the guard working.
+        args = list(args)
+        if len(lanes) > 1 and not any(a in ("--each", "--panel", "--lanes") for a in args):
+            args.insert(0, "--panel")
         return subprocess.run(
             [sys.executable, str(ROOT / "roundtable"), "--config", str(d / "c.yaml"),
              "--no-transcript", *args, "brief"],
@@ -1352,6 +1419,130 @@ class TestEndToEnd(unittest.TestCase):
                           "--list")
             self.assertEqual(r.returncode, 0)
             self.assertIsNone(s.srv.last_request)
+
+
+# --------------------------------------------------------------------------- #
+# revision round
+# --------------------------------------------------------------------------- #
+class TestRevisionRound(unittest.TestCase):
+    """--revise: round 1 stays blind; round 2 sees locked, anonymised answers."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self._old_dir = rt.TRANSCRIPT_DIR
+        rt.TRANSCRIPT_DIR = self.tmp
+        self.addCleanup(setattr, rt, "TRANSCRIPT_DIR", self._old_dir)
+
+    def _transcript(self, name, brief, results, **extra):
+        p = self.tmp / name
+        p.write_text(json.dumps({"brief": brief, "results": results, **extra}))
+        return p
+
+    @staticmethod
+    def _r(lane, answer):
+        return {"lane": lane, "answer": answer, "model": "m", "harness": "http"}
+
+    def test_latest_n_merges_per_lane_transcripts(self):
+        """--each writes one transcript per lane; latest:N is that whole run."""
+        self._transcript("20260901-000001.json", "q", [self._r("A", "a1")])
+        self._transcript("20260901-000002.json", "q", [self._r("B", "b1")])
+        paths, merged = rt.load_transcripts("latest:2")
+        self.assertEqual(len(paths), 2)
+        self.assertEqual({r["lane"] for r in merged["results"]}, {"A", "B"})
+
+    def test_mixed_briefs_are_refused(self):
+        """A latest:N that reaches past the run boundary must fail loudly, not
+        hand every lane a packet half about the wrong question."""
+        self._transcript("20260901-000001.json", "question one", [self._r("A", "a")])
+        self._transcript("20260901-000002.json", "question two", [self._r("B", "b")])
+        with self.assertRaises(SystemExit):
+            rt.load_transcripts("latest:2")
+
+    def test_an_answer_never_loses_to_a_later_failure(self):
+        self._transcript("20260901-000001.json", "q", [self._r("A", "kept")])
+        self._transcript("20260901-000002.json", "q",
+                         [{"lane": "A", "answer": None, "error": "timeout"}])
+        _, merged = rt.load_transcripts("latest:2")
+        self.assertEqual(merged["results"][0]["answer"], "kept")
+
+    def test_mixed_rounds_are_refused(self):
+        """Retrying one lane of a revision round with latest:N sweeps in the
+        siblings' round-2 transcripts; the brief guard cannot catch that
+        because a revision round records the same brief."""
+        self._transcript("20260901-000001.json", "q", [self._r("A", "a1")])
+        self._transcript("20260901-000002.json", "q", [self._r("B", "b2")], round=2)
+        with self.assertRaises(SystemExit):
+            rt.load_transcripts("latest:2")
+
+    def test_no_answers_at_all_is_refused(self):
+        self._transcript("20260901-000001.json", "q",
+                         [{"lane": "A", "answer": None, "error": "died"}])
+        with self.assertRaises(SystemExit):
+            rt.load_transcripts("latest")
+
+    def test_aliases_skip_lanes_that_gave_no_answer(self):
+        aliases = rt.alias_map([self._r("A", "yes"),
+                                {"lane": "dead", "answer": None},
+                                self._r("C", "also")])
+        self.assertEqual(aliases, {"A": "A", "C": "B"})
+
+    def test_packet_marks_own_answer_and_hides_peer_names(self):
+        prior = {"brief": "the question",
+                 "results": [self._r("sonnet", "sonnet's take"),
+                             self._r("qwen", "qwen's take")]}
+        packet = rt.build_revision_prompt("sonnet", prior, rt.alias_map(prior["results"]), 2)
+        self.assertIn("YOUR ROUND-1 ANSWER", packet)
+        self.assertIn("sonnet's take", packet)
+        self.assertIn("PANELIST B:", packet)
+        self.assertIn("qwen's take", packet)
+        # The peer's LANE NAME must not leak — anonymity is the point.
+        self.assertNotIn("qwen:", packet)
+        self.assertNotIn("PANELIST qwen", packet)
+
+    def test_a_lane_absent_from_round_one_is_told_to_open_with_new(self):
+        prior = {"brief": "q", "results": [self._r("A", "a")]}
+        packet = rt.build_revision_prompt("newcomer", prior,
+                                          rt.alias_map(prior["results"]), 2)
+        self.assertIn("NEW instead of HOLD", packet)
+
+    def test_verdict_parses_the_shapes_models_emit(self):
+        for text, want in [("HOLD\nbecause...", "HOLD"),
+                           ("**REVISE**\n\nnew answer", "REVISE"),
+                           ("## HOLD", "HOLD"),
+                           ("> NEW", "NEW"),
+                           ("I decline to say", None)]:
+            self.assertEqual(rt.parse_verdict(text), want, text)
+
+    def test_a_verdict_quoted_deep_in_the_answer_is_not_a_verdict(self):
+        self.assertIsNone(rt.parse_verdict("x" * 500 + "\nHOLD"))
+
+
+class TestRevisionEndToEnd(unittest.TestCase):
+    def test_revise_run_sends_the_packet_and_reports_the_round(self):
+        d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d, True)
+        prior = d / "prior.json"
+        prior.write_text(json.dumps({"brief": "the original question", "results": [
+            {"lane": "A", "answer": "round-one answer from A", "model": "m", "harness": "http"},
+            {"lane": "B", "answer": "round-one answer from B", "model": "m", "harness": "http"},
+        ]}))
+        with StubServer() as s:
+            cfg = d / "c.yaml"
+            cfg.write_text(json.dumps({"lanes": [
+                {"name": "A", "harness": "http", "model": "m", "base_url": s.url}]}))
+            env = {**os.environ, "XDG_CACHE_HOME": str(d / "cache")}
+            r = subprocess.run(
+                [sys.executable, str(ROOT / "roundtable"), "--config", str(cfg),
+                 "--no-transcript", "--lanes", "A", "--revise", str(prior)],
+                capture_output=True, text=True, timeout=90, env=env)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            sent = s.srv.last_request["messages"][-1]["content"]
+            self.assertIn("YOUR ROUND-1 ANSWER", sent)
+            self.assertIn("round-one answer from B", sent)
+            self.assertNotIn("PANELIST B is B", sent)
+            self.assertIn("ROUND 2", r.stdout)
+            self.assertIn("persuasion, not independent convergence", r.stdout)
 
 
 if __name__ == "__main__":
