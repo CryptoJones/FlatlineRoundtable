@@ -19,6 +19,13 @@ neither side drifts.
       and pre-round hygiene
       ([#66](https://github.com/CryptoJones/FlatlineRoundtable/issues/66))
 
+- [x] A run that dies mid-fan-out lost every answer it already collected
+      ([#58](https://github.com/CryptoJones/FlatlineRoundtable/issues/58)) —
+      `list(pool.map(...))` held all answers in memory and wrote the transcript
+      only after the last lane returned, so any interruption discarded completed
+      lanes, paid `http` ones included. Now persisted after every lane via
+      `as_completed`, atomically, marked `"partial": true` until the run finishes.
+
 ## Verification set
 
 Run before any PR. Most of these are behavioural and no test suite covers them.
