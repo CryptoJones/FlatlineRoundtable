@@ -1174,6 +1174,18 @@ __ON_PROMPT__
         self.assertEqual(out["answer"], "after permission")
         self.assertEqual(out["finish_reason"], "stop")
 
+    def test_a_permission_request_with_options_gets_a_reject_not_a_cancel(self):
+        """#62: 'cancelled' tells the agent the user cancelled the TURN, and
+        Laguna wrapped up after one sentence. With options present the client
+        must select a reject option -- denied, carry on."""
+        exe = self._custom_agent("""                *session/prompt*)
+                    echo '{"jsonrpc":"2.0","id":"perm2","method":"session/request_permission","params":{"options":[{"optionId":"ok1","name":"Allow","kind":"allow_once"},{"optionId":"rej1","name":"Reject","kind":"reject_once"}]}}' ;;
+                *perm2*rej1*)
+                    echo '{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"text":"denied and finished"}}}}'
+                    echo '{"jsonrpc":"2.0","id":2,"result":{"stopReason":"end_turn"}}' ;;""")
+        out = rt.acp_lane({"command": str(exe), "args": [], "timeout": 10}, "hi")
+        self.assertEqual(out["answer"], "denied and finished")
+
     def test_the_timeout_error_reports_what_streamed(self):
         """A model still reasoning at the deadline and a dead handshake must not
         produce the same error line -- that ambiguity cost four days on #56."""
