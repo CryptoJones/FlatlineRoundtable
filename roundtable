@@ -1296,8 +1296,9 @@ def load_transcripts(arg: str) -> tuple[list[Path], dict]:
             paths.extend(cands[-n:])
         else:
             paths.append(Path(spec).expanduser())
-    # Dedupe, then chronological order (transcript names are timestamps), so
-    # that when the same lane appears twice the later answer wins below.
+    # Dedupe, then chronological order: transcript names begin with a timestamp
+    # (then lane/pid for uniqueness), so sorting by name is sorting by time. This
+    # makes the later answer win below when the same lane appears twice.
     paths = sorted(set(paths), key=lambda p: p.name)
     if not paths:
         die("--revise: no transcript named")
@@ -1606,7 +1607,15 @@ def main() -> int:
     if not a.no_transcript:
         TRANSCRIPT_DIR.mkdir(parents=True, exist_ok=True)
         stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
-        path = TRANSCRIPT_DIR / f"{stamp}.json"
+        # One lane per process (the --each contract), so the lane name makes the
+        # path unique across a fan-out. The second-resolution timestamp alone was
+        # NOT unique: `--each -j N` starts lanes within the same second, and every
+        # child computed its own stamp independently — so they collided on one path
+        # and overwrote each other's answers while exiting 0 (#70). pid covers two
+        # runs of the SAME lane in the same second (a retry, or a bare single-lane
+        # call), which is otherwise still possible.
+        suffix = f"-{lanes[0]['name']}" if len(lanes) == 1 else ""
+        path = TRANSCRIPT_DIR / f"{stamp}{suffix}-{os.getpid()}.json"
 
     def save(results_so_far, synthesis=None, collisions=None, partial=True):
         """Write the transcript. Called after every lane, and again at the end.
@@ -1630,9 +1639,23 @@ def main() -> int:
             payload["partial"] = True
             payload["note"] = ("run did not finish — these are the lanes that had "
                                "answered when the transcript was last written")
-        tmp = path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(payload, indent=2))
-        tmp.replace(path)
+        # Stage to a UNIQUE temp in the same directory (same filesystem, so the
+        # replace below is still atomic). The old name was derived from `path`, so
+        # two writers colliding on one transcript also collided on one .json.tmp and
+        # raced before either rename — the exact torn-write window write-then-replace
+        # exists to prevent. mkstemp hands each save() its own file (#70).
+        fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix=".json.tmp")
+        try:
+            with os.fdopen(fd, "w") as fh:
+                fh.write(json.dumps(payload, indent=2))
+            os.replace(tmp, path)
+        except BaseException:
+            # Never leave a half-written temp behind if the write or rename fails.
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
 
     ordered = [None] * len(lanes)
     with cf.ThreadPoolExecutor(max_workers=max(len(lanes), 1)) as pool:

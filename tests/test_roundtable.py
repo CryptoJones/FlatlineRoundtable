@@ -1545,5 +1545,74 @@ class TestRevisionEndToEnd(unittest.TestCase):
             self.assertIn("persuasion, not independent convergence", r.stdout)
 
 
+class TestTranscriptUniqueness(unittest.TestCase):
+    """#70: transcripts clobber each other under --each -j N, losing paid answers.
+
+    The transcript filename was stamped at one-second resolution and every --each
+    child computed its own stamp independently, so lanes that started within the
+    same second — routine under -j — wrote the SAME path and overwrote each other.
+    The .json.tmp staging file derived from that same name too, so concurrent
+    writers raced on one temp before either rename. Exit code stayed 0 while paid
+    http answers vanished: #58's failure mode reintroduced through the filename.
+
+    HOME is pointed at a throwaway dir so TRANSCRIPT_DIR (~/.local/share/...) is
+    hermetic and each test counts only its own transcripts.
+    """
+
+    def _run(self, lanes, *args, extra_cfg=None):
+        d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d, True)
+        cfg = {"lanes": lanes}
+        cfg.update(extra_cfg or {})
+        (d / "c.yaml").write_text(json.dumps(cfg))
+        home = d / "home"
+        home.mkdir()
+        env = {**os.environ, "XDG_CACHE_HOME": str(d / "cache"), "HOME": str(home)}
+        tdir = home / ".local" / "share" / "flatline-roundtable" / "transcripts"
+        return subprocess.run(
+            [sys.executable, str(ROOT / "roundtable"), "--config", str(d / "c.yaml"),
+             *args, "brief"],
+            capture_output=True, text=True, timeout=120, env=env, input="brief\n",
+        ), tdir
+
+    @staticmethod
+    def _lanes(url, n):
+        return [{"name": f"L{i}", "harness": "http", "model": "m",
+                 "base_url": url, "timeout": 20} for i in range(n)]
+
+    def test_each_parallel_writes_one_transcript_per_lane(self):
+        """8 lanes under -j 8 must leave 8 transcripts naming 8 distinct lanes.
+
+        Before the fix this left a single file with one lane: same-second children
+        collided on the timestamped name and overwrote each other, exit 0, answers
+        billed and gone.
+        """
+        with StubServer() as s:
+            r, tdir = self._run(self._lanes(s.url, 8), "--each", "-j", "8")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        files = list(tdir.glob("*.json"))
+        self.assertEqual(len(files), 8,
+                         f"expected 8 transcripts, got {len(files)} — answers clobbered")
+        lanes_recorded = set()
+        for f in files:
+            data = json.loads(f.read_text())
+            lanes_recorded |= {res["lane"] for res in data["results"]}
+        self.assertEqual(lanes_recorded, {f"L{i}" for i in range(8)},
+                         "not every lane's answer survived to a transcript")
+
+    def test_no_temp_files_are_left_behind(self):
+        """The atomic write stages via a temp file; none may survive the run.
+
+        The old .json.tmp name was shared across same-second lanes, so concurrent
+        writers raced on one staging path before either rename — a torn-write
+        window that defeated the whole point of write-then-replace.
+        """
+        with StubServer() as s:
+            r, tdir = self._run(self._lanes(s.url, 6), "--each", "-j", "6")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        leftovers = [p.name for p in tdir.iterdir() if ".tmp" in p.name]
+        self.assertEqual(leftovers, [], f"staging files survived the run: {leftovers}")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
