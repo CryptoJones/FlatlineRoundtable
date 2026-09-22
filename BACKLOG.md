@@ -1,57 +1,130 @@
 # Backlog
 
 Mirrors the [GitHub Issues tab](https://github.com/CryptoJones/FlatlineRoundtable/issues).
-Every item here has an issue and vice versa; when one ships, check it off here so
-neither side drifts.
+Every item here has an issue and vice versa — except the foundational entries at
+the foot of **Done**, which predate the tracker. When one ships, check it off here
+so neither side drifts.
 
 ## Open
 
+Bugs first — the cost-guard and answer-loss class this tool exists to prevent,
+then security, then features/optimisation, then tests. Each has a GitHub issue
+and vice versa.
+
+- [ ] Transcripts clobber each other under `--each -j N`, losing paid answers —
+      one-second filename stamp + shared `.json.tmp` collide; #58's failure mode
+      via the filename instead of write order
+      ([#70](https://github.com/CryptoJones/FlatlineRoundtable/issues/70))
+- [ ] `--each` silently defeats `--max-spend` — the pre-dispatch budget gate runs
+      after the fan-out returns, so the parent never checks the whole-panel estimate
+      ([#71](https://github.com/CryptoJones/FlatlineRoundtable/issues/71))
+- [ ] Unknown model id estimates to `$0`, so `--max-spend` cannot bind — an http
+      lane with no resolvable price fails open on the guard meant to fail closed
+      ([#72](https://github.com/CryptoJones/FlatlineRoundtable/issues/72))
+- [ ] Transcripts are world-readable (`0755` dir / `0644` file) — full briefs and
+      answers exposed to any local user or tool-bearing `cli` lane
+      ([#73](https://github.com/CryptoJones/FlatlineRoundtable/issues/73))
+- [ ] `--diff` is silently dropped under `--each` — the flag isn't forwarded to
+      children, so synthesis no-ops with exit 0 on the recommended invocation
+      ([#74](https://github.com/CryptoJones/FlatlineRoundtable/issues/74))
+- [ ] `--revise latest:N` counts files, not lanes — wrong for a `--panel` round,
+      and misleading after a clobber; docs say "lane count"
+      ([#75](https://github.com/CryptoJones/FlatlineRoundtable/issues/75))
+- [ ] `--revise latest:<non-int>` throws a raw `ValueError` traceback instead of
+      the clean, actionable error every other bad input gives
+      ([#76](https://github.com/CryptoJones/FlatlineRoundtable/issues/76))
+- [ ] Env scrub has no test on the `acp` harness — `child_env()` is shared by
+      `cli` and `acp`, but only `cli` asserts a key stays out; drift reopens #22
+      ([#77](https://github.com/CryptoJones/FlatlineRoundtable/issues/77))
+- [ ] No per-lane CA bundle — a self-hosted/private-CA endpoint forces a global
+      TLS bypass that also weakens the OpenRouter lanes
+      ([#78](https://github.com/CryptoJones/FlatlineRoundtable/issues/78))
+- [ ] Report per-lane `cost` and run-level spend in `--json` (and under `--diff`) —
+      the number cron/CI callers need is computed but not surfaced machine-readably
+      ([#79](https://github.com/CryptoJones/FlatlineRoundtable/issues/79))
+- [ ] Give a round an identity (`run_id`) so `--revise latest-run` is robust —
+      replaces the fragile `latest:N` file-count heuristic with a real "round"
+      ([#80](https://github.com/CryptoJones/FlatlineRoundtable/issues/80))
+- [ ] Add `--dry-run` / `--estimate` — a priced pre-flight that shows per-lane and
+      panel worst-case cost without dispatching (and surfaces unpriced lanes)
+      ([#81](https://github.com/CryptoJones/FlatlineRoundtable/issues/81))
+- [ ] Transcripts accumulate forever — add bounded, opt-in retention that never
+      deletes a `parent` of a later round
+      ([#82](https://github.com/CryptoJones/FlatlineRoundtable/issues/82))
+- [ ] `synthesize()` collects readers serially instead of via `as_completed` — free
+      wall-clock win, and removes a serialization trap in the reader loop
+      ([#83](https://github.com/CryptoJones/FlatlineRoundtable/issues/83))
+- [ ] `load_pricing` caches the whole catalog and re-parses it every run — cache the
+      reduced `{id: (in, out)}` map instead
+      ([#84](https://github.com/CryptoJones/FlatlineRoundtable/issues/84))
+- [ ] No integration tests for `--each` budget gate, transcript integrity, unknown
+      price, or `--diff`+`--each` — the four high-severity behaviours CI doesn't cover
+      ([#85](https://github.com/CryptoJones/FlatlineRoundtable/issues/85))
+- [ ] Add Python 3.14 to the CI matrix — the suite already passes on it (verified
+      locally), free signal for no extra dependency
+      ([#86](https://github.com/CryptoJones/FlatlineRoundtable/issues/86))
+
+## Verification set
+
+Run before any PR. Several of these are behavioural and were once human-only;
+the ones now covered by an automated test name the test, so a green `make`-style
+suite stands in for them. The rest still need a person, because they assert on
+the real environment (process table, `ps`, `git`, `install.sh`) rather than a
+stub.
+
+- [ ] `./roundtable --list` — correct route per lane, **zero network calls.**
+      *Automated:* `test_list_makes_no_network_calls`, plus a dedicated CI step
+      that points the process at a dead proxy.
+- [ ] Full run — **every active lane answers**, exit code `0`. Partial delivery
+      must exit non-zero; a silent lane is the bug this tool exists to eliminate.
+      *Automated:* `test_all_answered_exits_zero`, `test_a_silent_lane_fails_the_run`.
+- [ ] **Env scrub:** run with an invalid `ANTHROPIC_API_KEY` exported and confirm
+      a `cli` lane still succeeds via OAuth. If it fails on the bad key, the
+      scrub is broken and that lane has silently moved onto metered billing.
+      *Automated:* `test_ambient_api_key_never_reaches_the_child`,
+      `test_bedrock_and_vertex_routes_are_scrubbed`. Re-check by hand when a new
+      vendor CLI is added — the patterns are broad, but a novel billing route is
+      exactly what they would miss.
+- [ ] **Orphan kill:** point a `cli` lane at a hanging command with a short
+      timeout; confirm it fails cleanly and `pgrep` finds no survivor.
+      *Automated:* `test_hung_lane_is_killed_and_leaves_no_orphan`.
+- [ ] **Missing key:** point a lane at a nonexistent `pass` entry; confirm it
+      fails loudly naming the entry, and never calls unauthenticated.
+      *Automated:* `test_missing_pass_entry_aborts_the_run`,
+      `test_absent_pass_binary_aborts_the_run`.
+- [ ] **No key in argv:** during a run, `ps auxww` shows no key. *(human — reads
+      the live process table; keys are held in memory and set as headers only.)*
+- [ ] **No key in output:** transcript and `--json` contain no `Authorization`
+      value. *Partly automated:* `test_fixtures_carry_no_credentials` scans the
+      golden fixtures; confirm by hand against a real transcript after a run.
+- [ ] `git check-ignore -v FlatlineRoundtable.yaml` confirms the real config
+      cannot be committed; `git status --porcelain` is clean after a run. *(human)*
+- [ ] `./install.sh` then `./install.sh --uninstall` round-trips, and refuses to
+      delete anything that is not a symlink. *(human — touches `$HOME`, no test)*
+
+## Done
+
+- [x] `acp` harness: a pool-acp lane timed out waiting for `session/prompt` while
+      poolside streamed a full answer — generated, billed, never delivered. The
+      client now answers agent-initiated requests (reject option, not `cancelled`)
+      and salvages whatever streamed before the deadline, marked truncated
+      ([#56](https://github.com/CryptoJones/FlatlineRoundtable/issues/56)) — shipped in PR #61;
+      the reject-vs-cancel refinement followed in PR #63 ([#62](https://github.com/CryptoJones/FlatlineRoundtable/issues/62))
+- [x] Docs claimed lanes have no tools; `cli` lanes run the vendor CLI with its
+      full toolset (HAL9000 wrote and deleted a probe test inside a reviewed
+      checkout, 2026-09-05). Tool access is now documented as a property of the
+      harness, not the panel, with revoke-on-cheating and pre-round hygiene
+      ([#66](https://github.com/CryptoJones/FlatlineRoundtable/issues/66)) — shipped in PR #67
 - [x] Optional second round: `--revise latest:N` replays a finished run so each
       lane sees the locked answers (own marked YOURS, peers anonymised) and
       opens with HOLD or REVISE; report marks the round non-independent
       ([#64](https://github.com/CryptoJones/FlatlineRoundtable/issues/64)) — shipped in PR #65
-- [ ] `acp` harness: pool-acp lane times out waiting for session/prompt while
-      poolside streams a full answer — generated, billed, never delivered
-      ([#56](https://github.com/CryptoJones/FlatlineRoundtable/issues/56))
-- [ ] Docs say lanes have no tools; `cli` lanes run the vendor CLI with its full
-      toolset (HAL9000 wrote and deleted a probe test inside a reviewed checkout,
-      2026-09-05). Scope the claim to `http`/`acp`, document revoke-on-cheating
-      and pre-round hygiene
-      ([#66](https://github.com/CryptoJones/FlatlineRoundtable/issues/66))
-
 - [x] A run that dies mid-fan-out lost every answer it already collected
       ([#58](https://github.com/CryptoJones/FlatlineRoundtable/issues/58)) —
       `list(pool.map(...))` held all answers in memory and wrote the transcript
       only after the last lane returned, so any interruption discarded completed
       lanes, paid `http` ones included. Now persisted after every lane via
       `as_completed`, atomically, marked `"partial": true` until the run finishes.
-
-## Verification set
-
-Run before any PR. Most of these are behavioural and no test suite covers them.
-The first two items and the config-parse check now run in CI on every PR; the
-rest still need a human, and the env-scrub and orphan-kill checks especially.
-
-- [ ] `./roundtable --list` — correct route per lane, **zero network calls**.
-- [ ] Full run — **every active lane answers**, exit code `0`. Partial delivery
-      must exit non-zero; a silent lane is the bug this tool exists to eliminate.
-- [ ] **Env scrub:** run with an invalid `ANTHROPIC_API_KEY` exported and confirm
-      a `cli` lane still succeeds via OAuth. If it fails on the bad key, the
-      scrub is broken and that lane has silently moved onto metered billing.
-- [ ] **Orphan kill:** point a `cli` lane at a hanging command with a short
-      timeout; confirm it fails cleanly and `pgrep` finds no survivor.
-- [ ] **Missing key:** point a lane at a nonexistent `pass` entry; confirm it
-      fails loudly naming the entry, and never calls unauthenticated.
-- [ ] **No key in argv:** during a run, `ps auxww` shows no key.
-- [ ] **No key in output:** transcript and `--json` contain no `Authorization`
-      value.
-- [ ] `git check-ignore -v FlatlineRoundtable.yaml` confirms the real config
-      cannot be committed; `git status --porcelain` is clean after a run.
-- [ ] `./install.sh` then `./install.sh --uninstall` round-trips, and refuses to
-      delete anything that is not a symlink.
-
-## Done
-
 - [x] Corrected #46: an empty answer with `finish_reason: length` is variance,
       not determinism — reasoning usage ranged 20–21,606 tokens across runs of
       one identical brief. The retry is restored; the message naming
@@ -131,8 +204,9 @@ rest still need a human, and the env-scrub and orphan-kill checks especially.
       completion charged at their separate rates. ([#3](https://github.com/CryptoJones/FlatlineRoundtable/issues/3))
 - [x] `--max-spend` / `budget_usd` enforced **before dispatch** against a
       worst-case estimate, so an overrun is prevented, not reported. ([#4](https://github.com/CryptoJones/FlatlineRoundtable/issues/4))
-- [x] Test suite — 25 tests, stub HTTP server and fake CLI binaries, no vendor
-      contacted and nothing spent. ([#5](https://github.com/CryptoJones/FlatlineRoundtable/issues/5))
+- [x] Test suite — stub HTTP server and fake CLI binaries, no vendor contacted
+      and nothing spent. Grown from 25 to 134 tests as each defect below landed.
+      ([#5](https://github.com/CryptoJones/FlatlineRoundtable/issues/5))
 - [x] `--diff` mode reporting AGREED / SPLIT / LONE CLAIMS. ([#6](https://github.com/CryptoJones/FlatlineRoundtable/issues/6))
 - [x] Direct-call architecture replacing long-lived agent processes — no
       identity, no message bus, no publish step, nothing left running to bill.
