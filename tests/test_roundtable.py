@@ -1275,6 +1275,19 @@ class TestPricing(unittest.TestCase):
         lanes = [{"name": "A", "harness": "cli", "model": "x", "max_tokens": 99999}]
         self.assertEqual(rt.estimate_run(lanes, "hello", {}, {}), 0.0)
 
+    def test_free_is_distinguished_from_unknown(self):
+        """#72: cli/acp, a `:free` model and an explicit price of 0 are free;
+        an http model the table has never heard of is unknown, not free."""
+        for lane in ({"harness": "cli", "model": "x"},
+                     {"harness": "acp", "model": "x"},
+                     {"harness": "http", "model": "vendor/thing:free"},
+                     {"harness": "http", "model": "x", "price_per_mtok": 0}):
+            self.assertTrue(rt.lane_price_known(lane, {}), lane)
+            self.assertEqual(rt.estimate_run(
+                [{"name": "A", "max_tokens": 100000, **lane}], "x" * 50000, {}, {}), 0.0)
+        self.assertTrue(rt.lane_price_known({"harness": "http", "model": "x"}, {"x": (0.0, 0.0)}))
+        self.assertFalse(rt.lane_price_known({"harness": "http", "model": "vendor/not-in-table"}, {}))
+
 
 class TestEndToEnd(unittest.TestCase):
     """Exit codes, via the real CLI entry point."""
@@ -1400,6 +1413,35 @@ class TestEndToEnd(unittest.TestCase):
             self.assertNotEqual(r.returncode, 0)
             self.assertIn("refusing to dispatch", r.stderr)
             self.assertIsNone(s.srv.last_request, "dispatched despite being over budget")
+
+    def test_budget_refuses_a_lane_it_cannot_price(self):
+        """#72: an unknown model id estimated to $0, so --max-spend could not
+        bind. Under a budget that is a refusal naming the lane and the fix."""
+        with StubServer() as s:
+            r = self._run(
+                [{"name": "Mystery", "harness": "http", "model": "vendor/not-in-table",
+                  "base_url": s.url, "max_tokens": 100000}],
+                "--max-spend", "0.01")
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn("Mystery", r.stderr)
+            self.assertIn("no known price", r.stderr)
+            self.assertIn("price_per_mtok", r.stderr)
+            self.assertIsNone(s.srv.last_request, "dispatched a lane the budget cannot see")
+
+    def test_budget_still_admits_a_free_model(self):
+        # The refusal is for unknown, not for free: a `:free` id still runs.
+        with StubServer() as s:
+            r = self._run([{"name": "A", "harness": "http", "model": "vendor/m:free",
+                            "base_url": s.url}], "--max-spend", "0.01")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIsNotNone(s.srv.last_request)
+
+    def test_no_budget_leaves_an_unpriced_lane_alone(self):
+        # Without a budget there is nothing to bind, so behaviour is unchanged.
+        with StubServer() as s:
+            r = self._run([{"name": "A", "harness": "http", "model": "vendor/not-in-table",
+                            "base_url": s.url}])
+            self.assertEqual(r.returncode, 0, r.stderr)
 
     def test_list_makes_no_network_calls(self):
         with StubServer() as s:

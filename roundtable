@@ -276,6 +276,23 @@ def lane_prices(lane: dict, table: dict) -> tuple[float, float]:
     return table.get(lane.get("model"), (0.0, 0.0))
 
 
+def lane_price_known(lane: dict, table: dict) -> bool:
+    """Whether lane_prices' (0, 0) would mean "free" rather than "no idea" (#72).
+
+    lane_prices collapses both to zero, which is fine for reporting but is
+    fail-open for the budget gate: an http lane whose model id is missing from
+    the table -- every direct Mistral/DeepSeek/local endpoint, or a typo --
+    estimated to $0.00 and so could never trip --max-spend. Free has three
+    legitimate shapes; anything else on a metered harness is unknown.
+    """
+    if lane.get("price_per_mtok") is not None:      # explicit, including 0
+        return True
+    if lane["harness"] in ("cli", "acp"):           # subscription
+        return True
+    model = str(lane.get("model") or "")
+    return model.endswith(":free") or model in table
+
+
 def estimate_run(lanes: list[dict], prompt: str, table: dict, defaults: dict,
                  calib: dict | None = None, retries: int = 0) -> float:
     """Worst-case cost BEFORE dispatch (issue #4).
@@ -1506,6 +1523,20 @@ def main() -> int:
     deadline = time.time() + cfg["deadline_seconds"] if cfg.get("deadline_seconds") else None
     keys = fetch_keys(lanes)
     prices = load_pricing(lanes)
+
+    # A budget can only bind on lanes it can price. An unpriced http lane used
+    # to estimate to $0 and slip past the gate unseen (#72) -- fail-open on the
+    # one check whose job is to fail closed. No default rate either: a guessed
+    # number reads as authoritative and is wrong for almost every vendor.
+    if budget is not None:
+        unpriced = [l for l in lanes if not lane_price_known(l, prices)]
+        if unpriced:
+            die(
+                "a budget is set but these lanes have no known price, so it cannot bind:\n"
+                + "".join(f"  {l['name']}  (model {l.get('model') or '-'})\n" for l in unpriced)
+                + "  set price_per_mtok on the lane or add vendor: openrouter so the "
+                "price table covers it"
+            )
 
     # Refuse BEFORE spending, not after. A budget checked only on the way out
     # reports an overrun; it does not prevent one.
