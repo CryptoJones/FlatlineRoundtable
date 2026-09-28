@@ -1191,14 +1191,24 @@ def synthesize(results, brief, cfg, lanes, keys, prices, count=2,
                    spent if spent is not None else [0.0],
                    lane_prices(lane, prices), pacers)
 
-    readings, errors = [], []
+    # Collect via as_completed rather than calling .result() in dispatch order
+    # (#83): the old loop blocked on reader 1 before it would look at reader 2,
+    # so anything done per lane inside the loop serialised behind the slowest
+    # early reader. Gather into a dict first, then assemble in `chosen` order so
+    # the output is identical regardless of which reader finished first.
+    replies = {}
     with cf.ThreadPoolExecutor(max_workers=len(chosen)) as pool:
-        for lane, fut in [(l, pool.submit(read, l)) for l in chosen]:
-            r = fut.result()          # ask() never raises; it reports via "error"
-            if r.get("answer"):
-                readings.append({"by": lane["name"], "text": r["answer"]})
-            else:
-                errors.append(f"{lane['name']}: {r.get('error') or 'empty answer'}")
+        futs = {pool.submit(read, l): i for i, l in enumerate(chosen)}
+        for fut in cf.as_completed(futs):
+            replies[futs[fut]] = fut.result()   # ask() never raises; it reports via "error"
+
+    readings, errors = [], []
+    for i, lane in enumerate(chosen):
+        r = replies[i]
+        if r.get("answer"):
+            readings.append({"by": lane["name"], "text": r["answer"]})
+        else:
+            errors.append(f"{lane['name']}: {r.get('error') or 'empty answer'}")
 
     if not readings:
         return None, f"synthesis failed ({'; '.join(errors)})"
