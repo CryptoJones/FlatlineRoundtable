@@ -1408,6 +1408,25 @@ class TestEndToEnd(unittest.TestCase):
             self.assertEqual(r.returncode, 0)
             self.assertIsNone(s.srv.last_request)
 
+    def test_each_with_diff_is_refused_before_anything_runs(self):
+        """#74: --diff was accepted under --each, never forwarded to the
+        children, and the run exited 0 with no synthesis. Synthesis needs every
+        answer in one process; --each gives each lane its own. Refuse up front,
+        spawning nothing and spending nothing."""
+        with StubServer() as s:
+            lanes = [{"name": n, "harness": "http", "model": "m", "base_url": s.url}
+                     for n in ("A", "B")]
+            r = self._run(lanes, "--each", "--diff")
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn("--each --diff", r.stderr)
+            self.assertIn("--panel --diff", r.stderr)
+            # No child ran: the per-lane banner is printed by the parent right
+            # before it spawns each one, so its absence means no spawn happened.
+            self.assertNotIn("=== A", r.stdout)
+            self.assertNotIn("=== B", r.stdout)
+            self.assertIsNone(s.srv.last_request, "a lane was dispatched")
+            self.assertEqual(s.srv.hits, {}, "the stub server was contacted")
+
 
 # --------------------------------------------------------------------------- #
 # revision round

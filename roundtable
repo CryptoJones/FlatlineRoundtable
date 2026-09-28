@@ -1424,6 +1424,19 @@ def main() -> int:
             "  --panel               the old shared-deadline behaviour, if you mean it"
             .format(n=len(lanes)))
 
+    # #74: --diff used to evaporate under --each. The children's argv forwarded
+    # --json/--no-transcript/--revise but not --diff, so the flag was accepted,
+    # ignored, and the run exited 0 with no synthesis. Forwarding it would not
+    # fix that: synthesis compares every lane's answer, and under --each each
+    # answer lives in its own process -- a child with one lane has nothing to
+    # compare. Refuse here, before any child is spawned and before any spend.
+    if a.each and a.diff and not a.list:
+        die("--each --diff: synthesis needs every answer in one process, and\n"
+            "  --each gives each lane its own. Either:\n"
+            "\n"
+            "  --panel --diff        one shared deadline, then synthesis\n"
+            "  --each, then synthesize the transcripts afterwards")
+
     if a.each and not a.list:
         # Re-invoke ourselves once per lane. Separate processes, separate
         # deadlines, separate transcripts: a lane can be slow, or die, alone.
