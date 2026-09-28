@@ -51,8 +51,12 @@ neither side drifts.
 - [ ] No integration tests for `--each` budget gate, transcript integrity,
       unknown price, `--diff`+`--each`
       ([#85](https://github.com/CryptoJones/FlatlineRoundtable/issues/85))
-- [ ] Add Python 3.14 to the CI matrix (suite already passes on it)
-      ([#86](https://github.com/CryptoJones/FlatlineRoundtable/issues/86))
+- [x] Add Python 3.14 to the CI matrix (suite already passes on it)
+      ([#86](https://github.com/CryptoJones/FlatlineRoundtable/issues/86)) — fixed on fix/open-issues-batch
+- [ ] Lane harnesses leak file descriptors: `acp_lane` / `cli_lane` Popen pipes
+      and `http_lane`'s retried `HTTPError` are never closed (28 `ResourceWarning`s,
+      all inside `roundtable`, none in the stub — found doing #86)
+      ([#90](https://github.com/CryptoJones/FlatlineRoundtable/issues/90))
 
 ## Verification set
 
