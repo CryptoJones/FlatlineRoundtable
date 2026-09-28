@@ -600,6 +600,37 @@ class TestSynthesis(unittest.TestCase):
             self.assertEqual(len(synth["readings"]), 2)
         self.assertGreater(spent[0], 0.0)
 
+    def test_reader_order_is_stable_when_the_second_finishes_first(self):
+        """#83: readers are gathered as they complete, but reported in roster
+        order, so the transcript does not reshuffle on latency."""
+        # The stub server is single-threaded, so the delay goes in front of
+        # ask() rather than inside the handler: L1 must actually reach the
+        # server and return while L0 is still waiting.
+        orig, done = rt.ask, []
+
+        def slow_first(lane, *a, **k):
+            if lane["name"] == "L0":
+                time.sleep(0.5)
+            r = orig(lane, *a, **k)
+            done.append(lane["name"])
+            return r
+        rt.ask = slow_first
+        self.addCleanup(lambda: setattr(rt, "ask", orig))
+        with StubServer() as s:
+            lanes = [{"name": f"L{i}", "harness": "http", "vendor": f"v{i}",
+                      "model": "m", "base_url": s.url, "timeout": 10}
+                     for i in range(2)]
+            results = [{"lane": "L0", "model": "m", "answer": "a", "usage": {}},
+                       {"lane": "L1", "model": "m", "answer": "b", "usage": {}}]
+            spent = [0.0]
+            synth, err = rt.synthesize(
+                results, "brief", {}, lanes, {}, {"m": (1.0, 1.0)}, count=2,
+                sems={}, lock=threading.Lock(), spent=spent, retries=0)
+        self.assertIsNone(err)
+        self.assertEqual(done, ["L1", "L0"])           # L1 really did finish first
+        self.assertEqual([r["by"] for r in synth["readings"]], ["L0", "L1"])
+        self.assertGreater(spent[0], 0.0)
+
     def test_a_reader_failing_reports_rather_than_raising(self):
         with StubServer() as s:
             lanes = [{"name": "Good", "harness": "http", "vendor": "a",
