@@ -120,6 +120,35 @@ epistemic claim, and a round-2 consensus is persuasion, not convergence. Report
 round-2 agreement to the user as "the panel converged after debate", never as
 "N independent models agree".
 
+## The discussion — `--discuss`
+
+`roundtable --discuss latest:N` (N = the prior blind run's lane count) puts the
+panel in ONE shared context — brief, anonymised openings, every turn said so
+far — and has them take turns in it, **one lane in flight at a time**, in a
+single process. Passes over the roster: `--discuss-rounds` (default 2), opener
+rotating each pass. After the last pass each lane closes with `HOLD` or
+`REVISE`; the report tallies those under the same "persuasion, not
+convergence" banner as `--revise`. `--discuss new` starts cold from a brief on
+stdin/argv with no blind round; any brief text given alongside a transcript
+spec rides as extra focus.
+
+This is the lightweight stand-in for a Buzz-style conversation: no resident
+runtimes, no bus, a `cli` lane's agent exists only for its turn. Do NOT add
+`--each`, `-j` or `--panel` — the tool refuses them, because a turn cannot be
+built until the one before it has been said. Do not run it instead of round
+1: the blind round is still the evidence; the discussion is what you run
+AFTER reading it, when you want to see which positions survive being argued
+with rather than merely being shown.
+
+Reading it: the thread is streamed turn by turn as it happens and saved to the
+transcript after every turn (`"discussion"` key, closings under `"results"`),
+so a run killed mid-thread still leaves what was said. Report the discussion
+by panelist letter → lane (the `aliases` map is in the transcript), quote the
+turn that actually moved a lane, and report closings as "converged after
+discussion", never as "N independent models agree". Cost is O(N²) in turns;
+use `--lanes` for a subset when the split is between three lanes, not twelve.
+`deadline_seconds` bounds one turn, not the run.
+
 ## Cost
 
 `harness` decides cost, not `model`. `cli` lanes ride an existing subscription
