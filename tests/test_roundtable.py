@@ -19,6 +19,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -454,6 +455,29 @@ class TestCliLane(unittest.TestCase):
                 os.environ[var] = "x"
                 self.addCleanup(os.environ.pop, var, None)
                 self.assertNotIn(var, rt.child_env({}))
+
+    def test_child_env_carries_nothing_the_scrub_rules_name(self):
+        """#77: child_env is shared by the cli and acp harnesses, so this is the
+        one place the rule itself can be checked, independent of either.
+
+        Seed every SCRUB_ENV name and one of each pattern shape, then assert
+        against the rules as written in the issue -- not against the module's
+        own regexes, or a weakened pattern would pass its own test.
+        """
+        seeded = list(rt.SCRUB_ENV) + [
+            "NEWVENDOR_API_KEY", "NEWVENDOR_AUTH_TOKEN", "NEWVENDOR_BASE_URL",
+            "CLAUDE_CODE_USE_SOMETHING_NEW",
+        ]
+        for var in seeded:
+            os.environ[var] = "would-bill"
+            self.addCleanup(os.environ.pop, var, None)
+        env = rt.child_env({})
+        rules = [re.compile(p) for p in
+                 (r"_API_KEY$", r"_AUTH_TOKEN$", r"_BASE_URL$", r"^CLAUDE_CODE_USE_")]
+        leaked = sorted(k for k in env
+                        if k in rt.SCRUB_ENV or any(r.search(k) for r in rules))
+        self.assertEqual(leaked, [], f"scrubbed shapes reached the child env: {leaked}")
+        self.assertNotIn("would-bill", env.values())
 
     def test_a_lane_can_scrub_extra_variables(self):
         os.environ["WEIRD_VENDOR_TOKEN"] = "x"
@@ -1204,6 +1228,24 @@ __ON_PROMPT__
         out = rt.acp_lane({"command": str(exe), "args": [], "timeout": 10}, "hi")
         self.assertEqual(out["answer"], "after permission")
         self.assertEqual(out["finish_reason"], "stop")
+
+    def test_ambient_api_key_never_reaches_the_acp_agent(self):
+        """#77: the acp analogue of TestCliLane's cost test.
+
+        acp_lane shares child_env with cli_lane today, so it inherits the
+        scrub -- but only the cli path was asserting it. A refactor giving the
+        acp path its own env construction would reopen the "free lane silently
+        becomes metered" hole with no CI signal. The fake agent echoes its own
+        environment back as its answer.
+        """
+        exe = self._custom_agent("""                *session/prompt*)
+                    echo '{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"text":"KEY=['"${ANTHROPIC_API_KEY:-unset}"']"}}}}'
+                    echo '{"jsonrpc":"2.0","id":2,"result":{"stopReason":"end_turn"}}' ;;""")
+        os.environ["ANTHROPIC_API_KEY"] = "leaked-would-bill"
+        self.addCleanup(os.environ.pop, "ANTHROPIC_API_KEY", None)
+        out = rt.acp_lane({"command": str(exe), "args": [], "timeout": 10}, "hi")
+        self.assertEqual(out["answer"], "KEY=[unset]")
+        self.assertNotIn("leaked-would-bill", out["answer"])
 
     def test_the_timeout_error_reports_what_streamed(self):
         """A model still reasoning at the deadline and a dead handshake must not
