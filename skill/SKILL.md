@@ -233,7 +233,8 @@ built until the one before it has been said. Do not run it instead of round
 AFTER reading it, when you want to see which positions survive being argued
 with rather than merely being shown.
 
-**When to discuss, and when not to.** Discuss when lanes split on a
+**When to discuss, and when not to** (the default; CJ's two-pass procedure
+below overrides it). Discuss when lanes split on a
 *judgment* — severity, reachability, whether a change is the right fix — and
 the split is what you need settled. Do not discuss when the only dissent
 rests on a *checkable fact*: verify the fact yourself and move on. A
@@ -283,6 +284,34 @@ treat every later use of it as unverified. Cost is O(N²) in turns; use `--lanes
 for the three-to-five lanes that actually split, not all twelve, and
 `--max-spend` still gates (longest packet × rounds+1 per lane).
 `deadline_seconds` bounds one turn, not the run.
+
+## The two-pass review (CJ, 2026-09-28)
+
+CJ's procedure for reviewing a fix branch, in his words: *"We should do pass
+two with the results of pass one without changing things and then evaluate
+and report to me"* and *"Make sure to use the new `--converse` flag on the
+second pass!"* When he asks for a two-pass review, this is what it means:
+
+1. **Pass 1 is a blind tool round.** `toolpanel.py`, one lane at a time, over
+   a committed or snapshotted checkout. Lanes marked `toolpanel: false` get
+   the full diff through plain `roundtable` and are labelled tool-less.
+2. **Pass 2 is ALWAYS `--converse`, seeded from pass 1's answers exactly as
+   they are.** Fold the answer files with `toolpanel-seed.py` and run
+   `roundtable --converse seed.json`. Change NOTHING between the passes: not
+   the code, not the brief, not the answers. No fixing findings first, no
+   dropping a lane's claim, no re-running pass 1. The converse pass discusses
+   what pass 1 actually said.
+3. **This overrides "when to discuss, and when not to" above.** Under this
+   procedure the converse pass runs even when pass 1 is unanimous or its only
+   dissent is a checkable fact. That guidance stays the default only when CJ
+   has not asked for the two-pass procedure.
+4. **Evaluation happens after both passes.** A fresh-context verifier checks
+   every finding from both passes against the code, and against `main`'s
+   behaviour where a finding claims "main did X". Lane agreement is never the
+   evidence; a converse-pass consensus is persuasion (see #98).
+5. **Report to CJ before acting.** No fixes, commits, PRs or merges based on
+   the review until he has seen the evaluated report. Fixes go into a new
+   commit, and a new review starts again from pass 1.
 
 ## Cost
 
