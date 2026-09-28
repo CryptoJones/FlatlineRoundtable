@@ -99,7 +99,10 @@ Prices come from the gateway's own table (cached for a day), so they do not go
 stale the way a hand-maintained number does; `price_per_mtok` overrides it for
 vendors with no price endpoint. `--max-spend` and `budget_usd` are checked
 **before dispatch** against a worst-case estimate, so an overrun is prevented
-rather than reported.
+rather than reported. Under a budget, an `http` lane whose price cannot be
+resolved is refused outright rather than estimated at $0 — a guard that
+cannot see a lane cannot bind on it. `cli`/`acp` lanes, `:free` models and an
+explicit `price_per_mtok: 0` are free, not unknown.
 
 ## Usage
 
@@ -113,13 +116,17 @@ roundtable --list                       # roster + route; no network calls
 roundtable --json                       # structured output
 roundtable --config PATH
 roundtable --max-spend 0.50        # refuses BEFORE dispatch if the estimate exceeds it
-roundtable --diff                  # report only where the lanes disagree
+roundtable --panel --diff          # report only where the lanes disagree (not with --each)
 roundtable --no-transcript
 roundtable --each --revise latest:12    # optional second round — see below
 ```
 
 `--diff` asks lanes to report AGREED / SPLIT / LONE CLAIMS across the others,
 because reading N full answers does not scale and disagreement is the product.
+It needs every answer in one process, so it pairs with `--panel`; `--each
+--diff` is refused up front rather than silently dropping the flag. To get the
+independent-process run *and* a comparison, run `--each` and synthesize from
+the transcripts afterwards.
 
 It is opt-in and it is not neutral — a synthesizer is one model with its own
 priors deciding what counts as a disagreement, so the raw answers still go to
@@ -208,8 +215,12 @@ kill, the missing-secret abort, and partial delivery failing the run.
 - Three harnesses: `http` (any OpenAI-compatible endpoint), `cli` (one-shot
   subscription CLIs), and `acp` (JSON-RPC-over-stdio agents, driven for exactly
   one turn).
-- Lanes have **no tools and no file access**. This is "read this and tell me what
-  you think," not "go investigate the repo." Put the material in the brief.
+- Tool access is a property of the harness, not the panel. `http` and `acp`
+  lanes see the brief and nothing else — put the material in it. `cli` lanes run
+  the vendor's CLI with its normal tools and may read, run, and write in the
+  directory they are launched from; commit first, and expect them to
+  investigate. A lane keeps its tools until it cheats (reads another lane's
+  answer, edits the code under review, games the question); then it loses them.
 - Lanes never see each other's answers. That is the point; it is also why they
   cannot build on one another.
 - A weak lane is worse than an absent one — it still gets counted. Prune the

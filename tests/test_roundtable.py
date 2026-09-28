@@ -19,6 +19,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -455,6 +456,29 @@ class TestCliLane(unittest.TestCase):
                 self.addCleanup(os.environ.pop, var, None)
                 self.assertNotIn(var, rt.child_env({}))
 
+    def test_child_env_carries_nothing_the_scrub_rules_name(self):
+        """#77: child_env is shared by the cli and acp harnesses, so this is the
+        one place the rule itself can be checked, independent of either.
+
+        Seed every SCRUB_ENV name and one of each pattern shape, then assert
+        against the rules as written in the issue -- not against the module's
+        own regexes, or a weakened pattern would pass its own test.
+        """
+        seeded = list(rt.SCRUB_ENV) + [
+            "NEWVENDOR_API_KEY", "NEWVENDOR_AUTH_TOKEN", "NEWVENDOR_BASE_URL",
+            "CLAUDE_CODE_USE_SOMETHING_NEW",
+        ]
+        for var in seeded:
+            os.environ[var] = "would-bill"
+            self.addCleanup(os.environ.pop, var, None)
+        env = rt.child_env({})
+        rules = [re.compile(p) for p in
+                 (r"_API_KEY$", r"_AUTH_TOKEN$", r"_BASE_URL$", r"^CLAUDE_CODE_USE_")]
+        leaked = sorted(k for k in env
+                        if k in rt.SCRUB_ENV or any(r.search(k) for r in rules))
+        self.assertEqual(leaked, [], f"scrubbed shapes reached the child env: {leaked}")
+        self.assertNotIn("would-bill", env.values())
+
     def test_a_lane_can_scrub_extra_variables(self):
         os.environ["WEIRD_VENDOR_TOKEN"] = "x"
         self.addCleanup(os.environ.pop, "WEIRD_VENDOR_TOKEN", None)
@@ -598,6 +622,37 @@ class TestSynthesis(unittest.TestCase):
                 sems={}, lock=threading.Lock(), spent=spent, retries=0)
             self.assertIsNone(err)
             self.assertEqual(len(synth["readings"]), 2)
+        self.assertGreater(spent[0], 0.0)
+
+    def test_reader_order_is_stable_when_the_second_finishes_first(self):
+        """#83: readers are gathered as they complete, but reported in roster
+        order, so the transcript does not reshuffle on latency."""
+        # The stub server is single-threaded, so the delay goes in front of
+        # ask() rather than inside the handler: L1 must actually reach the
+        # server and return while L0 is still waiting.
+        orig, done = rt.ask, []
+
+        def slow_first(lane, *a, **k):
+            if lane["name"] == "L0":
+                time.sleep(0.5)
+            r = orig(lane, *a, **k)
+            done.append(lane["name"])
+            return r
+        rt.ask = slow_first
+        self.addCleanup(lambda: setattr(rt, "ask", orig))
+        with StubServer() as s:
+            lanes = [{"name": f"L{i}", "harness": "http", "vendor": f"v{i}",
+                      "model": "m", "base_url": s.url, "timeout": 10}
+                     for i in range(2)]
+            results = [{"lane": "L0", "model": "m", "answer": "a", "usage": {}},
+                       {"lane": "L1", "model": "m", "answer": "b", "usage": {}}]
+            spent = [0.0]
+            synth, err = rt.synthesize(
+                results, "brief", {}, lanes, {}, {"m": (1.0, 1.0)}, count=2,
+                sems={}, lock=threading.Lock(), spent=spent, retries=0)
+        self.assertIsNone(err)
+        self.assertEqual(done, ["L1", "L0"])           # L1 really did finish first
+        self.assertEqual([r["by"] for r in synth["readings"]], ["L0", "L1"])
         self.assertGreater(spent[0], 0.0)
 
     def test_a_reader_failing_reports_rather_than_raising(self):
@@ -1174,6 +1229,36 @@ __ON_PROMPT__
         self.assertEqual(out["answer"], "after permission")
         self.assertEqual(out["finish_reason"], "stop")
 
+    def test_ambient_api_key_never_reaches_the_acp_agent(self):
+        """#77: the acp analogue of TestCliLane's cost test.
+
+        acp_lane shares child_env with cli_lane today, so it inherits the
+        scrub -- but only the cli path was asserting it. A refactor giving the
+        acp path its own env construction would reopen the "free lane silently
+        becomes metered" hole with no CI signal. The fake agent echoes its own
+        environment back as its answer.
+        """
+        exe = self._custom_agent("""                *session/prompt*)
+                    echo '{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"text":"KEY=['"${ANTHROPIC_API_KEY:-unset}"']"}}}}'
+                    echo '{"jsonrpc":"2.0","id":2,"result":{"stopReason":"end_turn"}}' ;;""")
+        os.environ["ANTHROPIC_API_KEY"] = "leaked-would-bill"
+        self.addCleanup(os.environ.pop, "ANTHROPIC_API_KEY", None)
+        out = rt.acp_lane({"command": str(exe), "args": [], "timeout": 10}, "hi")
+        self.assertEqual(out["answer"], "KEY=[unset]")
+        self.assertNotIn("leaked-would-bill", out["answer"])
+
+    def test_a_permission_request_with_options_gets_a_reject_not_a_cancel(self):
+        """#62: 'cancelled' tells the agent the user cancelled the TURN, and
+        Laguna wrapped up after one sentence. With options present the client
+        must select a reject option -- denied, carry on."""
+        exe = self._custom_agent("""                *session/prompt*)
+                    echo '{"jsonrpc":"2.0","id":"perm2","method":"session/request_permission","params":{"options":[{"optionId":"ok1","name":"Allow","kind":"allow_once"},{"optionId":"rej1","name":"Reject","kind":"reject_once"}]}}' ;;
+                *perm2*rej1*)
+                    echo '{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"text":"denied and finished"}}}}'
+                    echo '{"jsonrpc":"2.0","id":2,"result":{"stopReason":"end_turn"}}' ;;""")
+        out = rt.acp_lane({"command": str(exe), "args": [], "timeout": 10}, "hi")
+        self.assertEqual(out["answer"], "denied and finished")
+
     def test_the_timeout_error_reports_what_streamed(self):
         """A model still reasoning at the deadline and a dead handshake must not
         produce the same error line -- that ambiguity cost four days on #56."""
@@ -1274,6 +1359,19 @@ class TestPricing(unittest.TestCase):
     def test_free_lanes_contribute_nothing(self):
         lanes = [{"name": "A", "harness": "cli", "model": "x", "max_tokens": 99999}]
         self.assertEqual(rt.estimate_run(lanes, "hello", {}, {}), 0.0)
+
+    def test_free_is_distinguished_from_unknown(self):
+        """#72: cli/acp, a `:free` model and an explicit price of 0 are free;
+        an http model the table has never heard of is unknown, not free."""
+        for lane in ({"harness": "cli", "model": "x"},
+                     {"harness": "acp", "model": "x"},
+                     {"harness": "http", "model": "vendor/thing:free"},
+                     {"harness": "http", "model": "x", "price_per_mtok": 0}):
+            self.assertTrue(rt.lane_price_known(lane, {}), lane)
+            self.assertEqual(rt.estimate_run(
+                [{"name": "A", "max_tokens": 100000, **lane}], "x" * 50000, {}, {}), 0.0)
+        self.assertTrue(rt.lane_price_known({"harness": "http", "model": "x"}, {"x": (0.0, 0.0)}))
+        self.assertFalse(rt.lane_price_known({"harness": "http", "model": "vendor/not-in-table"}, {}))
 
 
 class TestEndToEnd(unittest.TestCase):
@@ -1401,12 +1499,81 @@ class TestEndToEnd(unittest.TestCase):
             self.assertIn("refusing to dispatch", r.stderr)
             self.assertIsNone(s.srv.last_request, "dispatched despite being over budget")
 
+    def test_budget_refuses_a_lane_it_cannot_price(self):
+        """#72: an unknown model id estimated to $0, so --max-spend could not
+        bind. Under a budget that is a refusal naming the lane and the fix."""
+        with StubServer() as s:
+            r = self._run(
+                [{"name": "Mystery", "harness": "http", "model": "vendor/not-in-table",
+                  "base_url": s.url, "max_tokens": 100000}],
+                "--max-spend", "0.01")
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn("Mystery", r.stderr)
+            self.assertIn("no known price", r.stderr)
+            self.assertIn("price_per_mtok", r.stderr)
+            self.assertIsNone(s.srv.last_request, "dispatched a lane the budget cannot see")
+
+    def test_budget_still_admits_a_free_model(self):
+        # The refusal is for unknown, not for free: a `:free` id still runs.
+        with StubServer() as s:
+            r = self._run([{"name": "A", "harness": "http", "model": "vendor/m:free",
+                            "base_url": s.url}], "--max-spend", "0.01")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIsNotNone(s.srv.last_request)
+
+    def test_no_budget_leaves_an_unpriced_lane_alone(self):
+        # Without a budget there is nothing to bind, so behaviour is unchanged.
+        with StubServer() as s:
+            r = self._run([{"name": "A", "harness": "http", "model": "vendor/not-in-table",
+                            "base_url": s.url}])
+            self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_each_gates_the_whole_panel_before_spawning_children(self):
+        """#71: the gate sat after the --each branch returned, so the parent
+        never ran it and each child checked only its own lane. Two lanes that
+        each fit the budget alone but not together must be refused by the
+        parent, before any child exists to reach the stub."""
+        with StubServer() as s:
+            lanes = [{"name": n, "harness": "http", "model": "m", "base_url": s.url,
+                      "price_per_mtok": 1000.0, "max_tokens": 2000}
+                     for n in ("A", "B")]
+            # One lane's ceiling is ~$2 (2000 completion tokens at $1000/Mtok);
+            # $3 clears one lane and not two.
+            r = self._run(lanes, "--each", "--max-spend", "3")
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn("refusing to dispatch", r.stderr)
+            self.assertNotIn("=== A", r.stdout, "a child was spawned despite the refusal")
+            self.assertIsNone(s.srv.last_request, "dispatched despite being over budget")
+            # And the same roster under a budget that covers the panel still runs.
+            r = self._run(lanes, "--each", "--max-spend", "5")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIsNotNone(s.srv.last_request)
+
     def test_list_makes_no_network_calls(self):
         with StubServer() as s:
             r = self._run([{"name": "A", "harness": "http", "model": "m", "base_url": s.url}],
                           "--list")
             self.assertEqual(r.returncode, 0)
             self.assertIsNone(s.srv.last_request)
+
+    def test_each_with_diff_is_refused_before_anything_runs(self):
+        """#74: --diff was accepted under --each, never forwarded to the
+        children, and the run exited 0 with no synthesis. Synthesis needs every
+        answer in one process; --each gives each lane its own. Refuse up front,
+        spawning nothing and spending nothing."""
+        with StubServer() as s:
+            lanes = [{"name": n, "harness": "http", "model": "m", "base_url": s.url}
+                     for n in ("A", "B")]
+            r = self._run(lanes, "--each", "--diff")
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn("--each --diff", r.stderr)
+            self.assertIn("--panel --diff", r.stderr)
+            # No child ran: the per-lane banner is printed by the parent right
+            # before it spawns each one, so its absence means no spawn happened.
+            self.assertNotIn("=== A", r.stdout)
+            self.assertNotIn("=== B", r.stdout)
+            self.assertIsNone(s.srv.last_request, "a lane was dispatched")
+            self.assertEqual(s.srv.hits, {}, "the stub server was contacted")
 
 
 # --------------------------------------------------------------------------- #
@@ -1469,6 +1636,26 @@ class TestRevisionRound(unittest.TestCase):
         with self.assertRaises(SystemExit):
             rt.load_transcripts("latest")
 
+    def test_bad_latest_n_dies_cleanly(self):
+        """#76: latest:<non-int>, latest:, latest:0 and latest:-3 used to leak a
+        raw ValueError traceback — the one place the tool did not die() with a
+        message naming the fix."""
+        self._transcript("20260901-000001.json", "q", [self._r("A", "a1")])
+        for spec in ("latest:notanint", "latest:", "latest:0", "latest:-3"):
+            with self.subTest(spec=spec):
+                with self.assertRaises(SystemExit) as e:
+                    rt.load_transcripts(spec)
+                self.assertIn("--revise latest:N needs a positive integer (e.g. latest:12)",
+                              str(e.exception.code))
+
+    def test_latest_and_latest_n_still_parse(self):
+        self._transcript("20260901-000001.json", "q", [self._r("A", "a1")])
+        self._transcript("20260901-000002.json", "q", [self._r("B", "b1")])
+        paths, _ = rt.load_transcripts("latest")
+        self.assertEqual([p.name for p in paths], ["20260901-000002.json"])
+        paths, _ = rt.load_transcripts("latest:2")
+        self.assertEqual(len(paths), 2)
+
     def test_aliases_skip_lanes_that_gave_no_answer(self):
         aliases = rt.alias_map([self._r("A", "yes"),
                                 {"lane": "dead", "answer": None},
@@ -1506,6 +1693,53 @@ class TestRevisionRound(unittest.TestCase):
         self.assertIsNone(rt.parse_verdict("x" * 500 + "\nHOLD"))
 
 
+@unittest.skipUnless(os.name == "posix", "POSIX file modes only")
+class TestTranscriptPermissions(unittest.TestCase):
+    """A transcript holds the full brief and every answer: private by default (#73)."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self._old_dir = rt.TRANSCRIPT_DIR
+        rt.TRANSCRIPT_DIR = self.tmp / "transcripts"
+        self.addCleanup(setattr, rt, "TRANSCRIPT_DIR", self._old_dir)
+        # A permissive umask must not be able to widen them either.
+        old = os.umask(0o000)
+        self.addCleanup(os.umask, old)
+
+    @staticmethod
+    def _mode(p):
+        return p.stat().st_mode & 0o777
+
+    def _path(self, name="20260901-000001-A-4242.json"):
+        # main's per-lane naming (#70/#88): <stamp>-<lane>-<pid>.json
+        return rt.TRANSCRIPT_DIR / name
+
+    def test_fresh_transcript_is_0600_in_a_0700_dir(self):
+        p = rt.save_transcript({"brief": "secret", "results": []}, self._path())
+        self.assertEqual(p, self._path())
+        self.assertEqual(self._mode(p), 0o600)
+        self.assertEqual(self._mode(rt.TRANSCRIPT_DIR), 0o700)
+        self.assertEqual(json.loads(p.read_text())["brief"], "secret")
+
+    def test_pre_existing_world_readable_dir_is_tightened(self):
+        rt.TRANSCRIPT_DIR.mkdir(mode=0o755)
+        rt.save_transcript({"brief": "q", "results": []}, self._path())
+        self.assertEqual(self._mode(rt.TRANSCRIPT_DIR), 0o700)
+
+    def test_incremental_rewrites_stay_0600_and_leave_no_staging_file(self):
+        """#58 writes the same path after every lane; every rewrite goes through
+        the same 0600 staging file, so a partial transcript is as private as a
+        finished one and nothing readable is left beside it."""
+        p = self._path()
+        rt.save_transcript({"brief": "q", "results": [None, None], "partial": True}, p)
+        rt.save_transcript({"brief": "q", "results": [{"lane": "A"}, None], "partial": True}, p)
+        rt.save_transcript({"brief": "q", "results": [{"lane": "A"}, {"lane": "B"}]}, p)
+        self.assertEqual(self._mode(p), 0o600)
+        self.assertEqual([x.name for x in rt.TRANSCRIPT_DIR.iterdir()], [p.name])
+        self.assertNotIn("partial", json.loads(p.read_text()))
+
+
 class TestRevisionEndToEnd(unittest.TestCase):
     def test_revise_run_sends_the_packet_and_reports_the_round(self):
         d = Path(tempfile.mkdtemp())
@@ -1531,6 +1765,75 @@ class TestRevisionEndToEnd(unittest.TestCase):
             self.assertNotIn("PANELIST B is B", sent)
             self.assertIn("ROUND 2", r.stdout)
             self.assertIn("persuasion, not independent convergence", r.stdout)
+
+
+class TestTranscriptUniqueness(unittest.TestCase):
+    """#70: transcripts clobber each other under --each -j N, losing paid answers.
+
+    The transcript filename was stamped at one-second resolution and every --each
+    child computed its own stamp independently, so lanes that started within the
+    same second — routine under -j — wrote the SAME path and overwrote each other.
+    The .json.tmp staging file derived from that same name too, so concurrent
+    writers raced on one temp before either rename. Exit code stayed 0 while paid
+    http answers vanished: #58's failure mode reintroduced through the filename.
+
+    HOME is pointed at a throwaway dir so TRANSCRIPT_DIR (~/.local/share/...) is
+    hermetic and each test counts only its own transcripts.
+    """
+
+    def _run(self, lanes, *args, extra_cfg=None):
+        d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d, True)
+        cfg = {"lanes": lanes}
+        cfg.update(extra_cfg or {})
+        (d / "c.yaml").write_text(json.dumps(cfg))
+        home = d / "home"
+        home.mkdir()
+        env = {**os.environ, "XDG_CACHE_HOME": str(d / "cache"), "HOME": str(home)}
+        tdir = home / ".local" / "share" / "flatline-roundtable" / "transcripts"
+        return subprocess.run(
+            [sys.executable, str(ROOT / "roundtable"), "--config", str(d / "c.yaml"),
+             *args, "brief"],
+            capture_output=True, text=True, timeout=120, env=env, input="brief\n",
+        ), tdir
+
+    @staticmethod
+    def _lanes(url, n):
+        return [{"name": f"L{i}", "harness": "http", "model": "m",
+                 "base_url": url, "timeout": 20} for i in range(n)]
+
+    def test_each_parallel_writes_one_transcript_per_lane(self):
+        """8 lanes under -j 8 must leave 8 transcripts naming 8 distinct lanes.
+
+        Before the fix this left a single file with one lane: same-second children
+        collided on the timestamped name and overwrote each other, exit 0, answers
+        billed and gone.
+        """
+        with StubServer() as s:
+            r, tdir = self._run(self._lanes(s.url, 8), "--each", "-j", "8")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        files = list(tdir.glob("*.json"))
+        self.assertEqual(len(files), 8,
+                         f"expected 8 transcripts, got {len(files)} — answers clobbered")
+        lanes_recorded = set()
+        for f in files:
+            data = json.loads(f.read_text())
+            lanes_recorded |= {res["lane"] for res in data["results"]}
+        self.assertEqual(lanes_recorded, {f"L{i}" for i in range(8)},
+                         "not every lane's answer survived to a transcript")
+
+    def test_no_temp_files_are_left_behind(self):
+        """The atomic write stages via a temp file; none may survive the run.
+
+        The old .json.tmp name was shared across same-second lanes, so concurrent
+        writers raced on one staging path before either rename — a torn-write
+        window that defeated the whole point of write-then-replace.
+        """
+        with StubServer() as s:
+            r, tdir = self._run(self._lanes(s.url, 6), "--each", "-j", "6")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        leftovers = [p.name for p in tdir.iterdir() if ".tmp" in p.name]
+        self.assertEqual(leftovers, [], f"staging files survived the run: {leftovers}")
 
 
 if __name__ == "__main__":
