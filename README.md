@@ -241,6 +241,12 @@ synthesis, or for another `--discuss`.
 nothing to fan out — each turn is built from the ones before it), and refuses
 fewer than two lanes.
 
+Use it when lanes split on a **judgment** — severity, reachability, which fix
+is right — and the split is what you need settled. When the only dissent
+rests on a **checkable fact**, check the fact; a discussion costs
+`rounds × lanes` requests and can manufacture evidence, a fact check costs one
+command.
+
 **What a turn can see.** `--discuss` drives the lanes itself, through the same
 `http` / `cli` / `acp` harnesses as round 1. An `http` or `acp` turn sees the
 shared packet and nothing else — no tools, no repo — so anything the panel
