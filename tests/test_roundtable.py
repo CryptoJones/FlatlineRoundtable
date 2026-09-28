@@ -1506,6 +1506,36 @@ class TestRevisionRound(unittest.TestCase):
         self.assertIsNone(rt.parse_verdict("x" * 500 + "\nHOLD"))
 
 
+@unittest.skipUnless(os.name == "posix", "POSIX file modes only")
+class TestTranscriptPermissions(unittest.TestCase):
+    """A transcript holds the full brief and every answer: private by default (#73)."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self._old_dir = rt.TRANSCRIPT_DIR
+        rt.TRANSCRIPT_DIR = self.tmp / "transcripts"
+        self.addCleanup(setattr, rt, "TRANSCRIPT_DIR", self._old_dir)
+        # A permissive umask must not be able to widen them either.
+        old = os.umask(0o000)
+        self.addCleanup(os.umask, old)
+
+    @staticmethod
+    def _mode(p):
+        return p.stat().st_mode & 0o777
+
+    def test_fresh_transcript_is_0600_in_a_0700_dir(self):
+        p = rt.save_transcript({"brief": "secret", "results": []})
+        self.assertEqual(self._mode(p), 0o600)
+        self.assertEqual(self._mode(rt.TRANSCRIPT_DIR), 0o700)
+        self.assertEqual(json.loads(p.read_text())["brief"], "secret")
+
+    def test_pre_existing_world_readable_dir_is_tightened(self):
+        rt.TRANSCRIPT_DIR.mkdir(mode=0o755)
+        rt.save_transcript({"brief": "q", "results": []})
+        self.assertEqual(self._mode(rt.TRANSCRIPT_DIR), 0o700)
+
+
 class TestRevisionEndToEnd(unittest.TestCase):
     def test_revise_run_sends_the_packet_and_reports_the_round(self):
         d = Path(tempfile.mkdtemp())

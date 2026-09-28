@@ -1317,6 +1317,25 @@ def load_transcripts(arg: str) -> tuple[list[Path], dict]:
     return paths, merged
 
 
+def save_transcript(record: dict) -> Path:
+    """Write one transcript, private to the user (dir 0700, file 0600).
+
+    A transcript holds the full brief and every lane's answer, and briefs are
+    routinely confidential. The default umask leaves them world-readable, which
+    hands them to any local user -- including a `cli` lane's vendor agent, which
+    runs with full tool access (#73). The chmod on an existing dir is for
+    transcript dirs created before this fix; the file gets its mode at creation
+    rather than afterwards so there is no window where it is readable.
+    """
+    TRANSCRIPT_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    TRANSCRIPT_DIR.chmod(0o700)
+    path = TRANSCRIPT_DIR / f"{dt.datetime.now():%Y%m%d-%H%M%S}.json"
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(json.dumps(record, indent=2))
+    return path
+
+
 def alias_map(results: list[dict]) -> dict[str, str]:
     """Stable anonymous letters for every lane that answered.
 
@@ -1538,16 +1557,13 @@ def main() -> int:
                                       retries=int(cfg.get("retries", 1)))
 
     if not a.no_transcript:
-        TRANSCRIPT_DIR.mkdir(parents=True, exist_ok=True)
-        stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
-        path = TRANSCRIPT_DIR / f"{stamp}.json"
         record = {"brief": brief_on_record, "results": results, "synthesis": synth,
                   "collisions": collisions}
         if prompts:
             record.update({"round": round_no,
                            "parent": [str(p) for p in prior_paths],
                            "aliases": aliases})
-        path.write_text(json.dumps(record, indent=2))
+        path = save_transcript(record)
 
     if a.json:
         print(json.dumps({"results": results, "synthesis": synth} if a.diff else results, indent=2))
