@@ -116,13 +116,17 @@ roundtable --list                       # roster + route; no network calls
 roundtable --json                       # structured output
 roundtable --config PATH
 roundtable --max-spend 0.50        # refuses BEFORE dispatch if the estimate exceeds it
-roundtable --diff                  # report only where the lanes disagree
+roundtable --panel --diff          # report only where the lanes disagree (not with --each)
 roundtable --no-transcript
 roundtable --each --revise latest:12    # optional second round — see below
 ```
 
 `--diff` asks lanes to report AGREED / SPLIT / LONE CLAIMS across the others,
 because reading N full answers does not scale and disagreement is the product.
+It needs every answer in one process, so it pairs with `--panel`; `--each
+--diff` is refused up front rather than silently dropping the flag. To get the
+independent-process run *and* a comparison, run `--each` and synthesize from
+the transcripts afterwards.
 
 It is opt-in and it is not neutral — a synthesizer is one model with its own
 priors deciding what counts as a disagreement, so the raw answers still go to
