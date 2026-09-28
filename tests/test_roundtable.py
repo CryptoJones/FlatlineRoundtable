@@ -1247,6 +1247,18 @@ __ON_PROMPT__
         self.assertEqual(out["answer"], "KEY=[unset]")
         self.assertNotIn("leaked-would-bill", out["answer"])
 
+    def test_a_permission_request_with_options_gets_a_reject_not_a_cancel(self):
+        """#62: 'cancelled' tells the agent the user cancelled the TURN, and
+        Laguna wrapped up after one sentence. With options present the client
+        must select a reject option -- denied, carry on."""
+        exe = self._custom_agent("""                *session/prompt*)
+                    echo '{"jsonrpc":"2.0","id":"perm2","method":"session/request_permission","params":{"options":[{"optionId":"ok1","name":"Allow","kind":"allow_once"},{"optionId":"rej1","name":"Reject","kind":"reject_once"}]}}' ;;
+                *perm2*rej1*)
+                    echo '{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"text":"denied and finished"}}}}'
+                    echo '{"jsonrpc":"2.0","id":2,"result":{"stopReason":"end_turn"}}' ;;""")
+        out = rt.acp_lane({"command": str(exe), "args": [], "timeout": 10}, "hi")
+        self.assertEqual(out["answer"], "denied and finished")
+
     def test_the_timeout_error_reports_what_streamed(self):
         """A model still reasoning at the deadline and a dead handshake must not
         produce the same error line -- that ambiguity cost four days on #56."""
@@ -1699,16 +1711,33 @@ class TestTranscriptPermissions(unittest.TestCase):
     def _mode(p):
         return p.stat().st_mode & 0o777
 
+    def _path(self, name="20260901-000001-A-4242.json"):
+        # main's per-lane naming (#70/#88): <stamp>-<lane>-<pid>.json
+        return rt.TRANSCRIPT_DIR / name
+
     def test_fresh_transcript_is_0600_in_a_0700_dir(self):
-        p = rt.save_transcript({"brief": "secret", "results": []})
+        p = rt.save_transcript({"brief": "secret", "results": []}, self._path())
+        self.assertEqual(p, self._path())
         self.assertEqual(self._mode(p), 0o600)
         self.assertEqual(self._mode(rt.TRANSCRIPT_DIR), 0o700)
         self.assertEqual(json.loads(p.read_text())["brief"], "secret")
 
     def test_pre_existing_world_readable_dir_is_tightened(self):
         rt.TRANSCRIPT_DIR.mkdir(mode=0o755)
-        rt.save_transcript({"brief": "q", "results": []})
+        rt.save_transcript({"brief": "q", "results": []}, self._path())
         self.assertEqual(self._mode(rt.TRANSCRIPT_DIR), 0o700)
+
+    def test_incremental_rewrites_stay_0600_and_leave_no_staging_file(self):
+        """#58 writes the same path after every lane; every rewrite goes through
+        the same 0600 staging file, so a partial transcript is as private as a
+        finished one and nothing readable is left beside it."""
+        p = self._path()
+        rt.save_transcript({"brief": "q", "results": [None, None], "partial": True}, p)
+        rt.save_transcript({"brief": "q", "results": [{"lane": "A"}, None], "partial": True}, p)
+        rt.save_transcript({"brief": "q", "results": [{"lane": "A"}, {"lane": "B"}]}, p)
+        self.assertEqual(self._mode(p), 0o600)
+        self.assertEqual([x.name for x in rt.TRANSCRIPT_DIR.iterdir()], [p.name])
+        self.assertNotIn("partial", json.loads(p.read_text()))
 
 
 class TestRevisionEndToEnd(unittest.TestCase):
@@ -1736,6 +1765,75 @@ class TestRevisionEndToEnd(unittest.TestCase):
             self.assertNotIn("PANELIST B is B", sent)
             self.assertIn("ROUND 2", r.stdout)
             self.assertIn("persuasion, not independent convergence", r.stdout)
+
+
+class TestTranscriptUniqueness(unittest.TestCase):
+    """#70: transcripts clobber each other under --each -j N, losing paid answers.
+
+    The transcript filename was stamped at one-second resolution and every --each
+    child computed its own stamp independently, so lanes that started within the
+    same second — routine under -j — wrote the SAME path and overwrote each other.
+    The .json.tmp staging file derived from that same name too, so concurrent
+    writers raced on one temp before either rename. Exit code stayed 0 while paid
+    http answers vanished: #58's failure mode reintroduced through the filename.
+
+    HOME is pointed at a throwaway dir so TRANSCRIPT_DIR (~/.local/share/...) is
+    hermetic and each test counts only its own transcripts.
+    """
+
+    def _run(self, lanes, *args, extra_cfg=None):
+        d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d, True)
+        cfg = {"lanes": lanes}
+        cfg.update(extra_cfg or {})
+        (d / "c.yaml").write_text(json.dumps(cfg))
+        home = d / "home"
+        home.mkdir()
+        env = {**os.environ, "XDG_CACHE_HOME": str(d / "cache"), "HOME": str(home)}
+        tdir = home / ".local" / "share" / "flatline-roundtable" / "transcripts"
+        return subprocess.run(
+            [sys.executable, str(ROOT / "roundtable"), "--config", str(d / "c.yaml"),
+             *args, "brief"],
+            capture_output=True, text=True, timeout=120, env=env, input="brief\n",
+        ), tdir
+
+    @staticmethod
+    def _lanes(url, n):
+        return [{"name": f"L{i}", "harness": "http", "model": "m",
+                 "base_url": url, "timeout": 20} for i in range(n)]
+
+    def test_each_parallel_writes_one_transcript_per_lane(self):
+        """8 lanes under -j 8 must leave 8 transcripts naming 8 distinct lanes.
+
+        Before the fix this left a single file with one lane: same-second children
+        collided on the timestamped name and overwrote each other, exit 0, answers
+        billed and gone.
+        """
+        with StubServer() as s:
+            r, tdir = self._run(self._lanes(s.url, 8), "--each", "-j", "8")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        files = list(tdir.glob("*.json"))
+        self.assertEqual(len(files), 8,
+                         f"expected 8 transcripts, got {len(files)} — answers clobbered")
+        lanes_recorded = set()
+        for f in files:
+            data = json.loads(f.read_text())
+            lanes_recorded |= {res["lane"] for res in data["results"]}
+        self.assertEqual(lanes_recorded, {f"L{i}" for i in range(8)},
+                         "not every lane's answer survived to a transcript")
+
+    def test_no_temp_files_are_left_behind(self):
+        """The atomic write stages via a temp file; none may survive the run.
+
+        The old .json.tmp name was shared across same-second lanes, so concurrent
+        writers raced on one staging path before either rename — a torn-write
+        window that defeated the whole point of write-then-replace.
+        """
+        with StubServer() as s:
+            r, tdir = self._run(self._lanes(s.url, 6), "--each", "-j", "6")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        leftovers = [p.name for p in tdir.iterdir() if ".tmp" in p.name]
+        self.assertEqual(leftovers, [], f"staging files survived the run: {leftovers}")
 
 
 if __name__ == "__main__":

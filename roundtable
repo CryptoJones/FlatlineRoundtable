@@ -24,6 +24,8 @@ Usage:
     roundtable --json > answers.json
     roundtable --config PATH
     roundtable --max-spend 0.50
+    cat brief.md | roundtable --each -j 8 -  eight lanes at a time, each still
+                                           its own process and its own deadline
     roundtable --each --revise latest:12   optional second round: each lane sees
                                            the locked round-1 answers and may
                                            HOLD or REVISE
@@ -830,8 +832,27 @@ def acp_lane(lane: dict, prompt: str) -> dict:
                     # delivered (#56). Lanes have no tools, so the honest
                     # answers are "no" and "no such method".
                     if m["method"] == "session/request_permission":
-                        send({"jsonrpc": "2.0", "id": m["id"],
-                              "result": {"outcome": {"outcome": "cancelled"}}})
+                        # "cancelled" means the USER cancelled the whole turn,
+                        # and agents honour it: Laguna's first delivered
+                        # full-brief turn ended after one sentence on exactly
+                        # that reply (#62). The no-tools answer is to SELECT a
+                        # reject option -- "denied, carry on" -- and fall back
+                        # to cancelled only when the request offers no options.
+                        opts = ((m.get("params") or {}).get("options")) or []
+                        rej = next((o for o in opts
+                                    if str(o.get("kind", "")).startswith("reject")),
+                                   None) or next(
+                            (o for o in opts
+                             if any(w in str(o.get("name", "")).lower()
+                                    for w in ("reject", "deny"))), None)
+                        if rej is not None and rej.get("optionId") is not None:
+                            send({"jsonrpc": "2.0", "id": m["id"],
+                                  "result": {"outcome": {
+                                      "outcome": "selected",
+                                      "optionId": rej["optionId"]}}})
+                        else:
+                            send({"jsonrpc": "2.0", "id": m["id"],
+                                  "result": {"outcome": {"outcome": "cancelled"}}})
                     else:
                         send({"jsonrpc": "2.0", "id": m["id"],
                               "error": {"code": -32601,
@@ -1309,8 +1330,9 @@ def load_transcripts(arg: str) -> tuple[list[Path], dict]:
             paths.extend(cands[-n:])
         else:
             paths.append(Path(spec).expanduser())
-    # Dedupe, then chronological order (transcript names are timestamps), so
-    # that when the same lane appears twice the later answer wins below.
+    # Dedupe, then chronological order: transcript names begin with a timestamp
+    # (then lane/pid for uniqueness), so sorting by name is sorting by time. This
+    # makes the later answer win below when the same lane appears twice.
     paths = sorted(set(paths), key=lambda p: p.name)
     if not paths:
         die("--revise: no transcript named")
@@ -1351,22 +1373,46 @@ def load_transcripts(arg: str) -> tuple[list[Path], dict]:
     return paths, merged
 
 
-def save_transcript(record: dict) -> Path:
-    """Write one transcript, private to the user (dir 0700, file 0600).
+def private_transcript_dir() -> Path:
+    """Make TRANSCRIPT_DIR exist and be private to the user (0700).
 
     A transcript holds the full brief and every lane's answer, and briefs are
-    routinely confidential. The default umask leaves them world-readable, which
-    hands them to any local user -- including a `cli` lane's vendor agent, which
+    routinely confidential. The default umask leaves the directory
+    world-listable, which hands the filenames -- and, with 0644 files, the
+    contents -- to any local user, including a `cli` lane's vendor agent, which
     runs with full tool access (#73). The chmod on an existing dir is for
-    transcript dirs created before this fix; the file gets its mode at creation
-    rather than afterwards so there is no window where it is readable.
+    transcript dirs created before this fix.
     """
     TRANSCRIPT_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
     TRANSCRIPT_DIR.chmod(0o700)
-    path = TRANSCRIPT_DIR / f"{dt.datetime.now():%Y%m%d-%H%M%S}.json"
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as f:
-        f.write(json.dumps(record, indent=2))
+    return TRANSCRIPT_DIR
+
+
+def save_transcript(record: dict, path: Path) -> Path:
+    """Write one transcript at `path`, private to the user (dir 0700, file 0600).
+
+    Atomic via write-then-replace: a kill during the write leaves the previous
+    good transcript rather than a truncated one (#58). The staging file is a
+    UNIQUE mkstemp in the same directory (same filesystem, so the replace is
+    still atomic): a name derived from `path` made two writers colliding on one
+    transcript also collide on one .json.tmp and race before either rename (#70).
+    The 0600 goes on the staging file BEFORE the replace, so there is no window
+    in which the transcript is readable by anyone else (#73).
+    """
+    private_transcript_dir()
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix=".json.tmp")
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            fh.write(json.dumps(record, indent=2))
+        os.replace(tmp, path)
+    except BaseException:
+        # Never leave a half-written temp behind if the write or rename fails.
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
     return path
 
 
@@ -1413,6 +1459,9 @@ def main() -> int:
     ap.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     ap.add_argument("--lanes")
     ap.add_argument("--each", action="store_true")
+    ap.add_argument("-j", "--concurrency", type=int, default=None,
+                    help="with --each, run up to N lanes at once (default 1). "
+                         "Per-lane and per-vendor caps still apply.")
     ap.add_argument("--panel", action="store_true")
     ap.add_argument("--list", action="store_true")
     ap.add_argument("--json", action="store_true")
@@ -1473,6 +1522,7 @@ def main() -> int:
             "  only as fast as its slowest lane, and one death costs every answer.\n"
             "\n"
             "  --each                run each lane as its own process (what you want)\n"
+            "  --each -j N           the same, up to N lanes at once\n"
             "  --lanes NAME          one lane\n"
             "  --panel               the old shared-deadline behaviour, if you mean it"
             .format(n=len(lanes)))
@@ -1569,9 +1619,41 @@ def main() -> int:
         # deadlines, separate transcripts: a lane can be slow, or die, alone.
         # The panel-wide budget gate above has already passed; a child re-runs
         # it for its single lane only as a backstop (issue #71).
-        rc = 0
+        #
+        # Serial by DEFAULT, still: the measurement in the block above is why,
+        # and a config that predates this flag must not silently start fanning
+        # out. `--concurrency N` is the opt-in, and it is the only way to get
+        # parallel lanes without the shared deadline --panel imposes.
+        #
+        # Before this flag existed there was no such way: this loop was a
+        # blocking subprocess.run, so --each was always serial, and anyone who
+        # wanted lanes in parallel had to reach for --panel and give up the
+        # per-lane deadlines that are the entire point of --each. The `concurrency:`
+        # key in the config is deliberately NOT read here -- it is documented as
+        # the panel-mode default, the shipped example sets it to 8, and quietly
+        # honouring it would flip every existing caller from serial to eight-way.
+        #
+        # The per-vendor cap IS applied, by the same smallest-in-group rule
+        # build_semaphores uses, so a `concurrency: 1` local lane still cannot be
+        # run beside its neighbour on the same GPU while the API lanes fan out.
+        #
+        # Output stays in roster order: a lane's block is printed whole, once
+        # every lane before it has been printed, so a concurrent run reads
+        # exactly like a serial one instead of interleaving. At -j1 the child
+        # keeps the terminal directly, so the familiar live streaming is intact.
+        #
+        # --diff is deliberately not forwarded: --each --diff was refused above
+        # (#74), so it cannot reach this point.
+        default_cc = max(int(a.concurrency or 1), 1)
+        caps: dict[str, int] = {}
         for l in lanes:
-            print(f"\n=== {l['name']} " + "=" * (66 - len(l['name'])), flush=True)
+            gid = l.get("vendor") or l["name"]
+            cc = int(l.get("concurrency", default_cc))
+            caps[gid] = min(caps.get(gid, cc), cc)
+        vendor_sems = {gid: threading.Semaphore(cc) for gid, cc in caps.items()}
+        overall = threading.Semaphore(max(default_cc, 1))
+
+        def child_argv(l: dict) -> list[str]:
             argv = [sys.executable, str(Path(__file__).resolve()),
                     "--lanes", l["name"], "--config", str(a.config)]
             if a.json:
@@ -1581,8 +1663,35 @@ def main() -> int:
             if a.revise:
                 argv += ["--revise", a.revise]
             argv.append("-")
-            r = subprocess.run(argv, input=prompt, text=True)
-            rc = rc or r.returncode
+            return argv
+
+        def run_one(l: dict) -> tuple[int, str]:
+            gid = l.get("vendor") or l["name"]
+            with overall, vendor_sems[gid]:
+                r = subprocess.run(child_argv(l), input=prompt, text=True,
+                                   capture_output=True)
+            return r.returncode, (r.stdout or "") + (r.stderr or "")
+
+        rc = 0
+        if default_cc == 1:
+            # Unchanged path: the child inherits this terminal and streams.
+            for l in lanes:
+                print(f"\n=== {l['name']} " + "=" * (66 - len(l['name'])), flush=True)
+                r = subprocess.run(child_argv(l), input=prompt, text=True)
+                rc = rc or r.returncode
+            return rc
+
+        with cf.ThreadPoolExecutor(max_workers=max(len(lanes), 1)) as pool:
+            futures = [pool.submit(run_one, l) for l in lanes]
+            for l, fut in zip(lanes, futures):
+                print(f"\n=== {l['name']} " + "=" * (66 - len(l['name'])), flush=True)
+                try:
+                    code, out = fut.result()
+                except Exception as exc:                      # noqa: BLE001
+                    code, out = 1, f"  !! lane crashed: {exc}\n"
+                sys.stdout.write(out)
+                sys.stdout.flush()
+                rc = rc or code
         return rc
 
     # Keys are resolved after the fan-out decision so the --each parent, which
@@ -1595,13 +1704,78 @@ def main() -> int:
 
     lock, spent = threading.Lock(), [0.0]
     t0 = time.time()
+
+    # The transcript path is claimed BEFORE the fan-out, not after it, so that a
+    # run which dies mid-flight still leaves its finished lanes on disk. This
+    # used to be `list(pool.map(...))` followed by a single write at the end:
+    # every completed answer was held in memory until the last lane returned, so
+    # a SIGKILL, a closed terminal, a harness timeout or a Ctrl-C anywhere in the
+    # fan-out threw away every answer already collected -- including paid http
+    # lanes that had billed for tokens nobody would ever read. The symptom is a
+    # run that "randomly dies" with zero output and no transcript.
+    path = None
+    if not a.no_transcript:
+        private_transcript_dir()
+        stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+        # One lane per process (the --each contract), so the lane name makes the
+        # path unique across a fan-out. The second-resolution timestamp alone was
+        # NOT unique: `--each -j N` starts lanes within the same second, and every
+        # child computed its own stamp independently — so they collided on one path
+        # and overwrote each other's answers while exiting 0 (#70). pid covers two
+        # runs of the SAME lane in the same second (a retry, or a bare single-lane
+        # call), which is otherwise still possible.
+        suffix = f"-{lanes[0]['name']}" if len(lanes) == 1 else ""
+        path = TRANSCRIPT_DIR / f"{stamp}{suffix}-{os.getpid()}.json"
+
+    def save(results_so_far, synthesis=None, collisions=None, partial=True):
+        """Write the transcript. Called after every lane, and again at the end.
+
+        Atomic via write-then-replace: a kill during the write leaves the previous
+        good transcript rather than a truncated one.
+        """
+        if path is None:
+            return
+        # brief_on_record stays the ORIGINAL question in a revision round; in a
+        # first round it is just `prompt`. A revision transcript also records the
+        # round number, its parents, and the alias map, exactly as a completed
+        # round does -- so a partial revision transcript reads like a full one.
+        payload = {"brief": brief_on_record, "results": results_so_far,
+                   "synthesis": synthesis, "collisions": collisions}
+        if prompts:
+            payload.update({"round": round_no,
+                            "parent": [str(p) for p in prior_paths],
+                            "aliases": aliases})
+        if partial:
+            payload["partial"] = True
+            payload["note"] = ("run did not finish — these are the lanes that had "
+                               "answered when the transcript was last written")
+        # Staged to a unique temp, chmod 0600, then replaced: see save_transcript.
+        save_transcript(payload, path)
+
+    ordered = [None] * len(lanes)
     with cf.ThreadPoolExecutor(max_workers=max(len(lanes), 1)) as pool:
-        results = list(pool.map(
-            lambda l: ask(l, prompts[l["name"]] if prompts else prompt,
-                          keys, int(cfg.get("retries", 1)), deadline, sems, lock,
-                          spent, lane_prices(l, prices), pacers),
-            lanes,
-        ))
+        # In a revision round each lane gets its own packet (prompts[name]);
+        # otherwise every lane gets the same brief.
+        futures = {
+            pool.submit(ask, l, prompts[l["name"]] if prompts else prompt,
+                        keys, int(cfg.get("retries", 1)), deadline,
+                        sems, lock, spent, lane_prices(l, prices), pacers): i
+            for i, l in enumerate(lanes)
+        }
+        for fut in cf.as_completed(futures):
+            i = futures[fut]
+            try:
+                ordered[i] = fut.result()
+            except Exception as e:  # noqa: BLE001 — mirror ask()'s own contract
+                ordered[i] = {"lane": lanes[i]["name"], "model": lanes[i].get("model"),
+                              "vendor": lanes[i].get("vendor"), "harness": lanes[i]["harness"],
+                              "answer": None, "error": str(e), "finish_reason": None}
+            # Persist after every lane. Order is preserved by writing into the
+            # slot the lane was dispatched from, so a partial transcript reads
+            # the same way a complete one does, with `null` for lanes still out.
+            save(ordered)
+
+    results = ordered
 
     answered = [r for r in results if r["answer"]]
 
@@ -1627,14 +1801,10 @@ def main() -> int:
                                       deadline=deadline, pacers=pacers,
                                       retries=int(cfg.get("retries", 1)))
 
-    if not a.no_transcript:
-        record = {"brief": brief_on_record, "results": results, "synthesis": synth,
-                  "collisions": collisions}
-        if prompts:
-            record.update({"round": round_no,
-                           "parent": [str(p) for p in prior_paths],
-                           "aliases": aliases})
-        path = save_transcript(record)
+    # Final write: same file the fan-out has been updating, now complete and with
+    # the synthesis attached. Clears the `partial` marker. Revision metadata
+    # (round/parent/aliases) is folded in by save() when this is a revision round.
+    save(results, synthesis=synth, collisions=collisions, partial=False)
 
     if a.json:
         print(json.dumps({"results": results, "synthesis": synth} if a.diff else results, indent=2))
