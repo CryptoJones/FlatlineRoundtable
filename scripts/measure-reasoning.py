@@ -30,20 +30,22 @@ and the context windows here are 130k-260k. For a metered lane it inflates the
 worst-case pre-flight estimate, so size those to the measurement instead.
 """
 import argparse
+import importlib.machinery
+import importlib.util
 import json
-import os
-import subprocess
 import sys
 import time
 import urllib.request
+from pathlib import Path
 
-try:
-    import yaml
-except ImportError:
-    sys.exit("PyYAML is required — pip install pyyaml")
+# Load the roundtable next to this script, so config and secrets come from the
+# one place that knows where they live (#106) instead of a second copy here.
+_rt = Path(__file__).resolve().parent.parent / "roundtable"
+_loader = importlib.machinery.SourceFileLoader("roundtable", str(_rt))
+rt = importlib.util.module_from_spec(
+    importlib.util.spec_from_loader("roundtable", _loader))
+_loader.exec_module(rt)
 
-DEFAULT_CONFIG = os.path.expanduser(
-    "~/.config/flatline-roundtable/FlatlineRoundtable.yaml")
 DEFAULT_BRIEF = (
     "Explain, in detail, when a cache is the wrong answer. Cover invalidation, "
     "staleness, coherence, and operational cost. Be thorough."
@@ -79,7 +81,7 @@ def sample(lane, brief, max_tokens, key):
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("lanes", nargs="+", help="lane names from the config")
-    ap.add_argument("--config", default=DEFAULT_CONFIG)
+    ap.add_argument("--config", type=Path, default=rt.DEFAULT_CONFIG)
     ap.add_argument("--brief", help="file to send; omit for a short built-in one")
     ap.add_argument("--samples", type=int, default=4)
     ap.add_argument("--ceiling", type=int, default=32000,
@@ -87,25 +89,30 @@ def main() -> int:
                          "observed rather than truncated")
     a = ap.parse_args()
 
-    cfg = yaml.safe_load(open(a.config))
+    cfg = rt.load_config(a.config)
     defaults = cfg.get("defaults") or {}
     brief = open(a.brief).read() if a.brief else DEFAULT_BRIEF
     print(f"brief: {len(brief)} chars   ceiling: {a.ceiling}   "
           f"samples: {a.samples}\n")
 
+    by_name = {l["name"]: l for l in cfg["lanes"]}
+    todo = []
     for name in a.lanes:
-        raw = next((l for l in cfg["lanes"] if l["name"] == name), None)
-        if raw is None:
+        lane = by_name.get(name)
+        if lane is None:
             print(f"  {name}: no such lane"); continue
-        lane = {**defaults, **raw}
         if lane.get("harness") != "http":
             print(f"  {name}: not an http lane — usage is only reported there")
             continue
         if not lane.get("key_entry"):
             print(f"  {name}: no key_entry"); continue
-        key = subprocess.run(["pass", "show", lane["key_entry"]],
-                             capture_output=True, text=True,
-                             check=True).stdout.splitlines()[0]
+        todo.append(lane)
+    # Resolve every key once, up front, the way the roundtable itself does.
+    keys = rt.fetch_keys(todo)
+
+    for lane in todo:
+        name = lane["name"]
+        key = keys[lane["key_entry"]]
 
         rs, ans, empties, errs = [], [], 0, 0
         for _ in range(a.samples):

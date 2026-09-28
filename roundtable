@@ -347,8 +347,20 @@ def load_config(path: Path) -> dict:
         cfg = yaml.safe_load(path.read_text()) or {}
     except yaml.YAMLError as e:
         die(f"{path} is not valid YAML: {e}")
+    return validate_config(cfg, str(path))
+
+
+def validate_config(cfg: dict, where: str) -> dict:
+    """Validate a roster dict and apply `defaults` to each lane.
+
+    Kept apart from the YAML read so a roster from any source -- a file today,
+    the store next (#105) -- passes through exactly one set of rules. `where`
+    names the source in error messages.
+    """
+    if not isinstance(cfg, dict):
+        die(f"{where} is not a mapping")
     if not isinstance(cfg.get("lanes"), list) or not cfg["lanes"]:
-        die(f"{path} defines no lanes")
+        die(f"{where} defines no lanes")
 
     defaults = cfg.get("defaults") or {}
     seen: set[str] = set()
