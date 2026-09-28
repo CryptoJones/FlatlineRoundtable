@@ -50,6 +50,14 @@ and vice versa.
       one lane in flight at a time — the lightweight stand-in for a Buzz-style
       conversation, no resident runtimes or bus
       ([#93](https://github.com/CryptoJones/FlatlineRoundtable/issues/93)) — shipped in PR #94
+- [ ] `acp` lanes: per-lane `config_options` applied via `session/set_config_option`
+      (thought level, mode, model) — the agent's CLI flags never reach these; a
+      rejected or unhonoured value fails the lane loudly
+      ([#95](https://github.com/CryptoJones/FlatlineRoundtable/issues/95)) — on feature/acp-config-options
+- [ ] Tool rounds: `skill/toolpanel.py` gives `http` lanes read-only repo tools
+      (`read_file` / `grep` / `list_dir` / `git`) for grounded reviews; lane settings
+      table and operating rules in `skill/SKILL.md`
+      ([#96](https://github.com/CryptoJones/FlatlineRoundtable/issues/96)) — on feature/acp-config-options
 - [ ] Give a round an identity (`run_id`) so `--revise latest-run` is robust —
       replaces the fragile `latest:N` file-count heuristic with a real "round"
       ([#80](https://github.com/CryptoJones/FlatlineRoundtable/issues/80))

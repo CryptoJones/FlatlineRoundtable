@@ -1172,6 +1172,71 @@ class TestAcpLane(unittest.TestCase):
         self.assertEqual(out["answer"], "hello from acp")
         self.assertEqual(out["finish_reason"], "stop")
 
+    # config_options (#95): session tunables an agent only exposes through
+    # session/set_config_option. The fake agent below answers each one with the
+    # configOptions echo a real agent sends, reporting whatever RT_ECHO says
+    # (default: the value asked for), and logs every call it saw.
+    CONFIG_CASE = """                *session/set_config_option*)
+                    rid=$(printf '%s' "$line" | sed -E 's/.*"id": ?([0-9]+).*/\\1/')
+                    cid=$(printf '%s' "$line" | sed -E 's/.*"configId": ?"([^"]+)".*/\\1/')
+                    val=$(printf '%s' "$line" | sed -E 's/.*"value": ?"([^"]+)".*/\\1/')
+                    echo "$cid=$val" >> "$RT_CFG_LOG"
+                    if [ -n "$RT_REJECT" ]; then
+                      echo "{\\"jsonrpc\\":\\"2.0\\",\\"id\\":$rid,\\"error\\":{\\"code\\":-32602,\\"message\\":\\"unknown value\\"}}"
+                    else
+                      echo "{\\"jsonrpc\\":\\"2.0\\",\\"id\\":$rid,\\"result\\":{\\"configOptions\\":[{\\"id\\":\\"$cid\\",\\"currentValue\\":\\"${RT_ECHO:-$val}\\"}]}}"
+                    fi ;;
+                *session/prompt*)"""
+
+    def _config_agent(self, **env):
+        exe = self._agent()
+        # write_exe dedents AGENT, so patch the written (4-space) form.
+        patched = exe.read_text().replace("    *session/prompt*)",
+                                          textwrap.dedent(self.CONFIG_CASE), 1)
+        assert patched != exe.read_text(), "set_config_option case not spliced in"
+        exe.write_text(patched)
+        self.cfg_log = exe.parent / "cfg.log"
+        os.environ["RT_CFG_LOG"] = str(self.cfg_log)
+        self.addCleanup(os.environ.pop, "RT_CFG_LOG", None)
+        for k, v in env.items():
+            os.environ[k] = v
+            self.addCleanup(os.environ.pop, k, None)
+        return exe
+
+    def test_config_options_are_set_before_the_prompt_and_the_lane_answers(self):
+        exe = self._config_agent()
+        out = rt.acp_lane({"command": str(exe), "args": [], "timeout": 20,
+                           "config_options": {"thought_level": "none", "mode": "plan"}},
+                          "hi")
+        self.assertEqual(out["answer"], "hello from acp", out.get("error"))
+        # One call per key, sorted, all before session/prompt (the prompt's
+        # answer arriving proves ordering: the agent is a single read loop).
+        self.assertEqual(self.cfg_log.read_text().split(),
+                         ["mode=plan", "thought_level=none"])
+
+    def test_no_config_options_means_no_set_config_option_calls(self):
+        exe = self._config_agent()
+        out = rt.acp_lane({"command": str(exe), "args": [], "timeout": 20}, "hi")
+        self.assertEqual(out["answer"], "hello from acp")
+        self.assertFalse(self.cfg_log.exists())
+
+    def test_a_rejected_config_option_fails_the_lane_loudly(self):
+        """A lane that quietly ran at the wrong thought level is a mislabelled
+        answer, which is worse than no answer -- so it must not answer."""
+        exe = self._config_agent(RT_REJECT="1")
+        with self.assertRaises(RuntimeError) as e:
+            rt.acp_lane({"command": str(exe), "args": [], "timeout": 20,
+                         "config_options": {"thought_level": "none"}}, "hi")
+        self.assertIn("thought_level='none' rejected", str(e.exception))
+        self.assertIn("unknown value", str(e.exception))
+
+    def test_an_unhonoured_config_option_fails_the_lane_loudly(self):
+        exe = self._config_agent(RT_ECHO="max")
+        with self.assertRaises(RuntimeError) as e:
+            rt.acp_lane({"command": str(exe), "args": [], "timeout": 20,
+                         "config_options": {"thought_level": "none"}}, "hi")
+        self.assertIn("asked 'none', agent reports 'max'", str(e.exception))
+
     def test_the_agent_does_not_get_the_callers_cwd(self):
         """A lane must not see context the others cannot -- that is the
         independence claim breaking quietly."""
