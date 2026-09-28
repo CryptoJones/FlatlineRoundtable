@@ -99,7 +99,10 @@ Prices come from the gateway's own table (cached for a day), so they do not go
 stale the way a hand-maintained number does; `price_per_mtok` overrides it for
 vendors with no price endpoint. `--max-spend` and `budget_usd` are checked
 **before dispatch** against a worst-case estimate, so an overrun is prevented
-rather than reported.
+rather than reported. Under a budget, an `http` lane whose price cannot be
+resolved is refused outright rather than estimated at $0 — a guard that
+cannot see a lane cannot bind on it. `cli`/`acp` lanes, `:free` models and an
+explicit `price_per_mtok: 0` are free, not unknown.
 
 ## Usage
 
