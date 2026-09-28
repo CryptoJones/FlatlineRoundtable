@@ -2060,6 +2060,19 @@ class TestDiscussion(unittest.TestCase):
         self.assertIn("PANELIST A (turn 1):\nfirst", rendered)
         self.assertNotIn("boom", rendered)          # a failed turn is not read aloud
 
+    def test_both_prompts_call_an_unsourced_mid_thread_fact_a_claim(self):
+        """#98: in the first live run a lane invented a "default 24 h" expiry and
+        the next three turns cited it as evidence. A blind round cannot
+        propagate a fabrication; a shared thread can, so both packets say so."""
+        prior = {"brief": "q", "results": [{"lane": "A", "answer": "yes"}]}
+        aliases = {"A": "A", "B": "B"}
+        turn = rt.build_discussion_prompt("B", "q", prior, aliases, [], 1, 2, 1, 1, 2)
+        closing = rt.build_closing_prompt("B", "q", prior, aliases, [])
+        for packet in (turn, closing):
+            self.assertIn("A fact first introduced in this discussion", packet)
+            self.assertIn("is a claim, not evidence, until its source is cited", packet)
+            self.assertIn("say that you have not verified it", packet)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

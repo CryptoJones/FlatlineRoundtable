@@ -1498,6 +1498,13 @@ def build_revision_prompt(lane_name: str, prior: dict, aliases: dict[str, str],
 # it. DISCUSS_WORDS caps what one turn adds and --discuss-rounds caps the
 # passes; the budget gate prices the longest packet times the requests per lane.
 #
+# A shared thread has a failure mode a blind round cannot have: one lane's
+# invention becomes everyone's premise. In the first live run (#98) a lane
+# asserted a "default 24 h" expiry that does not exist and the next three
+# turns cited it as evidence. Both prompts therefore say that a fact first
+# introduced in the thread is a claim until its source is cited. That lowers
+# the rate; the reader's verification pass is still the control.
+#
 # Every turn is appended to the transcript as soon as it returns, so a run that
 # dies at turn 17 leaves 16 turns on disk. The closings are saved as `results`,
 # which makes a discussion transcript a valid parent for --revise, --diff
@@ -1518,6 +1525,11 @@ whose answer would settle a dispute. Do not restate your opening and do not
 summarise the discussion. Do not defer to the majority or to any model you
 think you recognise. If nothing has been said yet, open the discussion with
 the point you most want tested. Stay under {words} words.
+
+A fact first introduced in this discussion -- not in the brief, not in an
+opening -- is a claim, not evidence, until its source is cited: a file and
+line, a command that was run, a document. Do not build on one; ask for its
+source. If you rely on one anyway, say that you have not verified it.
 {extra}
 --- THE BRIEF ---
 {brief}
@@ -1537,6 +1549,11 @@ REPLACES your opening, so it must stand alone. If you REVISE, name the
 argument that moved you and the panelist letter it came from. If you HOLD,
 answer the strongest point made against you instead of restating yourself.
 Move only for a reason you can state.
+
+A fact first introduced in this discussion -- not in the brief, not in an
+opening -- is a claim, not evidence, until its source is cited: a file and
+line, a command that was run, a document. Do not let one carry your closing;
+if it does, say that you have not verified it.
 {extra}
 --- THE BRIEF ---
 {brief}
