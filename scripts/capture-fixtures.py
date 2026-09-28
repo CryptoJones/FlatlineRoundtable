@@ -13,10 +13,16 @@ diff IS the drift you were trying to detect, so look at it before committing it.
 
 Request ids and fingerprints are redacted; nothing account-specific is written.
 """
-import json, os, pathlib, subprocess, urllib.request, yaml
+import importlib.machinery, importlib.util, json, pathlib, urllib.request
 
-CFG = os.path.expanduser("~/.config/flatline-roundtable/FlatlineRoundtable.yaml")
-cfg = yaml.safe_load(open(CFG)); defaults = cfg.get("defaults") or {}
+# Load the roundtable next to this script, so config and secrets come from the
+# one place that knows where they live (#106) instead of a second copy here.
+_rt = pathlib.Path(__file__).resolve().parent.parent / "roundtable"
+_loader = importlib.machinery.SourceFileLoader("roundtable", str(_rt))
+rt = importlib.util.module_from_spec(importlib.util.spec_from_loader("roundtable", _loader))
+_loader.exec_module(rt)
+
+cfg = rt.load_config(rt.DEFAULT_CONFIG)
 OUT = pathlib.Path("tests/fixtures/responses"); OUT.mkdir(parents=True, exist_ok=True)
 
 WANT = ["SHODAN", "Neuromancer", "MasterControl", "Cerebex", "SELMA", "GLaDOS"]
@@ -30,13 +36,16 @@ def redact(d):
         d["created"] = 0
     return d
 
+lanes = [l for l in cfg["lanes"] if l["name"] in WANT and l.get("active")]
 for name in WANT:
-    raw = next((l for l in cfg["lanes"] if l["name"] == name), None)
-    if not raw or not raw.get("active"):
-        print(f"  skip {name}: not active"); continue
-    lane = {**defaults, **raw}
-    key = subprocess.run(["pass", "show", lane["key_entry"]], capture_output=True,
-                         text=True, check=True).stdout.splitlines()[0]
+    if not any(l["name"] == name for l in lanes):
+        print(f"  skip {name}: not active")
+# Resolve every key once, up front, the way the roundtable itself does.
+keys = rt.fetch_keys(lanes)
+
+for lane in lanes:
+    name = lane["name"]
+    key = keys[lane["key_entry"]]
     body = {"model": lane["model"], "max_tokens": 60,
             "messages": [{"role": "user", "content": PROMPT}]}
     body.update(lane.get("extra_body") or {})

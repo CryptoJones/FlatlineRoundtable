@@ -11,6 +11,21 @@ Bugs first — the cost-guard and answer-loss class this tool exists to prevent,
 then security, then features/optimisation, then tests. Each has a GitHub issue
 and vice versa.
 
+### Epic: encrypted SQLite is the authoritative store for lanes, secrets and (next) metrics — YAML retired ([#105](https://github.com/CryptoJones/FlatlineRoundtable/issues/105))
+
+- [x] Split config validation from YAML parsing; route scripts through
+      `rt.fetch_keys` ([#106](https://github.com/CryptoJones/FlatlineRoundtable/issues/106)) — on refactor/sqlite-store-split-validation
+- [ ] Encrypted store: `db init|migrate|doctor` and
+      `secrets set|check|list|rotate|rm|rekey` ([#107](https://github.com/CryptoJones/FlatlineRoundtable/issues/107))
+- [ ] Lane config in the store: `lanes`, `defaults`, `globals`, `lane_versions`,
+      `db export|import`, `import-yaml` ([#108](https://github.com/CryptoJones/FlatlineRoundtable/issues/108))
+- [ ] Run from the store: `load_config` reads the DB, `fetch_keys` reads secrets,
+      YAML retired ([#109](https://github.com/CryptoJones/FlatlineRoundtable/issues/109))
+- [ ] `db backup|restore` and the telesto restic job ([#110](https://github.com/CryptoJones/FlatlineRoundtable/issues/110))
+- [ ] Fleet rollout notes and the Python 3.11 floor ([#111](https://github.com/CryptoJones/FlatlineRoundtable/issues/111))
+
+### Other open items
+
 - [x] Transcripts clobber each other under `--each -j N`, losing paid answers —
       one-second filename stamp + shared `.json.tmp` collide; #58's failure mode
       via the filename instead of write order

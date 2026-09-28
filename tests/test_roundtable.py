@@ -191,6 +191,34 @@ class TestConfigValidation(unittest.TestCase):
     def _loads(self, lanes):
         return rt.load_config(self._cfg(lanes))
 
+    def test_validate_config_takes_a_dict_directly(self):
+        """#106: validation is separate from the YAML read, so a roster from
+        any source gets the same rules and the same error text."""
+        cfg = rt.validate_config(
+            {"defaults": {"max_tokens": 7},
+             "lanes": [{"name": "A", "harness": "http", "model": "m",
+                        "base_url": "http://x"}]}, "test")
+        self.assertEqual(cfg["lanes"][0]["max_tokens"], 7)
+
+    def test_validate_config_errors_match_load_config(self):
+        for lanes, needle in (
+            ([{"name": "A", "harness": "carrier-pigeon"}], "harness must be"),
+            ([{"name": "A", "harness": "http", "model": "m"}], "needs base_url"),
+            ([{"name": "A", "harness": "cli", "command": "x", "args": ["-p"]}],
+             "would send no prompt"),
+        ):
+            with self.assertRaises(SystemExit) as direct:
+                rt.validate_config({"lanes": lanes}, "test")
+            with self.assertRaises(SystemExit) as via_file:
+                rt.load_config(self._cfg(lanes))
+            self.assertIn(needle, str(direct.exception))
+            self.assertEqual(str(direct.exception), str(via_file.exception))
+
+    def test_validate_config_names_the_source(self):
+        with self.assertRaises(SystemExit) as e:
+            rt.validate_config({"lanes": []}, "the store")
+        self.assertIn("the store defines no lanes", str(e.exception))
+
     def test_rejects_unknown_harness(self):
         self._dies([{"name": "A", "harness": "carrier-pigeon"}], "harness must be")
 
