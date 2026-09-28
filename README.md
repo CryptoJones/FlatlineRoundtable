@@ -82,7 +82,7 @@ Optionally `./install.sh` to expose it as a Claude Code skill.
   because `.gitignore` is not a security boundary — `git add -f`, stashes, and
   editor backups all defeat it.
 
-**Coming: the encrypted store ([#105](https://github.com/CryptoJones/FlatlineRoundtable/issues/105)).**
+**The encrypted store ([#105](https://github.com/CryptoJones/FlatlineRoundtable/issues/105)): admin commands available now, runs switch over in #109.**
 `roundtable db init` creates `~/.local/share/flatline-roundtable/roundtable.db`
 (`0600`, `XDG_DATA_HOME` honoured) and a 32-byte DB key in the `pass` entry
 `flatline-roundtable/db-key`. `roundtable secrets set NAME --stdin` stores a

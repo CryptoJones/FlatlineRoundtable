@@ -699,13 +699,23 @@ def schema_version(conn: sqlite3.Connection) -> int:
 
 
 def migrate(conn: sqlite3.Connection) -> tuple[int, int]:
-    """Apply pending migrations, each in its own transaction. Idempotent."""
-    before = schema_version(conn)
-    if before > SCHEMA_VERSION:
-        die(f"store is at schema {before}, newer than this roundtable ({SCHEMA_VERSION}) — "
-            f"update roundtable before touching it")
-    for n in range(before, SCHEMA_VERSION):
+    """Apply pending migrations, each in its own transaction. Idempotent, also
+    against a concurrent migrator: the version is read under the write lock,
+    so a caller that waited on another one's migration skips it rather than
+    re-running CREATE TABLE."""
+    before = None
+    while True:
         conn.execute("BEGIN IMMEDIATE")
+        n = schema_version(conn)
+        if before is None:
+            before = n       # as seen under the lock, so the report is honest too
+        if n > SCHEMA_VERSION:
+            conn.execute("ROLLBACK")
+            die(f"store is at schema {n}, newer than this roundtable ({SCHEMA_VERSION}) — "
+                f"update roundtable before touching it")
+        if n == SCHEMA_VERSION:
+            conn.execute("COMMIT")
+            break
         try:
             # Not executescript(): it COMMITs first, which would split a
             # migration across transactions.

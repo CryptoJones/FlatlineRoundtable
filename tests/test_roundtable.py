@@ -1469,6 +1469,38 @@ class TestStore(unittest.TestCase):
         self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], v1)
         self.assertEqual(v1, rt.SCHEMA_VERSION)
 
+    def test_concurrent_migrates_do_not_collide(self):
+        """`--each -j N` children and a hand-run `db migrate` can race. A
+        migrator must read the version under the write lock: one that read it
+        before waiting re-runs CREATE TABLE on an already-current store and dies
+        with a traceback.
+
+        Made deterministic by holding the lock on one connection while the
+        other starts, rather than hoping two processes interleave."""
+        self.db.parent.mkdir(parents=True, mode=0o700)
+        os.close(os.open(self.db, os.O_WRONLY | os.O_CREAT, 0o600))
+        holder = rt.open_db(self.db)
+        holder.execute("BEGIN IMMEDIATE")
+        errors = []
+
+        def racer():
+            try:
+                rt.migrate(rt.open_db(self.db))
+            except BaseException as e:   # noqa: BLE001 -- surfaced below
+                errors.append(e)
+
+        t = threading.Thread(target=racer)
+        t.start()
+        time.sleep(0.5)                  # racer is now parked on the lock
+        for stmt in (x.strip() for x in rt.MIGRATIONS[0].split(";")):
+            if stmt:
+                holder.execute(stmt)
+        holder.execute(f"PRAGMA user_version = {rt.SCHEMA_VERSION}")
+        holder.execute("COMMIT")
+        t.join(60)
+        self.assertEqual(errors, [])
+        self.assertEqual(rt.schema_version(holder), rt.SCHEMA_VERSION)
+
     def test_store_and_key_file_are_private(self):
         self.init()
         self.assertEqual(self.db.stat().st_mode & 0o777, 0o600)
