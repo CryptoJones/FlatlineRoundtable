@@ -57,6 +57,14 @@ to eliminate. Do not soften this to a warning.
 **Timeouts are not retried.** The request may have completed and billed already;
 a blind retry double-charges a metered lane for an answer you paid for.
 
+**`--discuss` is sequential, in one process.** Each turn's packet is built
+from the turns before it, so there is nothing to fan out, and one-lane-in-flight
+is the memory property the mode exists for (it replaces a fleet with a resident
+runtime per lane). Do not "speed it up" with a pool, do not forward it to
+`--each` children, and do not make it a long-lived process with a bus — that is
+the thing it was built to avoid. The thread is written to the transcript after
+every turn precisely so a sequential run that dies keeps what was said.
+
 ## Secrets
 
 No key value goes in a config file, this repo, `argv`, a transcript, or `--json`

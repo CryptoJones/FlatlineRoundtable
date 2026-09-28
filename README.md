@@ -241,6 +241,25 @@ synthesis, or for another `--discuss`.
 nothing to fan out — each turn is built from the ones before it), and refuses
 fewer than two lanes.
 
+**What a turn can see.** `--discuss` drives the lanes itself, through the same
+`http` / `cli` / `acp` harnesses as round 1. An `http` or `acp` turn sees the
+shared packet and nothing else — no tools, no repo — so anything the panel
+needs to check must already be in the openings or in the focus text (quote
+contiguous excerpts, mark elisions). A `cli` turn has whatever its vendor CLI
+normally has. If round 1 was a tool round driven by `skill/toolpanel.py`, its
+per-lane answer files are not transcripts; fold them into one with
+`skill/toolpanel-seed.py` and seed from that:
+
+```console
+skill/toolpanel-seed.py brief.md seed.json answers/*.md
+roundtable --lanes HAL9000,SHODAN,Cortana --discuss seed.json "the split to settle"
+```
+
+**What the transcript holds.** `brief` (the round-1 brief), `results` (the
+closings), `discussion` (every turn: `turn`, `pass`, `alias`, `lane`, `answer`,
+`seconds`, `cost`), `aliases` (letter → lane, so the anonymity is auditable),
+`parent` (the seed transcripts, `[]` for `new`), `round`, `mode: discuss`.
+
 ## Tests
 
 ```console

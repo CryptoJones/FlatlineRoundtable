@@ -1953,6 +1953,36 @@ class TestDiscussion(unittest.TestCase):
         r = self._run("http://127.0.0.1:9/v1", "--lanes", "A", "--discuss", str(p))
         self.assertIn("at least two lanes", r.stderr)
 
+    def test_toolpanel_seed_bridges_answer_files_to_a_discussion(self):
+        """skill/toolpanel-seed.py folds toolpanel.py's per-lane text files into
+        one transcript --discuss can seed from; a non-ok lane gets no opening."""
+        answers = self.d / "answers"
+        answers.mkdir()
+        (answers / "A.md").write_text(
+            "# A (speaker_a, http) status=ok tool_calls=3 finish=stop secs=9\n\n"
+            "grounded opening from A\n")
+        (answers / "B.md").write_text(
+            "# B (speaker_b, http) status=FAILED tool_calls=None finish=None secs=1\n\n"
+            "LANE FAILED: HTTP 500\n")
+        (self.d / "brief.md").write_text("the tool-round question")
+        seed = self.d / "seed.json"
+        r = subprocess.run([sys.executable, str(ROOT / "skill" / "toolpanel-seed.py"),
+                            str(self.d / "brief.md"), str(seed),
+                            str(answers / "A.md"), str(answers / "B.md")],
+                           capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        data = json.loads(seed.read_text())
+        self.assertEqual(data["brief"], "the tool-round question")
+        self.assertEqual([x["answer"] for x in data["results"]],
+                         ["grounded opening from A", None])
+        with StubServer() as s:
+            r = self._run(s.url, "--discuss", str(seed), "--discuss-rounds", "1")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            first = s.srv.requests[0]["messages"][-1]["content"]
+            self.assertIn("the tool-round question", first)
+            self.assertIn("PANELIST A:\ngrounded opening from A", first)
+            self.assertNotIn("LANE FAILED", first)      # a failed lane has no opening
+
     def test_helpers(self):
         prior = {"brief": "q", "results": [
             {"lane": "A", "answer": "yes"}, {"lane": "C", "answer": "no"}]}
