@@ -79,6 +79,12 @@ and vice versa.
       finding. Motivated by the 2026-09-27 rounds: six lanes agreed on the same
       wrong "bug" while each real defect came from one lane
       ([#89](https://github.com/CryptoJones/FlatlineRoundtable/issues/89))
+- [ ] (feat-req) `--metrics` to show lane accuracy metrics — per-lane rounds
+      answered, findings made, verified CORRECT / PARTLY / WRONG counts and rates,
+      lone-claim hit rate, fabrication count, tool-round grounding stats; scoped by
+      `latest:N` / transcript / `--lanes`, `--json` for raw numbers, zero network.
+      The read side of the outcome record #89 weights on; never decides a finding
+      ([#103](https://github.com/CryptoJones/FlatlineRoundtable/issues/103))
 - [x] `synthesize()` collects readers serially instead of via `as_completed` — free
       wall-clock win, and removes a serialization trap in the reader loop
       ([#83](https://github.com/CryptoJones/FlatlineRoundtable/issues/83)) — fixed on fix/open-issues-batch
