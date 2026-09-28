@@ -46,10 +46,10 @@ and vice versa.
 - [ ] Report per-lane `cost` and run-level spend in `--json` (and under `--diff`) —
       the number cron/CI callers need is computed but not surfaced machine-readably
       ([#79](https://github.com/CryptoJones/FlatlineRoundtable/issues/79))
-- [ ] Discussion mode: `--discuss` lets lanes share one context and take turns,
+- [x] Discussion mode: `--discuss` lets lanes share one context and take turns,
       one lane in flight at a time — the lightweight stand-in for a Buzz-style
       conversation, no resident runtimes or bus
-      ([#93](https://github.com/CryptoJones/FlatlineRoundtable/issues/93)) — on feature/discuss-mode
+      ([#93](https://github.com/CryptoJones/FlatlineRoundtable/issues/93)) — shipped in PR #94
 - [ ] Give a round an identity (`run_id`) so `--revise latest-run` is robust —
       replaces the fragile `latest:N` file-count heuristic with a real "round"
       ([#80](https://github.com/CryptoJones/FlatlineRoundtable/issues/80))
