@@ -2007,6 +2007,18 @@ class TestDiscussion(unittest.TestCase):
             self.assertEqual(r.returncode, 0, r.stderr)
             self.assertIn("ROUND 3", r.stdout)
 
+    def test_converse_is_the_same_flag(self):
+        """--converse is --discuss under its other name: same dest, same run."""
+        with StubServer() as s:
+            r = self._run(s.url, "--converse", str(self._prior()), "--discuss-rounds", "1")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual([q["model"] for q in s.srv.requests],
+                             ["speaker_a", "speaker_b", "speaker_a", "speaker_b"])
+            self.assertIn("closings after a shared discussion", r.stdout)
+        r = self._run("http://127.0.0.1:9/v1", "--converse", str(self._prior()), "--each")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("--discuss already runs the lanes one at a time", r.stderr)
+
     def test_refuses_each_panel_and_revise(self):
         p = self._prior()
         for extra in (["--each"], ["--panel"], ["--revise", str(p)]):
