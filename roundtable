@@ -278,6 +278,23 @@ def lane_prices(lane: dict, table: dict) -> tuple[float, float]:
     return table.get(lane.get("model"), (0.0, 0.0))
 
 
+def lane_price_known(lane: dict, table: dict) -> bool:
+    """Whether lane_prices' (0, 0) would mean "free" rather than "no idea" (#72).
+
+    lane_prices collapses both to zero, which is fine for reporting but is
+    fail-open for the budget gate: an http lane whose model id is missing from
+    the table -- every direct Mistral/DeepSeek/local endpoint, or a typo --
+    estimated to $0.00 and so could never trip --max-spend. Free has three
+    legitimate shapes; anything else on a metered harness is unknown.
+    """
+    if lane.get("price_per_mtok") is not None:      # explicit, including 0
+        return True
+    if lane["harness"] in ("cli", "acp"):           # subscription
+        return True
+    model = str(lane.get("model") or "")
+    return model.endswith(":free") or model in table
+
+
 def estimate_run(lanes: list[dict], prompt: str, table: dict, defaults: dict,
                  calib: dict | None = None, retries: int = 0) -> float:
     """Worst-case cost BEFORE dispatch (issue #4).
@@ -1212,14 +1229,24 @@ def synthesize(results, brief, cfg, lanes, keys, prices, count=2,
                    spent if spent is not None else [0.0],
                    lane_prices(lane, prices), pacers)
 
-    readings, errors = [], []
+    # Collect via as_completed rather than calling .result() in dispatch order
+    # (#83): the old loop blocked on reader 1 before it would look at reader 2,
+    # so anything done per lane inside the loop serialised behind the slowest
+    # early reader. Gather into a dict first, then assemble in `chosen` order so
+    # the output is identical regardless of which reader finished first.
+    replies = {}
     with cf.ThreadPoolExecutor(max_workers=len(chosen)) as pool:
-        for lane, fut in [(l, pool.submit(read, l)) for l in chosen]:
-            r = fut.result()          # ask() never raises; it reports via "error"
-            if r.get("answer"):
-                readings.append({"by": lane["name"], "text": r["answer"]})
-            else:
-                errors.append(f"{lane['name']}: {r.get('error') or 'empty answer'}")
+        futs = {pool.submit(read, l): i for i, l in enumerate(chosen)}
+        for fut in cf.as_completed(futs):
+            replies[futs[fut]] = fut.result()   # ask() never raises; it reports via "error"
+
+    readings, errors = [], []
+    for i, lane in enumerate(chosen):
+        r = replies[i]
+        if r.get("answer"):
+            readings.append({"by": lane["name"], "text": r["answer"]})
+        else:
+            errors.append(f"{lane['name']}: {r.get('error') or 'empty answer'}")
 
     if not readings:
         return None, f"synthesis failed ({'; '.join(errors)})"
@@ -1289,7 +1316,14 @@ def load_transcripts(arg: str) -> tuple[list[Path], dict]:
         if not spec:
             continue
         if spec == "latest" or spec.startswith("latest:"):
-            n = 1 if spec == "latest" else int(spec.split(":", 1)[1])
+            # Parse N defensively (#76): a bare int() here was the one place
+            # the tool leaked a raw traceback where every other bad input
+            # die()s with a message naming the fix. Zero and negatives are
+            # refused too — cands[-0:] would silently mean "all of them".
+            n_str = spec.split(":", 1)[1] if ":" in spec else "1"
+            if not n_str.isdecimal() or int(n_str) < 1:
+                die("--revise latest:N needs a positive integer (e.g. latest:12)")
+            n = int(n_str)
             cands = sorted(TRANSCRIPT_DIR.glob("*.json"))
             if len(cands) < n:
                 die(f"--revise {spec}: only {len(cands)} transcript(s) in {TRANSCRIPT_DIR}")
@@ -1337,6 +1371,49 @@ def load_transcripts(arg: str) -> tuple[list[Path], dict]:
     if not any(r.get("answer") for r in merged["results"]):
         die("--revise: no answers in the named transcript(s) to revise against")
     return paths, merged
+
+
+def private_transcript_dir() -> Path:
+    """Make TRANSCRIPT_DIR exist and be private to the user (0700).
+
+    A transcript holds the full brief and every lane's answer, and briefs are
+    routinely confidential. The default umask leaves the directory
+    world-listable, which hands the filenames -- and, with 0644 files, the
+    contents -- to any local user, including a `cli` lane's vendor agent, which
+    runs with full tool access (#73). The chmod on an existing dir is for
+    transcript dirs created before this fix.
+    """
+    TRANSCRIPT_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    TRANSCRIPT_DIR.chmod(0o700)
+    return TRANSCRIPT_DIR
+
+
+def save_transcript(record: dict, path: Path) -> Path:
+    """Write one transcript at `path`, private to the user (dir 0700, file 0600).
+
+    Atomic via write-then-replace: a kill during the write leaves the previous
+    good transcript rather than a truncated one (#58). The staging file is a
+    UNIQUE mkstemp in the same directory (same filesystem, so the replace is
+    still atomic): a name derived from `path` made two writers colliding on one
+    transcript also collide on one .json.tmp and race before either rename (#70).
+    The 0600 goes on the staging file BEFORE the replace, so there is no window
+    in which the transcript is readable by anyone else (#73).
+    """
+    private_transcript_dir()
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix=".json.tmp")
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            fh.write(json.dumps(record, indent=2))
+        os.replace(tmp, path)
+    except BaseException:
+        # Never leave a half-written temp behind if the write or rename fails.
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    return path
 
 
 def alias_map(results: list[dict]) -> dict[str, str]:
@@ -1450,90 +1527,18 @@ def main() -> int:
             "  --panel               the old shared-deadline behaviour, if you mean it"
             .format(n=len(lanes)))
 
-    if a.each and not a.list:
-        # Re-invoke ourselves once per lane. Separate processes, separate
-        # deadlines, separate transcripts: a lane can be slow, or die, alone.
-        #
-        # Serial by DEFAULT, still: the measurement in the block above is why,
-        # and a config that predates this flag must not silently start fanning
-        # out. `--concurrency N` is the opt-in, and it is the only way to get
-        # parallel lanes without the shared deadline --panel imposes.
-        #
-        # Before this flag existed there was no such way: this loop was a
-        # blocking subprocess.run, so --each was always serial, and anyone who
-        # wanted lanes in parallel had to reach for --panel and give up the
-        # per-lane deadlines that are the entire point of --each. The `concurrency:`
-        # key in the config is deliberately NOT read here -- it is documented as
-        # the panel-mode default, the shipped example sets it to 8, and quietly
-        # honouring it would flip every existing caller from serial to eight-way.
-        #
-        # The per-vendor cap IS applied, by the same smallest-in-group rule
-        # build_semaphores uses, so a `concurrency: 1` local lane still cannot be
-        # run beside its neighbour on the same GPU while the API lanes fan out.
-        #
-        # Output stays in roster order: a lane's block is printed whole, once
-        # every lane before it has been printed, so a concurrent run reads
-        # exactly like a serial one instead of interleaving. At -j1 the child
-        # keeps the terminal directly, so the familiar live streaming is intact.
-        brief_text = sys.stdin.read() if a.brief[:1] == ["-"] else " ".join(a.brief)
-        if not brief_text.strip() and not a.revise:
-            die("empty brief")
-
-        default_cc = max(int(a.concurrency or 1), 1)
-        caps: dict[str, int] = {}
-        for l in lanes:
-            gid = l.get("vendor") or l["name"]
-            cc = int(l.get("concurrency", default_cc))
-            caps[gid] = min(caps.get(gid, cc), cc)
-        vendor_sems = {gid: threading.Semaphore(cc) for gid, cc in caps.items()}
-        overall = threading.Semaphore(max(default_cc, 1))
-
-        def run_one(l: dict) -> tuple[int, str]:
-            argv = [sys.executable, str(Path(__file__).resolve()),
-                    "--lanes", l["name"], "--config", str(a.config)]
-            if a.json:
-                argv.append("--json")
-            if a.no_transcript:
-                argv.append("--no-transcript")
-            if a.revise:
-                argv += ["--revise", a.revise]
-            argv.append("-")
-            gid = l.get("vendor") or l["name"]
-            with overall, vendor_sems[gid]:
-                r = subprocess.run(argv, input=brief_text, text=True,
-                                   capture_output=True)
-            return r.returncode, (r.stdout or "") + (r.stderr or "")
-
-        rc = 0
-        if default_cc == 1:
-            # Unchanged path: the child inherits this terminal and streams.
-            for l in lanes:
-                print(f"\n=== {l['name']} " + "=" * (66 - len(l['name'])), flush=True)
-                argv = [sys.executable, str(Path(__file__).resolve()),
-                        "--lanes", l["name"], "--config", str(a.config)]
-                if a.json:
-                    argv.append("--json")
-                if a.no_transcript:
-                    argv.append("--no-transcript")
-                if a.revise:
-                    argv += ["--revise", a.revise]
-                argv.append("-")
-                r = subprocess.run(argv, input=brief_text, text=True)
-                rc = rc or r.returncode
-            return rc
-
-        with cf.ThreadPoolExecutor(max_workers=max(len(lanes), 1)) as pool:
-            futures = [pool.submit(run_one, l) for l in lanes]
-            for l, fut in zip(lanes, futures):
-                print(f"\n=== {l['name']} " + "=" * (66 - len(l['name'])), flush=True)
-                try:
-                    code, out = fut.result()
-                except Exception as exc:                      # noqa: BLE001
-                    code, out = 1, f"  !! lane crashed: {exc}\n"
-                sys.stdout.write(out)
-                sys.stdout.flush()
-                rc = rc or code
-        return rc
+    # #74: --diff used to evaporate under --each. The children's argv forwarded
+    # --json/--no-transcript/--revise but not --diff, so the flag was accepted,
+    # ignored, and the run exited 0 with no synthesis. Forwarding it would not
+    # fix that: synthesis compares every lane's answer, and under --each each
+    # answer lives in its own process -- a child with one lane has nothing to
+    # compare. Refuse here, before any child is spawned and before any spend.
+    if a.each and a.diff and not a.list:
+        die("--each --diff: synthesis needs every answer in one process, and\n"
+            "  --each gives each lane its own. Either:\n"
+            "\n"
+            "  --panel --diff        one shared deadline, then synthesis\n"
+            "  --each, then synthesize the transcripts afterwards")
 
     if a.list:
         for l in lanes:
@@ -1567,11 +1572,32 @@ def main() -> int:
 
     budget = a.max_spend if a.max_spend is not None else cfg.get("budget_usd")
     deadline = time.time() + cfg["deadline_seconds"] if cfg.get("deadline_seconds") else None
-    keys = fetch_keys(lanes)
     prices = load_pricing(lanes)
+
+    # A budget can only bind on lanes it can price. An unpriced http lane used
+    # to estimate to $0 and slip past the gate unseen (#72) -- fail-open on the
+    # one check whose job is to fail closed. No default rate either: a guessed
+    # number reads as authoritative and is wrong for almost every vendor.
+    if budget is not None:
+        unpriced = [l for l in lanes if not lane_price_known(l, prices)]
+        if unpriced:
+            die(
+                "a budget is set but these lanes have no known price, so it cannot bind:\n"
+                + "".join(f"  {l['name']}  (model {l.get('model') or '-'})\n" for l in unpriced)
+                + "  set price_per_mtok on the lane or add vendor: openrouter so the "
+                "price table covers it"
+            )
 
     # Refuse BEFORE spending, not after. A budget checked only on the way out
     # reports an overrun; it does not prevent one.
+    #
+    # This gate must also sit BEFORE the --each fan-out below (issue #71). It
+    # used to sit after that branch returned, so the parent never ran it: each
+    # child gated only its own lane, and a roster where no single lane is
+    # expensive but the panel total is walked through N cheap gates and spent
+    # N× what any one estimate implied. The whole-panel estimate is the one the
+    # README promises, so it runs here over the full selected set; the child's
+    # own gate stays as a backstop, not the only check.
     calib = load_calibration()
     defaults = cfg.get("defaults") or {}
     estimate = estimate_run(lanes, est_prompt, prices, defaults, calib,
@@ -1588,6 +1614,90 @@ def main() -> int:
             f"  raise --max-spend, drop lanes with --lanes, or lower max_tokens"
         )
 
+    if a.each:
+        # Re-invoke ourselves once per lane. Separate processes, separate
+        # deadlines, separate transcripts: a lane can be slow, or die, alone.
+        # The panel-wide budget gate above has already passed; a child re-runs
+        # it for its single lane only as a backstop (issue #71).
+        #
+        # Serial by DEFAULT, still: the measurement in the block above is why,
+        # and a config that predates this flag must not silently start fanning
+        # out. `--concurrency N` is the opt-in, and it is the only way to get
+        # parallel lanes without the shared deadline --panel imposes.
+        #
+        # Before this flag existed there was no such way: this loop was a
+        # blocking subprocess.run, so --each was always serial, and anyone who
+        # wanted lanes in parallel had to reach for --panel and give up the
+        # per-lane deadlines that are the entire point of --each. The `concurrency:`
+        # key in the config is deliberately NOT read here -- it is documented as
+        # the panel-mode default, the shipped example sets it to 8, and quietly
+        # honouring it would flip every existing caller from serial to eight-way.
+        #
+        # The per-vendor cap IS applied, by the same smallest-in-group rule
+        # build_semaphores uses, so a `concurrency: 1` local lane still cannot be
+        # run beside its neighbour on the same GPU while the API lanes fan out.
+        #
+        # Output stays in roster order: a lane's block is printed whole, once
+        # every lane before it has been printed, so a concurrent run reads
+        # exactly like a serial one instead of interleaving. At -j1 the child
+        # keeps the terminal directly, so the familiar live streaming is intact.
+        #
+        # --diff is deliberately not forwarded: --each --diff was refused above
+        # (#74), so it cannot reach this point.
+        default_cc = max(int(a.concurrency or 1), 1)
+        caps: dict[str, int] = {}
+        for l in lanes:
+            gid = l.get("vendor") or l["name"]
+            cc = int(l.get("concurrency", default_cc))
+            caps[gid] = min(caps.get(gid, cc), cc)
+        vendor_sems = {gid: threading.Semaphore(cc) for gid, cc in caps.items()}
+        overall = threading.Semaphore(max(default_cc, 1))
+
+        def child_argv(l: dict) -> list[str]:
+            argv = [sys.executable, str(Path(__file__).resolve()),
+                    "--lanes", l["name"], "--config", str(a.config)]
+            if a.json:
+                argv.append("--json")
+            if a.no_transcript:
+                argv.append("--no-transcript")
+            if a.revise:
+                argv += ["--revise", a.revise]
+            argv.append("-")
+            return argv
+
+        def run_one(l: dict) -> tuple[int, str]:
+            gid = l.get("vendor") or l["name"]
+            with overall, vendor_sems[gid]:
+                r = subprocess.run(child_argv(l), input=prompt, text=True,
+                                   capture_output=True)
+            return r.returncode, (r.stdout or "") + (r.stderr or "")
+
+        rc = 0
+        if default_cc == 1:
+            # Unchanged path: the child inherits this terminal and streams.
+            for l in lanes:
+                print(f"\n=== {l['name']} " + "=" * (66 - len(l['name'])), flush=True)
+                r = subprocess.run(child_argv(l), input=prompt, text=True)
+                rc = rc or r.returncode
+            return rc
+
+        with cf.ThreadPoolExecutor(max_workers=max(len(lanes), 1)) as pool:
+            futures = [pool.submit(run_one, l) for l in lanes]
+            for l, fut in zip(lanes, futures):
+                print(f"\n=== {l['name']} " + "=" * (66 - len(l['name'])), flush=True)
+                try:
+                    code, out = fut.result()
+                except Exception as exc:                      # noqa: BLE001
+                    code, out = 1, f"  !! lane crashed: {exc}\n"
+                sys.stdout.write(out)
+                sys.stdout.flush()
+                rc = rc or code
+        return rc
+
+    # Keys are resolved after the fan-out decision so the --each parent, which
+    # never queries anything itself, does not hit `pass` once for every lane
+    # its children are about to hit it for again.
+    keys = fetch_keys(lanes)
     sems = build_semaphores(lanes, int(cfg.get("concurrency", 8)))
     # Concurrency bounds how many are in flight; rpm bounds how fast they start.
     pacers = build_pacers(lanes)
@@ -1605,7 +1715,7 @@ def main() -> int:
     # run that "randomly dies" with zero output and no transcript.
     path = None
     if not a.no_transcript:
-        TRANSCRIPT_DIR.mkdir(parents=True, exist_ok=True)
+        private_transcript_dir()
         stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
         # One lane per process (the --each contract), so the lane name makes the
         # path unique across a fan-out. The second-resolution timestamp alone was
@@ -1639,23 +1749,8 @@ def main() -> int:
             payload["partial"] = True
             payload["note"] = ("run did not finish — these are the lanes that had "
                                "answered when the transcript was last written")
-        # Stage to a UNIQUE temp in the same directory (same filesystem, so the
-        # replace below is still atomic). The old name was derived from `path`, so
-        # two writers colliding on one transcript also collided on one .json.tmp and
-        # raced before either rename — the exact torn-write window write-then-replace
-        # exists to prevent. mkstemp hands each save() its own file (#70).
-        fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix=".json.tmp")
-        try:
-            with os.fdopen(fd, "w") as fh:
-                fh.write(json.dumps(payload, indent=2))
-            os.replace(tmp, path)
-        except BaseException:
-            # Never leave a half-written temp behind if the write or rename fails.
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-            raise
+        # Staged to a unique temp, chmod 0600, then replaced: see save_transcript.
+        save_transcript(payload, path)
 
     ordered = [None] * len(lanes)
     with cf.ThreadPoolExecutor(max_workers=max(len(lanes), 1)) as pool:

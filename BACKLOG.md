@@ -11,31 +11,35 @@ Bugs first — the cost-guard and answer-loss class this tool exists to prevent,
 then security, then features/optimisation, then tests. Each has a GitHub issue
 and vice versa.
 
-- [ ] Transcripts clobber each other under `--each -j N`, losing paid answers —
+- [x] Transcripts clobber each other under `--each -j N`, losing paid answers —
       one-second filename stamp + shared `.json.tmp` collide; #58's failure mode
       via the filename instead of write order
-      ([#70](https://github.com/CryptoJones/FlatlineRoundtable/issues/70))
-- [ ] `--each` silently defeats `--max-spend` — the pre-dispatch budget gate runs
+      ([#70](https://github.com/CryptoJones/FlatlineRoundtable/issues/70)) — shipped in PR #88
+- [x] `--each` silently defeats `--max-spend` — the pre-dispatch budget gate runs
       after the fan-out returns, so the parent never checks the whole-panel estimate
-      ([#71](https://github.com/CryptoJones/FlatlineRoundtable/issues/71))
-- [ ] Unknown model id estimates to `$0`, so `--max-spend` cannot bind — an http
+      ([#71](https://github.com/CryptoJones/FlatlineRoundtable/issues/71)) — fixed on fix/open-issues-batch
+- [x] Unknown model id estimates to `$0`, so `--max-spend` cannot bind — an http
       lane with no resolvable price fails open on the guard meant to fail closed
-      ([#72](https://github.com/CryptoJones/FlatlineRoundtable/issues/72))
-- [ ] Transcripts are world-readable (`0755` dir / `0644` file) — full briefs and
+      ([#72](https://github.com/CryptoJones/FlatlineRoundtable/issues/72)) — fixed on fix/open-issues-batch
+- [x] Transcripts are world-readable (`0755` dir / `0644` file) — full briefs and
       answers exposed to any local user or tool-bearing `cli` lane
-      ([#73](https://github.com/CryptoJones/FlatlineRoundtable/issues/73))
-- [ ] `--diff` is silently dropped under `--each` — the flag isn't forwarded to
+      ([#73](https://github.com/CryptoJones/FlatlineRoundtable/issues/73)) — fixed on fix/open-issues-batch
+- [x] `--diff` is silently dropped under `--each` — the flag isn't forwarded to
       children, so synthesis no-ops with exit 0 on the recommended invocation
-      ([#74](https://github.com/CryptoJones/FlatlineRoundtable/issues/74))
+      ([#74](https://github.com/CryptoJones/FlatlineRoundtable/issues/74)) — fixed on fix/open-issues-batch
 - [ ] `--revise latest:N` counts files, not lanes — wrong for a `--panel` round,
       and misleading after a clobber; docs say "lane count"
       ([#75](https://github.com/CryptoJones/FlatlineRoundtable/issues/75))
-- [ ] `--revise latest:<non-int>` throws a raw `ValueError` traceback instead of
+- [x] `--revise latest:<non-int>` throws a raw `ValueError` traceback instead of
       the clean, actionable error every other bad input gives
-      ([#76](https://github.com/CryptoJones/FlatlineRoundtable/issues/76))
-- [ ] Env scrub has no test on the `acp` harness — `child_env()` is shared by
+      ([#76](https://github.com/CryptoJones/FlatlineRoundtable/issues/76)) — fixed on fix/open-issues-batch
+- [ ] Lane harnesses leak file descriptors — `acp_lane` / `cli_lane` Popen pipes
+      and `http_lane`'s retried `HTTPError` are never closed (28 `ResourceWarning`s,
+      all inside `roundtable`, none in the stub; found doing #86)
+      ([#90](https://github.com/CryptoJones/FlatlineRoundtable/issues/90))
+- [x] Env scrub has no test on the `acp` harness — `child_env()` is shared by
       `cli` and `acp`, but only `cli` asserts a key stays out; drift reopens #22
-      ([#77](https://github.com/CryptoJones/FlatlineRoundtable/issues/77))
+      ([#77](https://github.com/CryptoJones/FlatlineRoundtable/issues/77)) — fixed on fix/open-issues-batch
 - [ ] No per-lane CA bundle — a self-hosted/private-CA endpoint forces a global
       TLS bypass that also weakens the OpenRouter lanes
       ([#78](https://github.com/CryptoJones/FlatlineRoundtable/issues/78))
@@ -51,18 +55,25 @@ and vice versa.
 - [ ] Transcripts accumulate forever — add bounded, opt-in retention that never
       deletes a `parent` of a later round
       ([#82](https://github.com/CryptoJones/FlatlineRoundtable/issues/82))
-- [ ] `synthesize()` collects readers serially instead of via `as_completed` — free
+- [ ] TODO: assign mathematical weighting to lanes based on model ability —
+      per-lane weights from each lane's verified track record (CORRECT / PARTLY /
+      WRONG), Beta-smoothed, optionally seeded from benchmark scores. Weights rank
+      findings for verification and annotate the synthesis; they never decide a
+      finding. Motivated by the 2026-09-27 rounds: six lanes agreed on the same
+      wrong "bug" while each real defect came from one lane
+      ([#89](https://github.com/CryptoJones/FlatlineRoundtable/issues/89))
+- [x] `synthesize()` collects readers serially instead of via `as_completed` — free
       wall-clock win, and removes a serialization trap in the reader loop
-      ([#83](https://github.com/CryptoJones/FlatlineRoundtable/issues/83))
+      ([#83](https://github.com/CryptoJones/FlatlineRoundtable/issues/83)) — fixed on fix/open-issues-batch
 - [ ] `load_pricing` caches the whole catalog and re-parses it every run — cache the
       reduced `{id: (in, out)}` map instead
       ([#84](https://github.com/CryptoJones/FlatlineRoundtable/issues/84))
 - [ ] No integration tests for `--each` budget gate, transcript integrity, unknown
       price, or `--diff`+`--each` — the four high-severity behaviours CI doesn't cover
       ([#85](https://github.com/CryptoJones/FlatlineRoundtable/issues/85))
-- [ ] Add Python 3.14 to the CI matrix — the suite already passes on it (verified
+- [x] Add Python 3.14 to the CI matrix — the suite already passes on it (verified
       locally), free signal for no extra dependency
-      ([#86](https://github.com/CryptoJones/FlatlineRoundtable/issues/86))
+      ([#86](https://github.com/CryptoJones/FlatlineRoundtable/issues/86)) — fixed on fix/open-issues-batch
 
 ## Verification set
 
