@@ -230,6 +230,17 @@ built until the one before it has been said. Do not run it instead of round
 AFTER reading it, when you want to see which positions survive being argued
 with rather than merely being shown.
 
+**When to discuss, and when not to.** Discuss when lanes split on a
+*judgment* — severity, reachability, whether a change is the right fix — and
+the split is what you need settled. Do not discuss when the only dissent
+rests on a *checkable fact*: verify the fact yourself and move on. A
+discussion costs rounds × lanes requests and, as #98 showed, can manufacture
+evidence; a fact check costs one command. Vigil #1217 round 4 (2026-09-28):
+12 tool lanes said READY, Multivac alone said NOT READY on the claim that
+`isinstance(x, str)` discards `str` subclasses — false, and checkable in one
+line — so the right move was verification, not a discussion, and that is what
+was done.
+
 **Seeding from a tool round.** `--discuss` drives the lanes itself through
 roundtable's own harnesses; it does not run tool rounds and does not read
 `toolpanel.py` answer files. An `http`/`acp` turn is tool-less — it sees the
