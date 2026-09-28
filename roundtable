@@ -901,6 +901,26 @@ def acp_lane(lane: dict, prompt: str) -> dict:
         sid = (r.get("result") or {}).get("sessionId")
         if not sid:
             raise RuntimeError(f"session/new returned no sessionId: {str(r)[:150]}")
+        # Per-lane session config, applied before the prompt. ACP agents expose
+        # tunables (thought level, mode, model) only as session/set_config_option
+        # calls after session/new -- pool's --settings flag does NOT reach them
+        # (measured 2026-09-04: thought_level stayed "max" under every --settings
+        # spelling). A rejected value is a hard failure, not a silent fallback:
+        # a lane that quietly ran at the wrong thought level is a mislabeled
+        # answer, which is worse than no answer.
+        for rid, (cid, val) in enumerate(
+                sorted((lane.get("config_options") or {}).items()), start=100):
+            r = call(rid, "session/set_config_option",
+                     {"sessionId": sid, "configId": cid, "value": val})
+            if "error" in r:
+                raise RuntimeError(
+                    f"set_config_option {cid}={val!r} rejected: {str(r['error'])[:150]}")
+            got = next((o.get("currentValue") for o in
+                        (r.get("result") or {}).get("configOptions") or []
+                        if o.get("id") == cid), val)
+            if got != val:
+                raise RuntimeError(
+                    f"set_config_option {cid}: asked {val!r}, agent reports {got!r}")
         text = prompt
         if lane.get("personality"):
             text = f"{lane['personality']}\n\n---\n\n{prompt}"

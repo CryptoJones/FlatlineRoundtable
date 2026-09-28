@@ -275,7 +275,11 @@ kill, the missing-secret abort, and partial delivery failing the run.
 
 - Three harnesses: `http` (any OpenAI-compatible endpoint), `cli` (one-shot
   subscription CLIs), and `acp` (JSON-RPC-over-stdio agents, driven for exactly
-  one turn).
+  one turn). An `acp` lane's `config_options` (thought level, mode, model —
+  whatever the agent lists under `configOptions`) are applied with
+  `session/set_config_option` after `session/new` and before the prompt, because
+  the agent's own CLI flags do not reach them; a rejected or unhonoured value
+  fails the lane rather than answering at the wrong setting.
 - Tool access is a property of the harness, not the panel. `http` and `acp`
   lanes see the brief and nothing else — put the material in it. `cli` lanes run
   the vendor's CLI with its normal tools and may read, run, and write in the
