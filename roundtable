@@ -1424,28 +1424,6 @@ def main() -> int:
             "  --panel               the old shared-deadline behaviour, if you mean it"
             .format(n=len(lanes)))
 
-    if a.each and not a.list:
-        # Re-invoke ourselves once per lane. Separate processes, separate
-        # deadlines, separate transcripts: a lane can be slow, or die, alone.
-        brief_text = sys.stdin.read() if a.brief[:1] == ["-"] else " ".join(a.brief)
-        if not brief_text.strip() and not a.revise:
-            die("empty brief")
-        rc = 0
-        for l in lanes:
-            print(f"\n=== {l['name']} " + "=" * (66 - len(l['name'])), flush=True)
-            argv = [sys.executable, str(Path(__file__).resolve()),
-                    "--lanes", l["name"], "--config", str(a.config)]
-            if a.json:
-                argv.append("--json")
-            if a.no_transcript:
-                argv.append("--no-transcript")
-            if a.revise:
-                argv += ["--revise", a.revise]
-            argv.append("-")
-            r = subprocess.run(argv, input=brief_text, text=True)
-            rc = rc or r.returncode
-        return rc
-
     if a.list:
         for l in lanes:
             route = l["harness"]
@@ -1478,11 +1456,18 @@ def main() -> int:
 
     budget = a.max_spend if a.max_spend is not None else cfg.get("budget_usd")
     deadline = time.time() + cfg["deadline_seconds"] if cfg.get("deadline_seconds") else None
-    keys = fetch_keys(lanes)
     prices = load_pricing(lanes)
 
     # Refuse BEFORE spending, not after. A budget checked only on the way out
     # reports an overrun; it does not prevent one.
+    #
+    # This gate must also sit BEFORE the --each fan-out below (issue #71). It
+    # used to sit after that branch returned, so the parent never ran it: each
+    # child gated only its own lane, and a roster where no single lane is
+    # expensive but the panel total is walked through N cheap gates and spent
+    # N× what any one estimate implied. The whole-panel estimate is the one the
+    # README promises, so it runs here over the full selected set; the child's
+    # own gate stays as a backstop, not the only check.
     calib = load_calibration()
     defaults = cfg.get("defaults") or {}
     estimate = estimate_run(lanes, est_prompt, prices, defaults, calib,
@@ -1499,6 +1484,31 @@ def main() -> int:
             f"  raise --max-spend, drop lanes with --lanes, or lower max_tokens"
         )
 
+    if a.each:
+        # Re-invoke ourselves once per lane. Separate processes, separate
+        # deadlines, separate transcripts: a lane can be slow, or die, alone.
+        # The panel-wide budget gate above has already passed; a child re-runs
+        # it for its single lane only as a backstop (issue #71).
+        rc = 0
+        for l in lanes:
+            print(f"\n=== {l['name']} " + "=" * (66 - len(l['name'])), flush=True)
+            argv = [sys.executable, str(Path(__file__).resolve()),
+                    "--lanes", l["name"], "--config", str(a.config)]
+            if a.json:
+                argv.append("--json")
+            if a.no_transcript:
+                argv.append("--no-transcript")
+            if a.revise:
+                argv += ["--revise", a.revise]
+            argv.append("-")
+            r = subprocess.run(argv, input=prompt, text=True)
+            rc = rc or r.returncode
+        return rc
+
+    # Keys are resolved after the fan-out decision so the --each parent, which
+    # never queries anything itself, does not hit `pass` once for every lane
+    # its children are about to hit it for again.
+    keys = fetch_keys(lanes)
     sems = build_semaphores(lanes, int(cfg.get("concurrency", 8)))
     # Concurrency bounds how many are in flight; rpm bounds how fast they start.
     pacers = build_pacers(lanes)
