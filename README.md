@@ -199,6 +199,67 @@ and the alias map, so the anonymity is auditable after the fact. `--revise
 latest:12` on a round-2 run produces round 3; nothing caps it, but each round
 is another full panel spend, and the returns fall fast.
 
+### `--discuss` — the shared-context discussion
+
+`--revise` shows every lane the others' answers once. `--discuss` lets them
+talk. The panel shares **one** context — the brief, the anonymised opening
+positions, and every turn said so far, in order — and takes turns in it, one
+lane speaking at a time. Each turn is one ordinary request with that shared
+context as the prompt, so the process holds a single request in flight, a
+`cli` lane's agent runtime exists only for its turn, and nothing outlives the
+run. That is the whole point: a standing fleet with a resident runtime per
+lane and a message bus between them can do this too, and is far too heavy to
+keep around for it.
+
+```console
+roundtable --each "the brief"               # round 1, blind
+roundtable --discuss latest:12              # the same 12 lanes discuss it
+roundtable --discuss latest:12 --discuss-rounds 3 "focus on the cost claims"
+cat brief.md | roundtable --discuss new -   # start cold, no blind round
+roundtable --lanes HAL9000,SHODAN,Cortana --discuss latest:12   # a subset
+```
+
+Seed it from a blind round and round 1 keeps its epistemic claim; `new`
+starts cold and its transcript *is* round 1 — a dependent one. Each pass
+gives every lane one turn (the opener rotates each pass, so no lane always
+anchors or always gets the last word), and after the last pass each lane
+writes a closing that opens with `HOLD` or `REVISE`. The report tallies the
+closings under the same banner `--revise` uses, because the same caveat
+applies: agreement after a discussion is persuasion, not independent
+convergence.
+
+The thread is O(N²) in prompt tokens — turn *k* re-sends the *k−1* turns before
+it — so a turn is capped at ~300 words and `--discuss-rounds` defaults to 2.
+The budget gate prices the longest packet times the requests per lane
+(`rounds + 1`), and `deadline_seconds` bounds one turn rather than the run.
+Every turn is appended to the transcript as soon as it returns, so a run that
+dies at turn 17 leaves 16 turns on disk. The closings are saved as `results`,
+which makes a discussion transcript a valid parent for `--revise`, for `--diff`
+synthesis, or for another `--discuss`.
+
+`--discuss` refuses `--each`, `--panel` and `--revise` alongside it (there is
+nothing to fan out — each turn is built from the ones before it), and refuses
+fewer than two lanes.
+
+**What a turn can see.** `--discuss` drives the lanes itself, through the same
+`http` / `cli` / `acp` harnesses as round 1. An `http` or `acp` turn sees the
+shared packet and nothing else — no tools, no repo — so anything the panel
+needs to check must already be in the openings or in the focus text (quote
+contiguous excerpts, mark elisions). A `cli` turn has whatever its vendor CLI
+normally has. If round 1 was a tool round driven by `skill/toolpanel.py`, its
+per-lane answer files are not transcripts; fold them into one with
+`skill/toolpanel-seed.py` and seed from that:
+
+```console
+skill/toolpanel-seed.py brief.md seed.json answers/*.md
+roundtable --lanes HAL9000,SHODAN,Cortana --discuss seed.json "the split to settle"
+```
+
+**What the transcript holds.** `brief` (the round-1 brief), `results` (the
+closings), `discussion` (every turn: `turn`, `pass`, `alias`, `lane`, `answer`,
+`seconds`, `cost`), `aliases` (letter → lane, so the anonymity is auditable),
+`parent` (the seed transcripts, `[]` for `new`), `round`, `mode: discuss`.
+
 ## Tests
 
 ```console

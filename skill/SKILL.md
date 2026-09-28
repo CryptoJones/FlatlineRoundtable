@@ -120,6 +120,54 @@ epistemic claim, and a round-2 consensus is persuasion, not convergence. Report
 round-2 agreement to the user as "the panel converged after debate", never as
 "N independent models agree".
 
+## The discussion — `--discuss`
+
+`roundtable --discuss latest:N` (N = the prior blind run's lane count) puts the
+panel in ONE shared context — brief, anonymised openings, every turn said so
+far — and has them take turns in it, **one lane in flight at a time**, in a
+single process. Passes over the roster: `--discuss-rounds` (default 2), opener
+rotating each pass. After the last pass each lane closes with `HOLD` or
+`REVISE`; the report tallies those under the same "persuasion, not
+convergence" banner as `--revise`. `--discuss new` starts cold from a brief on
+stdin/argv with no blind round; any brief text given alongside a transcript
+spec rides as extra focus.
+
+This is the lightweight stand-in for a Buzz-style conversation: no resident
+runtimes, no bus, a `cli` lane's agent exists only for its turn. Do NOT add
+`--each`, `-j` or `--panel` — the tool refuses them, because a turn cannot be
+built until the one before it has been said. Do not run it instead of round
+1: the blind round is still the evidence; the discussion is what you run
+AFTER reading it, when you want to see which positions survive being argued
+with rather than merely being shown.
+
+**Seeding from a tool round.** `--discuss` drives the lanes itself through
+roundtable's own harnesses; it does not run tool rounds and does not read
+`toolpanel.py` answer files. An `http`/`acp` turn is tool-less — it sees the
+shared packet and nothing else — so the evidence has to be in the openings or
+the focus text (contiguous excerpts, elisions marked). A `cli` turn keeps its
+vendor CLI's tools. To discuss a tool round's findings, fold the per-lane
+answer files into one seed transcript first:
+
+```bash
+S=~/.claude/skills/flatline-roundtable/toolpanel-seed.py
+$S brief.md seed.json answers/*.md             # status!=ok lanes get answer=null
+roundtable --lanes HAL9000,SHODAN,Cortana --discuss seed.json "focus: the split, by finding"
+```
+
+Put the disputed claims in the focus text by finding, not by lane, and say
+what would settle each; that is what the panel argues about.
+
+Reading it: the thread is streamed turn by turn as it happens and saved to the
+transcript after every turn (`"discussion"`: `turn`, `pass`, `alias`, `lane`,
+`answer`, `seconds`, `cost`; closings under `"results"`; `"aliases"` letter →
+lane; `"parent"` the seed), so a run killed mid-thread still leaves what was
+said. Report the discussion by panelist letter → lane, quote the turn that
+actually moved a lane, and report closings as "converged after discussion",
+never as "N independent models agree". Cost is O(N²) in turns; use `--lanes`
+for the three-to-five lanes that actually split, not all twelve, and
+`--max-spend` still gates (longest packet × rounds+1 per lane).
+`deadline_seconds` bounds one turn, not the run.
+
 ## Cost
 
 `harness` decides cost, not `model`. `cli` lanes ride an existing subscription
