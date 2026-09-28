@@ -253,7 +253,19 @@ transcript after every turn (`"discussion"`: `turn`, `pass`, `alias`, `lane`,
 lane; `"parent"` the seed), so a run killed mid-thread still leaves what was
 said. Report the discussion by panelist letter → lane, quote the turn that
 actually moved a lane, and report closings as "converged after discussion",
-never as "N independent models agree". Cost is O(N²) in turns; use `--lanes`
+never as "N independent models agree".
+
+**Check every fact that first appears mid-thread against the code before you
+repeat it.** A shared thread can do what a blind round cannot: turn one lane's
+invention into everyone's premise. First live run, 2026-09-28 (#98): Colossus
+asserted a "default 24 h" approval expiry that does not exist (it is
+`approval_expiry_days`, default 7, pending only), and HAL9000, SHODAN and
+Cerebex each cited "B's 24-hour expiry" as evidence in the next three turns.
+The verdict was right; the evidence was false. The prompts now tell lanes a
+fact introduced in the thread is a claim until sourced, which lowers the rate
+and does not eliminate it. The `discussion` array is in turn order: find where
+a fact was first said, and if that turn cites no file, command or document,
+treat every later use of it as unverified. Cost is O(N²) in turns; use `--lanes`
 for the three-to-five lanes that actually split, not all twelve, and
 `--max-spend` still gates (longest packet × rounds+1 per lane).
 `deadline_seconds` bounds one turn, not the run.
