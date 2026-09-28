@@ -1516,6 +1516,27 @@ class TestEndToEnd(unittest.TestCase):
                             "base_url": s.url}])
             self.assertEqual(r.returncode, 0, r.stderr)
 
+    def test_each_gates_the_whole_panel_before_spawning_children(self):
+        """#71: the gate sat after the --each branch returned, so the parent
+        never ran it and each child checked only its own lane. Two lanes that
+        each fit the budget alone but not together must be refused by the
+        parent, before any child exists to reach the stub."""
+        with StubServer() as s:
+            lanes = [{"name": n, "harness": "http", "model": "m", "base_url": s.url,
+                      "price_per_mtok": 1000.0, "max_tokens": 2000}
+                     for n in ("A", "B")]
+            # One lane's ceiling is ~$2 (2000 completion tokens at $1000/Mtok);
+            # $3 clears one lane and not two.
+            r = self._run(lanes, "--each", "--max-spend", "3")
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn("refusing to dispatch", r.stderr)
+            self.assertNotIn("=== A", r.stdout, "a child was spawned despite the refusal")
+            self.assertIsNone(s.srv.last_request, "dispatched despite being over budget")
+            # And the same roster under a budget that covers the panel still runs.
+            r = self._run(lanes, "--each", "--max-spend", "5")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIsNotNone(s.srv.last_request)
+
     def test_list_makes_no_network_calls(self):
         with StubServer() as s:
             r = self._run([{"name": "A", "harness": "http", "model": "m", "base_url": s.url}],
