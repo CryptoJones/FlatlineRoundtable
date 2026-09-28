@@ -20,20 +20,20 @@ neither side drifts.
       finding. Motivated by the 2026-09-27 rounds: six lanes agreed on the same
       wrong "bug" while each real defect came from one lane.
       ([#89](https://github.com/CryptoJones/FlatlineRoundtable/issues/89))
-- [ ] `--each` silently defeats `--max-spend`: no budget gate before fan-out
-      ([#71](https://github.com/CryptoJones/FlatlineRoundtable/issues/71))
-- [ ] Unknown model id estimates to $0, so `--max-spend` cannot bind
-      ([#72](https://github.com/CryptoJones/FlatlineRoundtable/issues/72))
-- [ ] Transcripts are world-readable (0755 dir / 0644 file)
-      ([#73](https://github.com/CryptoJones/FlatlineRoundtable/issues/73))
-- [ ] `--diff` is silently dropped under `--each`
-      ([#74](https://github.com/CryptoJones/FlatlineRoundtable/issues/74))
+- [x] `--each` silently defeats `--max-spend`: no budget gate before fan-out
+      ([#71](https://github.com/CryptoJones/FlatlineRoundtable/issues/71)) — fixed on fix/open-issues-batch
+- [x] Unknown model id estimates to $0, so `--max-spend` cannot bind
+      ([#72](https://github.com/CryptoJones/FlatlineRoundtable/issues/72)) — fixed on fix/open-issues-batch
+- [x] Transcripts are world-readable (0755 dir / 0644 file)
+      ([#73](https://github.com/CryptoJones/FlatlineRoundtable/issues/73)) — fixed on fix/open-issues-batch
+- [x] `--diff` is silently dropped under `--each`
+      ([#74](https://github.com/CryptoJones/FlatlineRoundtable/issues/74)) — fixed on fix/open-issues-batch
 - [ ] `--revise latest:N` counts files, not lanes; wrong for `--panel` rounds
       ([#75](https://github.com/CryptoJones/FlatlineRoundtable/issues/75))
-- [ ] `--revise latest:<non-int>` throws a raw `ValueError` traceback
-      ([#76](https://github.com/CryptoJones/FlatlineRoundtable/issues/76))
-- [ ] Env scrub has no test on the `acp` harness (shared `child_env`)
-      ([#77](https://github.com/CryptoJones/FlatlineRoundtable/issues/77))
+- [x] `--revise latest:<non-int>` throws a raw `ValueError` traceback
+      ([#76](https://github.com/CryptoJones/FlatlineRoundtable/issues/76)) — fixed on fix/open-issues-batch
+- [x] Env scrub has no test on the `acp` harness (shared `child_env`)
+      ([#77](https://github.com/CryptoJones/FlatlineRoundtable/issues/77)) — fixed on fix/open-issues-batch
 - [ ] No per-lane CA bundle: self-hosted endpoints force global TLS bypass
       ([#78](https://github.com/CryptoJones/FlatlineRoundtable/issues/78))
 - [ ] Report per-lane cost and run-level spend in `--json` (and under `--diff`)
@@ -44,8 +44,8 @@ neither side drifts.
       ([#81](https://github.com/CryptoJones/FlatlineRoundtable/issues/81))
 - [ ] Transcripts accumulate forever; add bounded retention
       ([#82](https://github.com/CryptoJones/FlatlineRoundtable/issues/82))
-- [ ] `synthesize()` collects readers serially instead of via `as_completed`
-      ([#83](https://github.com/CryptoJones/FlatlineRoundtable/issues/83))
+- [x] `synthesize()` collects readers serially instead of via `as_completed`
+      ([#83](https://github.com/CryptoJones/FlatlineRoundtable/issues/83)) — fixed on fix/open-issues-batch
 - [ ] `load_pricing` caches the whole catalog and re-parses it every run
       ([#84](https://github.com/CryptoJones/FlatlineRoundtable/issues/84))
 - [ ] No integration tests for `--each` budget gate, transcript integrity,
