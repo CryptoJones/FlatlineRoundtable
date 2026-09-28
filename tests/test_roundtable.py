@@ -1469,6 +1469,26 @@ class TestRevisionRound(unittest.TestCase):
         with self.assertRaises(SystemExit):
             rt.load_transcripts("latest")
 
+    def test_bad_latest_n_dies_cleanly(self):
+        """#76: latest:<non-int>, latest:, latest:0 and latest:-3 used to leak a
+        raw ValueError traceback — the one place the tool did not die() with a
+        message naming the fix."""
+        self._transcript("20260901-000001.json", "q", [self._r("A", "a1")])
+        for spec in ("latest:notanint", "latest:", "latest:0", "latest:-3"):
+            with self.subTest(spec=spec):
+                with self.assertRaises(SystemExit) as e:
+                    rt.load_transcripts(spec)
+                self.assertIn("--revise latest:N needs a positive integer (e.g. latest:12)",
+                              str(e.exception.code))
+
+    def test_latest_and_latest_n_still_parse(self):
+        self._transcript("20260901-000001.json", "q", [self._r("A", "a1")])
+        self._transcript("20260901-000002.json", "q", [self._r("B", "b1")])
+        paths, _ = rt.load_transcripts("latest")
+        self.assertEqual([p.name for p in paths], ["20260901-000002.json"])
+        paths, _ = rt.load_transcripts("latest:2")
+        self.assertEqual(len(paths), 2)
+
     def test_aliases_skip_lanes_that_gave_no_answer(self):
         aliases = rt.alias_map([self._r("A", "yes"),
                                 {"lane": "dead", "answer": None},

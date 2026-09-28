@@ -1268,7 +1268,14 @@ def load_transcripts(arg: str) -> tuple[list[Path], dict]:
         if not spec:
             continue
         if spec == "latest" or spec.startswith("latest:"):
-            n = 1 if spec == "latest" else int(spec.split(":", 1)[1])
+            # Parse N defensively (#76): a bare int() here was the one place
+            # the tool leaked a raw traceback where every other bad input
+            # die()s with a message naming the fix. Zero and negatives are
+            # refused too — cands[-0:] would silently mean "all of them".
+            n_str = spec.split(":", 1)[1] if ":" in spec else "1"
+            if not n_str.isdecimal() or int(n_str) < 1:
+                die("--revise latest:N needs a positive integer (e.g. latest:12)")
+            n = int(n_str)
             cands = sorted(TRANSCRIPT_DIR.glob("*.json"))
             if len(cands) < n:
                 die(f"--revise {spec}: only {len(cands)} transcript(s) in {TRANSCRIPT_DIR}")
