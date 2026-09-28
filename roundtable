@@ -29,13 +29,19 @@ Usage:
     roundtable --each --revise latest:12   optional second round: each lane sees
                                            the locked round-1 answers and may
                                            HOLD or REVISE
+    roundtable --discuss latest:12         shared-context discussion seeded from
+                                           that round: lanes take turns in ONE
+                                           thread, one lane in flight at a time,
+                                           then each closes with HOLD or REVISE
+    roundtable --discuss latest:12 --discuss-rounds 3 "focus on the cost claims"
+    cat brief.md | roundtable --discuss new -   start cold, no blind round
 
   * Round 1 is blind by construction — a lane cannot see the others because
-    their answers do not exist yet in its process. `--revise` is the only path
-    to cross-lane visibility: it replays a *finished* run's transcript(s), so
-    the packet each lane receives is locked before any lane reads it. Round-2
-    answers are not independent and the report says so; convergence there is
-    persuasion, not evidence.
+    their answers do not exist yet in its process. `--revise` and `--discuss`
+    are the only paths to cross-lane visibility: both replay a *finished* run's
+    transcript(s), so the openings each lane receives are locked before any
+    lane reads them. Answers after either are not independent and the report
+    says so; convergence there is persuasion, not evidence.
 """
 from __future__ import annotations
 
@@ -1473,6 +1479,158 @@ def build_revision_prompt(lane_name: str, prior: dict, aliases: dict[str, str],
                                 answers="\n\n".join(sections))
 
 
+# --------------------------------------------------------------------------- #
+# discussion mode
+# --------------------------------------------------------------------------- #
+# --discuss: the panel shares ONE context and takes turns in it, one lane in
+# flight at a time.
+#
+# Buzz (the standing fleet) gives lanes a conversation by keeping a resident
+# agent runtime per lane and a message bus between them, and that is exactly
+# what made it too heavy to keep around. Here the "shared context space" is a
+# string: the brief, the anonymised opening positions, and every turn said so
+# far, in order. A turn is one ordinary ask() with that string as the prompt,
+# so the process holds one request at a time -- a cli lane's agent runtime
+# exists only for its turn -- and nothing outlives the run, which keeps the
+# no-long-lived-process guarantee the rest of the tool is built on.
+#
+# The thread is O(N^2) in prompt tokens: turn k re-sends the k-1 turns before
+# it. DISCUSS_WORDS caps what one turn adds and --discuss-rounds caps the
+# passes; the budget gate prices the longest packet times the requests per lane.
+#
+# Every turn is appended to the transcript as soon as it returns, so a run that
+# dies at turn 17 leaves 16 turns on disk. The closings are saved as `results`,
+# which makes a discussion transcript a valid parent for --revise, --diff
+# synthesis or another --discuss.
+DISCUSS_WORDS = 300
+
+DISCUSS_PROMPT = """This is a live panel discussion between {n} independent models. You are
+PANELIST {me}. It is your turn: turn {turn} of {total}, pass {pas} of {passes}.
+
+Everything below is shared context: the brief, each panelist's opening
+position (written in isolation), and the discussion so far in the order it
+was said. Every panelist sees exactly this.
+
+Speak to the panel, not to a moderator. Address panelists by letter. Do at
+least one of: concede a specific point that was right; challenge a specific
+claim and say why; answer a question that was put to you; ask one question
+whose answer would settle a dispute. Do not restate your opening and do not
+summarise the discussion. Do not defer to the majority or to any model you
+think you recognise. If nothing has been said yet, open the discussion with
+the point you most want tested. Stay under {words} words.
+{extra}
+--- THE BRIEF ---
+{brief}
+
+--- OPENING POSITIONS ---
+{openings}
+
+--- DISCUSSION SO FAR ---
+{thread}"""
+
+CLOSING_PROMPT = """The discussion is over. You are PANELIST {me}. Give your closing position
+on the brief.
+
+Open your reply with exactly one word on its own line: HOLD or REVISE,
+relative to your opening position (NEW if you gave none). Your closing
+REPLACES your opening, so it must stand alone. If you REVISE, name the
+argument that moved you and the panelist letter it came from. If you HOLD,
+answer the strongest point made against you instead of restating yourself.
+Move only for a reason you can state.
+{extra}
+--- THE BRIEF ---
+{brief}
+
+--- OPENING POSITIONS ---
+{openings}
+
+--- THE DISCUSSION ---
+{thread}"""
+
+
+def discussion_aliases(lanes: list[dict], prior: dict | None) -> dict[str, str]:
+    """Letters for everyone in the room.
+
+    Prior-round lanes keep the letters alias_map would give them, so a lane
+    that opened as PANELIST C is still C when it speaks; roster lanes with no
+    opening (a cold start, or a lane that failed in round 1) are lettered after.
+    A prior lane not on this roster keeps its letter too -- its opening is
+    still shown, it just never gets a turn.
+    """
+    aliases = alias_map(prior["results"]) if prior else {}
+    for l in lanes:
+        if l["name"] not in aliases:
+            i = len(aliases)
+            aliases[l["name"]] = chr(ord("A") + i) if i < 26 else f"P{i + 1}"
+    return aliases
+
+
+def render_openings(prior: dict | None, aliases: dict[str, str]) -> str:
+    if not prior:
+        return "(none -- this discussion starts cold)"
+    return "\n\n".join(f"PANELIST {aliases[r['lane']]}:\n{r['answer']}"
+                       for r in prior["results"] if r.get("answer"))
+
+
+def render_thread(thread: list[dict]) -> str:
+    # A turn that failed is kept in the transcript but not read to the panel:
+    # "[no answer]" is noise to argue with. The turn numbers stay as spoken.
+    said = [f"PANELIST {t['alias']} (turn {t['turn']}):\n{t['answer']}"
+            for t in thread if t.get("answer")]
+    return "\n\n".join(said) if said else "(nothing yet -- you speak first)"
+
+
+def build_discussion_prompt(me: str, brief: str, prior: dict | None, aliases: dict[str, str],
+                            thread: list[dict], turn: int, total: int, pas: int,
+                            passes: int, n: int, focus: str = "") -> str:
+    extra = f"\n--- ADDITIONAL FOCUS ---\n{focus}\n" if focus else ""
+    return DISCUSS_PROMPT.format(n=n, me=me, turn=turn, total=total, pas=pas,
+                                 passes=passes, words=DISCUSS_WORDS, extra=extra,
+                                 brief=brief, openings=render_openings(prior, aliases),
+                                 thread=render_thread(thread))
+
+
+def build_closing_prompt(me: str, brief: str, prior: dict | None, aliases: dict[str, str],
+                         thread: list[dict], focus: str = "") -> str:
+    extra = f"\n--- ADDITIONAL FOCUS ---\n{focus}\n" if focus else ""
+    return CLOSING_PROMPT.format(me=me, extra=extra, brief=brief,
+                                 openings=render_openings(prior, aliases),
+                                 thread=render_thread(thread))
+
+
+def run_discussion(lanes: list[dict], brief: str, prior: dict | None,
+                   aliases: dict[str, str], rounds: int, focus: str,
+                   ask_one, on_turn, on_closing) -> tuple[list[dict], list[dict]]:
+    """Drive the thread: `rounds` passes over the roster, then one closing each.
+
+    Strictly sequential -- the next turn cannot be built until this one has
+    been said, and one-at-a-time is the memory property the mode exists for.
+    `ask_one(lane, packet)` is ask() with the run's plumbing applied; the two
+    callbacks fire after every turn and every closing so the caller can stream
+    and persist without this function knowing about terminals or transcripts.
+    """
+    n = len(lanes)
+    total = rounds * n
+    thread: list[dict] = []
+    for pas in range(rounds):
+        # Rotate the opener each pass so no lane always speaks first (anchoring
+        # the pass) or last (getting the final word for free).
+        order = lanes[pas % n:] + lanes[:pas % n]
+        for l in order:
+            turn = len(thread) + 1
+            packet = build_discussion_prompt(aliases[l["name"]], brief, prior, aliases,
+                                             thread, turn, total, pas + 1, rounds, n, focus)
+            r = ask_one(l, packet)
+            thread.append({"turn": turn, "pass": pas + 1, "alias": aliases[l["name"]], **r})
+            on_turn(thread[-1], thread)
+    closings: list = [None] * n
+    for i, l in enumerate(lanes):
+        closings[i] = ask_one(l, build_closing_prompt(aliases[l["name"]], brief, prior,
+                                                      aliases, thread, focus))
+        on_closing(closings)
+    return thread, closings
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(add_help=False)
     ap.add_argument("brief", nargs="*")
@@ -1489,11 +1647,26 @@ def main() -> int:
     ap.add_argument("--no-transcript", action="store_true")
     ap.add_argument("--diff", action="store_true")
     ap.add_argument("--revise", metavar="TRANSCRIPT")
+    ap.add_argument("--discuss", metavar="TRANSCRIPT|new",
+                    help="shared-context discussion, one lane speaking at a time: "
+                         "seeded from a blind round's transcript(s), or `new` to "
+                         "start cold from the brief")
+    ap.add_argument("--discuss-rounds", type=int, default=2,
+                    help="passes over the roster before closings (default 2)")
     ap.add_argument("-h", "--help", action="store_true")
     a = ap.parse_args()
     if a.help:
         print(__doc__.strip())
         return 0
+    if a.discuss:
+        if a.revise:
+            die("--discuss and --revise are two different second rounds; pick one")
+        if a.each or a.panel:
+            die("--discuss already runs the lanes one at a time, in one process:\n"
+                "  each turn is built from the turns before it, so there is nothing\n"
+                "  to fan out. Drop --each/--panel.")
+        if a.discuss_rounds < 1:
+            die("--discuss-rounds needs a positive integer")
 
     cfg = load_config(a.config)
     lanes = [l for l in cfg["lanes"] if l.get("active", True)]
@@ -1517,9 +1690,16 @@ def main() -> int:
     # resolving "latest" for itself would pick up a sibling's round-2 output —
     # the exact self-echo this feature must not create.
     prior = None
+    prior_paths: list[Path] = []
     if a.revise and not a.list:
         prior_paths, prior = load_transcripts(a.revise)
         a.revise = ",".join(str(p) for p in prior_paths)
+    # A discussion seeded from a blind round keeps round 1's epistemic claim
+    # intact; `new` starts cold, and its transcript is round 1 -- a dependent one.
+    if a.discuss and a.discuss != "new" and not a.list:
+        prior_paths, prior = load_transcripts(a.discuss)
+    if a.discuss and len(lanes) < 2 and not a.list:
+        die("--discuss needs at least two lanes; one lane is a monologue")
 
     # ONE RUN PER LANE.
     #
@@ -1536,7 +1716,9 @@ def main() -> int:
     # So multi-lane runs must say which they want. --each is the right answer and
     # is what the refusal points at; --panel is the escape hatch for anyone who
     # genuinely wants the old shared-deadline behaviour.
-    if len(lanes) > 1 and not a.list and not (a.each or a.panel):
+    # --discuss is exempt: it is sequential by construction (see run_discussion),
+    # so no lane ever waits on another's deadline.
+    if len(lanes) > 1 and not a.list and not (a.each or a.panel or a.discuss):
         die("refusing to run {n} lanes in one invocation.\n"
             "  A shared deadline makes independent lanes fail together: the run is\n"
             "  only as fast as its slowest lane, and one death costs every answer.\n"
@@ -1570,7 +1752,7 @@ def main() -> int:
         return 0
 
     prompt = sys.stdin.read() if a.brief[:1] == ["-"] else " ".join(a.brief)
-    if not prompt.strip() and not a.revise:
+    if not prompt.strip() and not a.revise and not prior:
         die("empty brief")
 
     # In a revision round the brief on record stays the ORIGINAL question; any
@@ -1589,6 +1771,20 @@ def main() -> int:
         # Packets differ per lane only by which answer is marked YOURS; the
         # longest one is the honest worst case for the budget gate.
         est_prompt = max(prompts.values(), key=len)
+    focus = ""
+    if a.discuss:
+        aliases = discussion_aliases(lanes, prior)
+        if prior:
+            round_no = int(prior.get("round") or 1) + 1
+            brief_on_record = prior["brief"]
+            focus = prompt.strip()
+        # The budget gate's worst case: the last closing packet, i.e. the full
+        # context plus every turn at the word cap (~7 chars a word with the
+        # PANELIST headers). Multiplied by requests-per-lane below.
+        est_prompt = build_closing_prompt(
+            "A", brief_on_record, prior, aliases,
+            [{"turn": i + 1, "alias": "A", "answer": "x" * (DISCUSS_WORDS * 7)}
+             for i in range(a.discuss_rounds * len(lanes))], focus)
 
     budget = a.max_spend if a.max_spend is not None else cfg.get("budget_usd")
     deadline = time.time() + cfg["deadline_seconds"] if cfg.get("deadline_seconds") else None
@@ -1628,6 +1824,9 @@ def main() -> int:
         estimate += estimate_synthesis(lanes, brief_on_record, prices, defaults, calib,
                                        cfg.get("synthesizer"),
                                        int(cfg.get("synthesizers", 2)))
+    if a.discuss:
+        # Each lane speaks once per pass and once to close.
+        estimate *= a.discuss_rounds + 1
     if budget is not None and estimate > budget:
         die(
             f"estimated worst case ${estimate:.4f} exceeds budget ${budget:.2f} — refusing to dispatch\n"
@@ -1745,7 +1944,11 @@ def main() -> int:
         # runs of the SAME lane in the same second (a retry, or a bare single-lane
         # call), which is otherwise still possible.
         suffix = f"-{lanes[0]['name']}" if len(lanes) == 1 else ""
+        if a.discuss:
+            suffix = "-discuss"
         path = TRANSCRIPT_DIR / f"{stamp}{suffix}-{os.getpid()}.json"
+
+    thread: list[dict] = []
 
     def save(results_so_far, synthesis=None, collisions=None, partial=True):
         """Write the transcript. Called after every lane, and again at the end.
@@ -1761,10 +1964,15 @@ def main() -> int:
         # round does -- so a partial revision transcript reads like a full one.
         payload = {"brief": brief_on_record, "results": results_so_far,
                    "synthesis": synthesis, "collisions": collisions}
-        if prompts:
+        if prompts or a.discuss:
             payload.update({"round": round_no,
                             "parent": [str(p) for p in prior_paths],
                             "aliases": aliases})
+        if a.discuss:
+            # The thread is the product; `results` (the closings) is what makes
+            # this file a round another mode can build on.
+            payload.update({"mode": "discuss", "discuss_rounds": a.discuss_rounds,
+                            "discussion": thread})
         if partial:
             payload["partial"] = True
             payload["note"] = ("run did not finish — these are the lanes that had "
@@ -1773,27 +1981,60 @@ def main() -> int:
         save_transcript(payload, path)
 
     ordered = [None] * len(lanes)
-    with cf.ThreadPoolExecutor(max_workers=max(len(lanes), 1)) as pool:
-        # In a revision round each lane gets its own packet (prompts[name]);
-        # otherwise every lane gets the same brief.
-        futures = {
-            pool.submit(ask, l, prompts[l["name"]] if prompts else prompt,
-                        keys, int(cfg.get("retries", 1)), deadline,
-                        sems, lock, spent, lane_prices(l, prices), pacers): i
-            for i, l in enumerate(lanes)
-        }
-        for fut in cf.as_completed(futures):
-            i = futures[fut]
-            try:
-                ordered[i] = fut.result()
-            except Exception as e:  # noqa: BLE001 — mirror ask()'s own contract
-                ordered[i] = {"lane": lanes[i]["name"], "model": lanes[i].get("model"),
-                              "vendor": lanes[i].get("vendor"), "harness": lanes[i]["harness"],
-                              "answer": None, "error": str(e), "finish_reason": None}
-            # Persist after every lane. Order is preserved by writing into the
-            # slot the lane was dispatched from, so a partial transcript reads
-            # the same way a complete one does, with `null` for lanes still out.
+    if a.discuss:
+        retries = int(cfg.get("retries", 1))
+
+        def ask_one(l: dict, packet: str) -> dict:
+            # deadline_seconds bounds ONE turn here, not the run: a discussion
+            # is rounds * lanes dependent requests, and a whole-run clock sized
+            # for a single fan-out would cut every discussion off mid-thread.
+            turn_deadline = (time.time() + cfg["deadline_seconds"]
+                             if cfg.get("deadline_seconds") else None)
+            return ask(l, packet, keys, retries, turn_deadline, sems, lock, spent,
+                       lane_prices(l, prices), pacers)
+
+        def on_turn(t: dict, so_far: list[dict]) -> None:
+            thread[:] = so_far
             save(ordered)
+            if a.json:
+                return
+            print(f"\n--- pass {t['pass']} · turn {t['turn']}/{a.discuss_rounds * len(lanes)}"
+                  f" · {t['lane']} (PANELIST {t['alias']}) · {t['seconds']}s")
+            print(t["answer"] if t["answer"] else f"  !! {t['error']}", flush=True)
+
+        def on_closing(closings: list) -> None:
+            for i, c in enumerate(closings):
+                ordered[i] = c
+            save(ordered)
+
+        if not a.json:
+            print(f"DISCUSSION — {len(lanes)} lanes, {a.discuss_rounds} pass(es), one at a time",
+                  flush=True)
+        run_discussion(lanes, brief_on_record, prior, aliases, a.discuss_rounds,
+                       focus, ask_one, on_turn, on_closing)
+        results = ordered
+    else:
+        with cf.ThreadPoolExecutor(max_workers=max(len(lanes), 1)) as pool:
+            # In a revision round each lane gets its own packet (prompts[name]);
+            # otherwise every lane gets the same brief.
+            futures = {
+                pool.submit(ask, l, prompts[l["name"]] if prompts else prompt,
+                            keys, int(cfg.get("retries", 1)), deadline,
+                            sems, lock, spent, lane_prices(l, prices), pacers): i
+                for i, l in enumerate(lanes)
+            }
+            for fut in cf.as_completed(futures):
+                i = futures[fut]
+                try:
+                    ordered[i] = fut.result()
+                except Exception as e:  # noqa: BLE001 — mirror ask()'s own contract
+                    ordered[i] = {"lane": lanes[i]["name"], "model": lanes[i].get("model"),
+                                  "vendor": lanes[i].get("vendor"), "harness": lanes[i]["harness"],
+                                  "answer": None, "error": str(e), "finish_reason": None}
+                # Persist after every lane. Order is preserved by writing into the
+                # slot the lane was dispatched from, so a partial transcript reads
+                # the same way a complete one does, with `null` for lanes still out.
+                save(ordered)
 
     results = ordered
 
@@ -1804,7 +2045,7 @@ def main() -> int:
     # Calibration pairs one prompt length with each lane's measured
     # prompt_tokens; in a revision round every lane got a different packet, so
     # feeding any single length would poison the ratio for the next estimate.
-    if not prompts:
+    if not prompts and not a.discuss:
         record_calibration(results, prompt, lanes)
 
     # Convergence between lanes that turn out to be the same model is an echo,
@@ -1827,7 +2068,13 @@ def main() -> int:
     save(results, synthesis=synth, collisions=collisions, partial=False)
 
     if a.json:
-        print(json.dumps({"results": results, "synthesis": synth} if a.diff else results, indent=2))
+        if a.discuss:
+            out = {"discussion": thread, "results": results}
+            if a.diff:
+                out["synthesis"] = synth
+        else:
+            out = {"results": results, "synthesis": synth} if a.diff else results
+        print(json.dumps(out, indent=2))
     elif a.diff:
         if synth:
             for r in synth["readings"]:
@@ -1856,6 +2103,8 @@ def main() -> int:
         else:
             print(f"\n  !! {synth_err}", file=sys.stderr)
     else:
+        if a.discuss:
+            print(f"\n{'=' * 74}\nCLOSINGS — each lane's position after the discussion")
         for r in results:
             # served_by was captured on every http response and never shown.
             # Who actually answered is the evidence for the independence claim.
@@ -1868,14 +2117,24 @@ def main() -> int:
                 print("\n  !! TRUNCATED — salvaged at the lane timeout; the turn never finished"
                       if r.get("finish_reason") == "timeout" else
                       "\n  !! TRUNCATED — hit max_tokens; raise it for this lane")
-        if prompts:
+        if prompts or a.discuss:
             moves = [(r["lane"], parse_verdict(r["answer"]) or "?")
                      for r in results if r["answer"]]
             held = sum(1 for _, v in moves if v == "HOLD")
+            unparsed = sum(1 for _, v in moves if v == "?")
             print(f"\n{'=' * 74}")
-            print(f"ROUND {round_no} — lanes saw the round-{round_no - 1} answers."
-                  f" Agreement here is persuasion, not independent convergence.")
-            print(f"  {held} HOLD, {len(moves) - held} moved:")
+            if a.discuss:
+                spoke = sum(1 for t in thread if t.get("answer"))
+                print(f"ROUND {round_no} — closings after a shared discussion"
+                      f" ({spoke}/{len(thread)} turns spoken, {a.discuss_rounds} pass(es))."
+                      f" Agreement here is persuasion, not independent convergence.")
+            else:
+                print(f"ROUND {round_no} — lanes saw the round-{round_no - 1} answers."
+                      f" Agreement here is persuasion, not independent convergence.")
+            # A closing with no verdict word is not a move; say so rather than
+            # folding it into the moved count.
+            tail = f", {unparsed} gave no verdict" if unparsed else ""
+            print(f"  {held} HOLD, {len(moves) - held - unparsed} moved{tail}:")
             for lane, v in moves:
                 print(f"    {lane:<18} {v}")
         print(f"\n{'=' * 74}")

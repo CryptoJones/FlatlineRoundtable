@@ -51,8 +51,20 @@ class StubHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         self.server.last_request = body
+        self.server.requests.append(body)
         self.server.last_auth = self.headers.get("Authorization")
         model = body.get("model", "")
+
+        if model.startswith("speaker_"):
+            # A distinguishable voice per lane: --discuss tests need to see WHO
+            # said what reach the next speaker's packet.
+            self.server.hits[model] = self.server.hits.get(model, 0) + 1
+            self._send(200, {
+                "choices": [{"message": {"content": f"{model} spoke {self.server.hits[model]}"},
+                             "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 100, "completion_tokens": 20},
+            })
+            return
 
         if model == "boom":
             self._send(500, {"error": {"message": "upstream exploded"}})
@@ -141,6 +153,7 @@ class StubServer:
         self.srv = HTTPServer(("127.0.0.1", 0), StubHandler)
         self.srv.last_request = self.srv.last_auth = None
         self.srv.hits = {}
+        self.srv.requests = []
         threading.Thread(target=self.srv.serve_forever, daemon=True).start()
         self.url = f"http://127.0.0.1:{self.srv.server_port}/v1"
         return self
@@ -1834,6 +1847,123 @@ class TestTranscriptUniqueness(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         leftovers = [p.name for p in tdir.iterdir() if ".tmp" in p.name]
         self.assertEqual(leftovers, [], f"staging files survived the run: {leftovers}")
+
+
+# --------------------------------------------------------------------------- #
+# discussion mode
+# --------------------------------------------------------------------------- #
+class TestDiscussion(unittest.TestCase):
+    """--discuss: one shared thread, one lane in flight at a time, closings saved
+    as a round."""
+
+    def setUp(self):
+        self.d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.d, True)
+        self.home = self.d / "home"
+        self.home.mkdir()
+        self.env = {**os.environ, "XDG_CACHE_HOME": str(self.d / "cache"),
+                    "HOME": str(self.home)}
+        self.tdir = self.home / ".local" / "share" / "flatline-roundtable" / "transcripts"
+
+    def _run(self, url, *args, brief=""):
+        cfg = self.d / "c.yaml"
+        cfg.write_text(json.dumps({"lanes": [
+            {"name": "A", "harness": "http", "model": "speaker_a", "base_url": url},
+            {"name": "B", "harness": "http", "model": "speaker_b", "base_url": url},
+        ]}))
+        return subprocess.run(
+            [sys.executable, str(ROOT / "roundtable"), "--config", str(cfg), *args],
+            capture_output=True, text=True, timeout=120, env=self.env, input=brief)
+
+    def _prior(self):
+        p = self.d / "prior.json"
+        p.write_text(json.dumps({"brief": "the original question", "results": [
+            {"lane": "A", "answer": "opening from A", "model": "m", "harness": "http"},
+            {"lane": "B", "answer": "opening from B", "model": "m", "harness": "http"},
+        ]}))
+        return p
+
+    def test_turns_are_sequential_and_each_sees_the_thread_so_far(self):
+        with StubServer() as s:
+            r = self._run(s.url, "--discuss", str(self._prior()), "--discuss-rounds", "1")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            reqs = [q["messages"][-1]["content"] for q in s.srv.requests]
+            # 2 lanes x (1 pass + closing) = 4 requests, in speaking order.
+            self.assertEqual([q["model"] for q in s.srv.requests],
+                             ["speaker_a", "speaker_b", "speaker_a", "speaker_b"])
+            self.assertIn("(nothing yet -- you speak first)", reqs[0])
+            self.assertIn("opening from B", reqs[0])          # openings are shared
+            self.assertIn("PANELIST A (turn 1):\nspeaker_a spoke 1", reqs[1])
+            self.assertNotIn("speaker_a spoke 1", reqs[0])     # nothing from the future
+            self.assertIn("speaker_b spoke 1", reqs[2])        # closing sees the whole thread
+            self.assertIn("HOLD or REVISE", reqs[2])
+            self.assertNotIn("PANELIST A is A", reqs[1])       # anonymised
+            self.assertIn("ROUND 2 — closings after a shared discussion", r.stdout)
+            self.assertIn("2/2 turns spoken", r.stdout)
+            self.assertIn("persuasion, not independent convergence", r.stdout)
+            (t,) = list(self.tdir.glob("*-discuss-*.json"))
+            data = json.loads(t.read_text())
+            self.assertEqual(data["mode"], "discuss")
+            self.assertEqual(data["round"], 2)
+            self.assertEqual(data["brief"], "the original question")
+            self.assertEqual([x["alias"] for x in data["discussion"]], ["A", "B"])
+            self.assertEqual([x["answer"] for x in data["results"]],
+                             ["speaker_a spoke 2", "speaker_b spoke 2"])
+            self.assertNotIn("partial", data)
+
+    def test_second_pass_rotates_the_opener(self):
+        with StubServer() as s:
+            r = self._run(s.url, "--discuss", str(self._prior()), "--discuss-rounds", "2")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual([q["model"] for q in s.srv.requests],
+                             ["speaker_a", "speaker_b",    # pass 1
+                              "speaker_b", "speaker_a",    # pass 2, rotated
+                              "speaker_a", "speaker_b"])   # closings, roster order
+
+    def test_cold_start_takes_the_brief_and_is_round_one(self):
+        with StubServer() as s:
+            r = self._run(s.url, "--discuss", "new", "--discuss-rounds", "1", "-",
+                          brief="a cold question\n")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            first = s.srv.requests[0]["messages"][-1]["content"]
+            self.assertIn("a cold question", first)
+            self.assertIn("(none -- this discussion starts cold)", first)
+            (t,) = list(self.tdir.glob("*-discuss-*.json"))
+            data = json.loads(t.read_text())
+            self.assertEqual(data["round"], 1)
+            self.assertEqual(data["parent"], [])
+            self.assertEqual(data["brief"], "a cold question\n")
+
+    def test_a_discussion_transcript_seeds_revise(self):
+        with StubServer() as s:
+            r = self._run(s.url, "--discuss", str(self._prior()), "--discuss-rounds", "1")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            r = self._run(s.url, "--each", "--revise", "latest", "--no-transcript")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("ROUND 3", r.stdout)
+
+    def test_refuses_each_panel_and_revise(self):
+        p = self._prior()
+        for extra in (["--each"], ["--panel"], ["--revise", str(p)]):
+            r = self._run("http://127.0.0.1:9/v1", "--discuss", str(p), *extra)
+            self.assertEqual(r.returncode, 1, extra)
+            self.assertNotIn("Traceback", r.stderr)
+        r = self._run("http://127.0.0.1:9/v1", "--discuss", str(p), "--discuss-rounds", "0")
+        self.assertIn("positive integer", r.stderr)
+        r = self._run("http://127.0.0.1:9/v1", "--lanes", "A", "--discuss", str(p))
+        self.assertIn("at least two lanes", r.stderr)
+
+    def test_helpers(self):
+        prior = {"brief": "q", "results": [
+            {"lane": "A", "answer": "yes"}, {"lane": "C", "answer": "no"}]}
+        lanes = [{"name": "A"}, {"name": "B"}, {"name": "C"}]
+        self.assertEqual(rt.discussion_aliases(lanes, prior), {"A": "A", "C": "B", "B": "C"})
+        self.assertEqual(rt.discussion_aliases(lanes, None), {"A": "A", "B": "B", "C": "C"})
+        thread = [{"turn": 1, "alias": "A", "answer": "first"},
+                  {"turn": 2, "alias": "B", "answer": None, "error": "boom"}]
+        rendered = rt.render_thread(thread)
+        self.assertIn("PANELIST A (turn 1):\nfirst", rendered)
+        self.assertNotIn("boom", rendered)          # a failed turn is not read aloud
 
 
 if __name__ == "__main__":
