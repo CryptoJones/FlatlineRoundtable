@@ -156,6 +156,12 @@ lanes:
     model: some-model
     timeout: 180
     # protocol_version: 1
+    # Session tunables the agent only exposes through session/set_config_option
+    # (thought level, mode, model). Applied after session/new, before the
+    # prompt. Keys and values are whatever the agent's session/new reply lists
+    # under configOptions; a rejected or unhonoured value fails the lane loudly.
+    # config_options:
+    #   thought_level: none
     personality: |
       You are the protocol lane.
 
