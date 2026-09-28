@@ -201,6 +201,8 @@ is another full panel spend, and the returns fall fast.
 
 ### `--discuss` — the shared-context discussion
 
+(`--converse` is an alias; the two are the same flag.)
+
 `--revise` shows every lane the others' answers once. `--discuss` lets them
 talk. The panel shares **one** context — the brief, the anonymised opening
 positions, and every turn said so far, in order — and takes turns in it, one

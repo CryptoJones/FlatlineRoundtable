@@ -210,7 +210,10 @@ epistemic claim, and a round-2 consensus is persuasion, not convergence. Report
 round-2 agreement to the user as "the panel converged after debate", never as
 "N independent models agree".
 
-## The discussion — `--discuss`
+## The discussion — `--discuss` (alias `--converse`)
+
+`--converse` is the same flag by the name CJ uses for it — "run the converse
+pass" means `--discuss`. There is no separate converse mode.
 
 `roundtable --discuss latest:N` (N = the prior blind run's lane count) puts the
 panel in ONE shared context — brief, anonymised openings, every turn said so

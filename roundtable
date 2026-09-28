@@ -35,6 +35,7 @@ Usage:
                                            then each closes with HOLD or REVISE
     roundtable --discuss latest:12 --discuss-rounds 3 "focus on the cost claims"
     cat brief.md | roundtable --discuss new -   start cold, no blind round
+    roundtable --converse latest:12        the same flag, by its other name
 
   * Round 1 is blind by construction — a lane cannot see the others because
     their answers do not exist yet in its process. `--revise` and `--discuss`
@@ -1664,7 +1665,10 @@ def main() -> int:
     ap.add_argument("--no-transcript", action="store_true")
     ap.add_argument("--diff", action="store_true")
     ap.add_argument("--revise", metavar="TRANSCRIPT")
-    ap.add_argument("--discuss", metavar="TRANSCRIPT|new",
+    # --converse is the same flag under the name CJ uses for it; argparse
+    # binds both spellings to `discuss`, so nothing downstream knows which
+    # one was typed.
+    ap.add_argument("--discuss", "--converse", dest="discuss", metavar="TRANSCRIPT|new",
                     help="shared-context discussion, one lane speaking at a time: "
                          "seeded from a blind round's transcript(s), or `new` to "
                          "start cold from the brief")
