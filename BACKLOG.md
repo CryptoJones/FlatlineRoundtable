@@ -58,11 +58,11 @@ and vice versa.
       (`read_file` / `grep` / `list_dir` / `git`) for grounded reviews; lane settings
       table and operating rules in `skill/SKILL.md`
       ([#96](https://github.com/CryptoJones/FlatlineRoundtable/issues/96)) — shipped in PR #97
-- [ ] `--discuss`: a fact first introduced mid-thread propagates unverified — a
+- [x] `--discuss`: a fact first introduced mid-thread propagates unverified — a
       fabricated "24h expiry" was cited as evidence by the next three turns; both
       prompts now call an unsourced mid-thread fact a claim, and the skill tells the
       reader to check it against the code
-      ([#98](https://github.com/CryptoJones/FlatlineRoundtable/issues/98)) — on fix/discuss-unverified-facts
+      ([#98](https://github.com/CryptoJones/FlatlineRoundtable/issues/98)) — shipped in PR #99
 - [ ] Give a round an identity (`run_id`) so `--revise latest-run` is robust —
       replaces the fragile `latest:N` file-count heuristic with a real "round"
       ([#80](https://github.com/CryptoJones/FlatlineRoundtable/issues/80))
