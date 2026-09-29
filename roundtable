@@ -37,6 +37,13 @@ Usage:
     cat brief.md | roundtable --discuss new -   start cold, no blind round
     roundtable --converse latest:12        the same flag, by its other name
 
+Store (#105; runs do not read it yet -- YAML stays authoritative until #109):
+    roundtable db init | migrate | doctor  [--config DB]
+    roundtable secrets set NAME [--stdin]  value from stdin or a no-echo prompt,
+                                           never argv
+    roundtable secrets check [NAME...] | list | rotate NAME | rm NAME [--force]
+    roundtable secrets rekey
+
   * Round 1 is blind by construction — a lane cannot see the others because
     their answers do not exist yet in its process. `--revise` and `--discuss`
     are the only paths to cross-lane visibility: both replay a *finished* run's
@@ -50,11 +57,15 @@ import argparse
 import concurrent.futures as cf
 import datetime as dt
 import email.utils
+import getpass
+import hashlib
 import json
 import os
 import re
 import shutil
 import signal
+import socket
+import sqlite3
 import subprocess
 import tempfile
 import sys
@@ -471,6 +482,608 @@ def fetch_keys(lanes: list[dict]) -> dict[str, str]:
             die(f"pass entry {entry!r} is empty")
         keys[entry] = first
     return keys
+
+# --------------------------------------------------------------------------- #
+# store (#105)
+#
+# One SQLite file per host that will hold the lane roster, the lane secrets and
+# (later) metrics. In this PR it holds secrets only and nothing on the run path
+# reads it: load_config() / fetch_keys() still go to YAML and `pass` until #109.
+#
+# Encryption is column-level: secrets.ciphertext is AES-256-GCM, everything else
+# is plain SQLite so `sqlite3` can still query it. SQLCipher was rejected -- it
+# needs a compiled binding on every host and in CI, and its key would live in
+# `pass` anyway (epic #105, decision 7).
+# --------------------------------------------------------------------------- #
+DATA_DIR = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share") / "flatline-roundtable"
+DEFAULT_DB = DATA_DIR / "roundtable.db"
+DB_KEY_ENTRY = "flatline-roundtable/db-key"
+# Tests and CI have no gpg-agent. This names a FILE holding the key, never the
+# key itself: an env var carrying the value would leak into every child process
+# and every `ps e`.
+DB_KEY_FILE_ENV = "ROUNDTABLE_DB_KEY_FILE"
+KCV_PLAINTEXT = b"flatline-roundtable-kcv"
+SECRET_NAME_RE = re.compile(r"^[A-Za-z0-9._@+/-]+$")
+
+# Migration N takes user_version N-1 to N. Append, never edit a shipped one: a
+# host that already ran it will not run it again.
+#
+# SQLite 3.34 is the floor (pluto), so no STRICT, RETURNING or DROP COLUMN.
+#
+# lanes.key_entry deliberately has no REFERENCES secrets(name). A lane can be
+# imported before its secret is set -- `db doctor` reports that case -- and a
+# foreign key would refuse the lane instead. `secrets rm` checks references
+# itself.
+MIGRATIONS = [
+    """
+    CREATE TABLE meta (key TEXT PRIMARY KEY, value BLOB);
+    CREATE TABLE globals (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL);
+    CREATE TABLE defaults (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL);
+    CREATE TABLE secrets (
+        name TEXT PRIMARY KEY,
+        ciphertext BLOB NOT NULL,
+        nonce BLOB NOT NULL,
+        key_id TEXT NOT NULL,
+        vendor TEXT,
+        notes TEXT,
+        created_at TEXT NOT NULL,
+        rotated_at TEXT,
+        last_used_at TEXT
+    );
+    CREATE TABLE lanes (
+        lane_id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        active INTEGER NOT NULL DEFAULT 1,
+        retired_at TEXT,
+        notes TEXT,
+        key_entry TEXT,
+        config TEXT NOT NULL DEFAULT '{}',
+        harness TEXT GENERATED ALWAYS AS (json_extract(config, '$.harness')) VIRTUAL,
+        vendor TEXT GENERATED ALWAYS AS (json_extract(config, '$.vendor')) VIRTUAL,
+        model TEXT GENERATED ALWAYS AS (json_extract(config, '$.model')) VIRTUAL,
+        version INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
+    CREATE UNIQUE INDEX lanes_live_name ON lanes(lower(name)) WHERE retired_at IS NULL;
+    CREATE TABLE lane_versions (
+        id INTEGER PRIMARY KEY,
+        lane_id TEXT NOT NULL REFERENCES lanes(lane_id),
+        version INTEGER NOT NULL,
+        config TEXT NOT NULL,
+        config_sha256 TEXT NOT NULL,
+        key_entry TEXT,
+        changed_at TEXT NOT NULL,
+        changed_by TEXT,
+        reason TEXT,
+        UNIQUE (lane_id, version)
+    );
+    CREATE TABLE lane_aliases (
+        old_name TEXT PRIMARY KEY,
+        lane_id TEXT NOT NULL REFERENCES lanes(lane_id),
+        renamed_at TEXT NOT NULL
+    );
+    """,
+]
+SCHEMA_VERSION = len(MIGRATIONS)
+
+
+def _now() -> str:
+    return dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+
+
+def _aesgcm():
+    # Imported here, not at the top: nothing on the run path needs it until #109,
+    # and a host without it must still be able to run a panel.
+    try:
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    except ImportError:
+        die("the store needs the `cryptography` package — pip install cryptography")
+    return AESGCM
+
+
+def key_id(key: bytes) -> str:
+    """A public fingerprint of the DB key: safe to print, store and compare."""
+    return hashlib.sha256(key).hexdigest()[:16]
+
+
+def _secret_aad(name: str, kid: str) -> bytes:
+    # Binding the name means a ciphertext copied onto another row fails to
+    # decrypt rather than handing lane B lane A's key. Binding the key id means
+    # a row that missed a rekey fails loudly instead of decrypting as garbage.
+    return f"secret\0{name}\0{kid}".encode()
+
+
+def _kcv_aad(kid: str) -> bytes:
+    return f"kcv\0{kid}".encode()
+
+
+def _check_private(path: Path, what: str) -> None:
+    mode = path.stat().st_mode & 0o777
+    if mode & 0o077:
+        die(f"{what} {path} is mode {mode:04o}; it must be 0600 — chmod 600 {path}")
+
+
+def _parse_key(text: str, where: str) -> bytes:
+    raw = text.strip().splitlines()[0].strip() if text.strip() else ""
+    try:
+        key = bytes.fromhex(raw)
+    except ValueError:
+        key = b""
+    if len(key) != 32:
+        die(f"{where} does not hold a DB key (expected 64 hex characters)")
+    return key
+
+
+def _pass_store_dir() -> Path:
+    return Path(os.environ.get("PASSWORD_STORE_DIR") or Path.home() / ".password-store")
+
+
+def _pass_show(entry: str) -> str | None:
+    """First-line-safe `pass show`; None when the entry is absent or pass is."""
+    if not shutil.which("pass"):
+        return None
+    try:
+        p = subprocess.run(["pass", "show", entry], capture_output=True, text=True, timeout=30)
+    except subprocess.TimeoutExpired:
+        die(f"`pass show {entry}` timed out — is gpg-agent waiting on a passphrase?")
+    return p.stdout if p.returncode == 0 else None
+
+
+def load_db_key() -> bytes:
+    """The DB key: $ROUNDTABLE_DB_KEY_FILE, else `pass`, else die.
+
+    One `pass show` per process -- the same reason fetch_keys() resolves before
+    fan-out -- and never an interactive passphrase, which would hang a
+    non-tty `--each` child.
+    """
+    kf = os.environ.get(DB_KEY_FILE_ENV)
+    if kf:
+        path = Path(kf)
+        if not path.exists():
+            die(f"${DB_KEY_FILE_ENV} names {path}, which does not exist")
+        _check_private(path, "DB key file")
+        return _parse_key(path.read_text(), str(path))
+    out = _pass_show(DB_KEY_ENTRY)
+    if out is None:
+        if not shutil.which("pass"):
+            die(f"no DB key: `pass` is not installed and ${DB_KEY_FILE_ENV} is unset")
+        die(f"no DB key in pass entry {DB_KEY_ENTRY!r}\n"
+            f"  create the store (and its key) with:  roundtable db init")
+    return _parse_key(out, f"pass entry {DB_KEY_ENTRY!r}")
+
+
+def store_db_key(key: bytes, entry: str = DB_KEY_ENTRY) -> None:
+    """Write a key where load_db_key() will find it. The value goes on stdin,
+    never argv."""
+    kf = os.environ.get(DB_KEY_FILE_ENV)
+    if kf:
+        path = Path(kf + entry[len(DB_KEY_ENTRY):])   # `.prev` rides along as a suffix
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(key.hex() + "\n")
+        os.chmod(path, 0o600)
+        return
+    if not shutil.which("pass"):
+        die(f"cannot store the DB key: `pass` is not installed and ${DB_KEY_FILE_ENV} is unset")
+    p = subprocess.run(["pass", "insert", "-m", "-f", entry], input=key.hex() + "\n",
+                       capture_output=True, text=True, timeout=60)
+    if p.returncode != 0:
+        die(f"`pass insert {entry}` failed: {p.stderr.strip() or p.returncode}")
+
+
+def open_db(path: Path, create: bool = False) -> sqlite3.Connection:
+    """Open the store with the settings every caller relies on.
+
+    WAL + busy_timeout is what lets `--each -j N` children share one file: a
+    reader never blocks a writer, and a writer waits rather than failing.
+    """
+    if not path.exists():
+        if not create:
+            die(f"no store at {path}\n  create it with:  roundtable db init")
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        # Create the file 0600 before SQLite touches it. SQLite gives -wal and
+        # -shm the database file's mode, so this one call covers all three.
+        os.close(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
+    _check_private(path, "store")
+    conn = sqlite3.connect(path, isolation_level=None)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA busy_timeout=30000")
+    return conn
+
+
+def schema_version(conn: sqlite3.Connection) -> int:
+    return conn.execute("PRAGMA user_version").fetchone()[0]
+
+
+def migrate(conn: sqlite3.Connection) -> tuple[int, int]:
+    """Apply pending migrations, each in its own transaction. Idempotent, also
+    against a concurrent migrator: the version is read under the write lock,
+    so a caller that waited on another one's migration skips it rather than
+    re-running CREATE TABLE."""
+    before = None
+    while True:
+        conn.execute("BEGIN IMMEDIATE")
+        n = schema_version(conn)
+        if before is None:
+            before = n       # as seen under the lock, so the report is honest too
+        if n > SCHEMA_VERSION:
+            conn.execute("ROLLBACK")
+            die(f"store is at schema {n}, newer than this roundtable ({SCHEMA_VERSION}) — "
+                f"update roundtable before touching it")
+        if n == SCHEMA_VERSION:
+            conn.execute("COMMIT")
+            break
+        try:
+            # Not executescript(): it COMMITs first, which would split a
+            # migration across transactions.
+            for stmt in (s.strip() for s in MIGRATIONS[n].split(";")):
+                if stmt:
+                    conn.execute(stmt)
+            conn.execute(f"PRAGMA user_version = {n + 1}")
+            conn.execute("COMMIT")
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
+    return before, schema_version(conn)
+
+
+def _meta(conn: sqlite3.Connection, key: str):
+    row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+    return row[0] if row else None
+
+
+def _write_kcv(conn: sqlite3.Connection, key: bytes) -> None:
+    kid = key_id(key)
+    nonce = os.urandom(12)
+    ct = _aesgcm()(key).encrypt(nonce, KCV_PLAINTEXT, _kcv_aad(kid))
+    conn.executemany("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
+                     [("key_id", kid), ("kcv", ct), ("kcv_nonce", nonce)])
+
+
+def verify_db_key(conn: sqlite3.Connection, key: bytes) -> None:
+    """Die unless `key` is the one this store was written with.
+
+    Runs before any secret row is read, so a wrong key produces one clear
+    message instead of N authentication failures that look like corruption.
+    """
+    want = _meta(conn, "key_id")
+    if want is None:
+        die("store has no key-check value — was it created with `roundtable db init`?")
+    have = key_id(key)
+    if have != want:
+        die(f"DB key (id {have}) does not unlock this store (id {want})")
+    from cryptography.exceptions import InvalidTag
+    try:
+        pt = _aesgcm()(key).decrypt(_meta(conn, "kcv_nonce"), _meta(conn, "kcv"), _kcv_aad(want))
+    except InvalidTag:
+        pt = None
+    if pt != KCV_PLAINTEXT:
+        die(f"DB key id {have} matches, but the key-check value does not decrypt — "
+            f"the store's meta table is damaged")
+
+
+def open_store(path: Path) -> tuple[sqlite3.Connection, bytes]:
+    """An initialised, migrated store plus its verified key."""
+    conn = open_db(path)
+    if schema_version(conn) < SCHEMA_VERSION:
+        die(f"store is at schema {schema_version(conn)}, this roundtable needs "
+            f"{SCHEMA_VERSION} — run:  roundtable db migrate")
+    key = load_db_key()
+    verify_db_key(conn, key)
+    return conn, key
+
+
+def encrypt_secret(key: bytes, name: str, value: str) -> tuple[bytes, bytes, str]:
+    kid = key_id(key)
+    nonce = os.urandom(12)
+    return _aesgcm()(key).encrypt(nonce, value.encode(), _secret_aad(name, kid)), nonce, kid
+
+
+def decrypt_secret(key: bytes, name: str, ciphertext: bytes, nonce: bytes, kid: str) -> str:
+    return _aesgcm()(key).decrypt(nonce, ciphertext, _secret_aad(name, kid)).decode()
+
+
+def _read_secret_value(name: str, use_stdin: bool) -> str:
+    if use_stdin:
+        data = sys.stdin.read()
+    else:
+        data = getpass.getpass(f"value for {name} (not echoed): ")
+    # Same rule as fetch_keys(): the secret is the first line. That makes
+    # `pass show X | roundtable secrets set X --stdin` do the right thing.
+    value = data.splitlines()[0].strip() if data.strip() else ""
+    if not value:
+        die(f"empty value for {name} — nothing stored")
+    return value
+
+
+def _referencing_lanes(conn: sqlite3.Connection, name: str) -> list[str]:
+    return [r[0] for r in conn.execute(
+        "SELECT name FROM lanes WHERE key_entry = ? AND retired_at IS NULL ORDER BY name",
+        (name,))]
+
+
+# --------------------------------------------------------------------------- #
+# store admin commands
+# --------------------------------------------------------------------------- #
+ADMIN_VERBS = {
+    "db": ("init", "migrate", "doctor"),
+    "secrets": ("set", "check", "list", "rotate", "rm", "rekey"),
+}
+
+
+def is_admin_argv(argv: list[str]) -> bool:
+    """True when argv is a store command rather than a brief.
+
+    The brief is positional and free text, so `roundtable "db is slow"` must
+    stay a brief. Only a known group followed by nothing, a known verb or a
+    flag counts.
+    """
+    if not argv or argv[0] not in ADMIN_VERBS:
+        return False
+    return len(argv) == 1 or argv[1] in ADMIN_VERBS[argv[0]] or argv[1].startswith("-")
+
+
+def cmd_db_init(a) -> int:
+    _aesgcm()   # before a key is created, not after
+    path = a.config
+    if path.exists() and schema_version(open_db(path)) > 0:
+        die(f"{path} is already a store — `roundtable db doctor` checks it")
+    kf = os.environ.get(DB_KEY_FILE_ENV)
+    if kf and not Path(kf).exists():
+        key = os.urandom(32)
+        store_db_key(key)
+        print(f"DB key created in {kf}")
+    elif kf:
+        key = load_db_key()
+        print(f"DB key reused from {kf}")
+    elif _pass_show(DB_KEY_ENTRY) is not None:
+        # A second host, or a re-init after deleting the file: keep the key so a
+        # `db import` from another host's export can be read here.
+        key = load_db_key()
+        print(f"DB key reused from pass entry {DB_KEY_ENTRY}")
+    else:
+        # `pass insert -f` overwrites. If the entry file exists but `pass show`
+        # failed, that is a gpg-agent problem, not an absent key -- overwriting
+        # would destroy the only key to an existing store.
+        if (_pass_store_dir() / f"{DB_KEY_ENTRY}.gpg").exists():
+            die(f"pass entry {DB_KEY_ENTRY} exists but could not be read — "
+                f"unlock gpg-agent and retry; refusing to overwrite it")
+        key = os.urandom(32)
+        store_db_key(key)
+        print(f"DB key created in pass entry {DB_KEY_ENTRY}")
+    conn = open_db(path, create=True)
+    migrate(conn)
+    conn.execute("BEGIN IMMEDIATE")
+    _write_kcv(conn, key)
+    conn.executemany("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
+                     [("host_id", socket.gethostname()), ("created_at", _now())])
+    conn.execute("COMMIT")
+    print(f"store created at {path} (schema {SCHEMA_VERSION}, key id {key_id(key)})")
+    return 0
+
+
+def cmd_db_migrate(a) -> int:
+    before, after = migrate(open_db(a.config))
+    if before == after:
+        print(f"schema {after} — already current")
+    else:
+        print(f"schema {before} -> {after}")
+    return 0
+
+
+def cmd_db_doctor(a) -> int:
+    path = a.config
+    conn = open_db(path)
+    problems = 0
+    mode = path.stat().st_mode & 0o777
+    ver = schema_version(conn)
+    print(f"store      {path}")
+    print(f"mode       {mode:04o}")
+    print(f"schema     {ver} (this roundtable: {SCHEMA_VERSION})")
+    if ver != SCHEMA_VERSION:
+        problems += 1
+    integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
+    print(f"integrity  {integrity}")
+    if integrity != "ok":
+        problems += 1
+    if ver < 1:
+        return 1
+    want = _meta(conn, "key_id")
+    try:
+        key = load_db_key()
+    except SystemExit as e:
+        print(f"key        store id {want}; key unavailable: {e}")
+        return 1
+    have = key_id(key)
+    if have == want:
+        verify_db_key(conn, key)
+        print(f"key        id {have} — unlocks this store")
+    else:
+        print(f"key        id {have} does NOT unlock this store (id {want})")
+        problems += 1
+    n = conn.execute("SELECT count(*) FROM secrets").fetchone()[0]
+    print(f"secrets    {n}")
+    orphans = conn.execute(
+        "SELECT l.name, l.key_entry FROM lanes l LEFT JOIN secrets s ON s.name = l.key_entry "
+        "WHERE l.key_entry IS NOT NULL AND l.retired_at IS NULL AND s.name IS NULL "
+        "ORDER BY l.name").fetchall()
+    for lane, entry in orphans:
+        print(f"MISSING    lane {lane} names secret {entry!r}, which is not in the store")
+    problems += len(orphans)
+    return 1 if problems else 0
+
+
+def cmd_secrets_set(a) -> int:
+    if a.value:
+        die("refusing a secret value on the command line — argv is readable by any\n"
+            "  local user via `ps` and lands in shell history. Use --stdin, or omit\n"
+            "  the value to be prompted without echo.")
+    if not SECRET_NAME_RE.match(a.name):
+        die(f"secret name {a.name!r} may use only letters, digits and . _ @ + / -")
+    conn, key = open_store(a.config)
+    if conn.execute("SELECT 1 FROM secrets WHERE name = ?", (a.name,)).fetchone():
+        die(f"secret {a.name!r} already exists — use:  roundtable secrets rotate {a.name}")
+    ct, nonce, kid = encrypt_secret(key, a.name, _read_secret_value(a.name, a.stdin))
+    conn.execute(
+        "INSERT INTO secrets (name, ciphertext, nonce, key_id, vendor, notes, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)", (a.name, ct, nonce, kid, a.vendor, a.notes, _now()))
+    print(f"stored {a.name} (key id {kid})")
+    return 0
+
+
+def cmd_secrets_rotate(a) -> int:
+    conn, key = open_store(a.config)
+    if not conn.execute("SELECT 1 FROM secrets WHERE name = ?", (a.name,)).fetchone():
+        die(f"no secret {a.name!r} — create it with:  roundtable secrets set {a.name}")
+    ct, nonce, kid = encrypt_secret(key, a.name, _read_secret_value(a.name, a.stdin))
+    conn.execute("UPDATE secrets SET ciphertext = ?, nonce = ?, key_id = ?, rotated_at = ? "
+                 "WHERE name = ?", (ct, nonce, kid, _now(), a.name))
+    print(f"rotated {a.name} (key id {kid})")
+    return 0
+
+
+def cmd_secrets_check(a) -> int:
+    from cryptography.exceptions import InvalidTag
+    conn, key = open_store(a.config)
+    names = a.names or sorted(
+        {r[0] for r in conn.execute("SELECT name FROM secrets")}
+        | {r[0] for r in conn.execute(
+            "SELECT key_entry FROM lanes WHERE key_entry IS NOT NULL AND retired_at IS NULL")})
+    bad = 0
+    for name in names:
+        row = conn.execute("SELECT ciphertext, nonce, key_id FROM secrets WHERE name = ?",
+                           (name,)).fetchone()
+        if row is None:
+            print(f"{name}\tMISSING")
+            bad += 1
+            continue
+        try:
+            # The length is the only property of the value ever printed: enough
+            # to spot a truncated paste, useless to anyone reading the terminal.
+            n = len(decrypt_secret(key, name, *row))
+        except InvalidTag:
+            print(f"{name}\tCORRUPT\tkey id {row[2]}")
+            bad += 1
+            continue
+        print(f"{name}\tpresent\t{n} chars\tkey id {row[2]}")
+    return 1 if bad else 0
+
+
+def cmd_secrets_list(a) -> int:
+    conn = open_db(a.config)
+    rows = conn.execute(
+        "SELECT s.name, s.vendor, s.created_at, s.rotated_at, s.key_id, "
+        "(SELECT count(*) FROM lanes l WHERE l.key_entry = s.name AND l.retired_at IS NULL) "
+        "FROM secrets s ORDER BY s.name").fetchall()
+    if not rows:
+        print("no secrets stored")
+    for name, vendor, created, rotated, kid, used in rows:
+        print(f"{name}\tvendor={vendor or '-'}\tcreated={created}\t"
+              f"rotated={rotated or '-'}\tkey id {kid}\tlanes={used}")
+    return 0
+
+
+def cmd_secrets_rm(a) -> int:
+    conn = open_db(a.config)
+    if not conn.execute("SELECT 1 FROM secrets WHERE name = ?", (a.name,)).fetchone():
+        die(f"no secret {a.name!r}")
+    users = _referencing_lanes(conn, a.name)
+    if users and not a.force:
+        die(f"secret {a.name!r} is used by {', '.join(users)} — those lanes would fail\n"
+            f"  at run time. Point them elsewhere first, or pass --force.")
+    conn.execute("DELETE FROM secrets WHERE name = ?", (a.name,))
+    print(f"removed {a.name}")
+    return 0
+
+
+def cmd_secrets_rekey(a) -> int:
+    """Re-encrypt every secret under a fresh key.
+
+    Order matters, because the failure worth fearing is a store whose key is
+    nowhere: the old key is stashed as `<entry>.prev` first, the rows are
+    re-encrypted inside an open transaction, the new key is written, and only
+    then does the transaction commit. If the key write fails the transaction
+    rolls back; if the commit fails the old key is put back.
+    """
+    conn, old = open_store(a.config)
+    new = os.urandom(32)
+    store_db_key(old, DB_KEY_ENTRY + ".prev")
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        rows = conn.execute("SELECT name, ciphertext, nonce, key_id FROM secrets").fetchall()
+        for name, ct, nonce, kid in rows:
+            value = decrypt_secret(old, name, ct, nonce, kid)
+            conn.execute("UPDATE secrets SET ciphertext = ?, nonce = ?, key_id = ? WHERE name = ?",
+                         (*encrypt_secret(new, name, value), name))
+        _write_kcv(conn, new)
+        store_db_key(new)
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
+    try:
+        conn.execute("COMMIT")
+    except BaseException:
+        store_db_key(old)
+        raise
+    print(f"rekeyed {len(rows)} secret(s): key id {key_id(old)} -> {key_id(new)}\n"
+          f"  the old key is kept as {DB_KEY_ENTRY}.prev until you remove it")
+    return 0
+
+
+def admin_main(argv: list[str]) -> int:
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--config", type=Path, default=DEFAULT_DB,
+                        help=f"the store (default {DEFAULT_DB})")
+    ap = argparse.ArgumentParser(prog="roundtable", description="store administration")
+    groups = ap.add_subparsers(dest="group", required=True)
+
+    db = groups.add_parser("db", help="create, migrate and check the store")
+    dbv = db.add_subparsers(dest="verb", required=True)
+    dbv.add_parser("init", parents=[common], help="create the store and its DB key") \
+        .set_defaults(fn=cmd_db_init)
+    dbv.add_parser("migrate", parents=[common], help="apply pending schema migrations") \
+        .set_defaults(fn=cmd_db_migrate)
+    dbv.add_parser("doctor", parents=[common], help="check mode, schema, integrity and key") \
+        .set_defaults(fn=cmd_db_doctor)
+
+    sec = groups.add_parser("secrets", help="lane secrets, encrypted in the store")
+    sv = sec.add_subparsers(dest="verb", required=True)
+    p = sv.add_parser("set", parents=[common], help="store a new secret (stdin or prompt)")
+    p.add_argument("name")
+    # Captured only so it can be refused with a reason, rather than argparse's
+    # "unrecognized arguments" -- which reads like a typo, not a policy.
+    p.add_argument("value", nargs="*", help=argparse.SUPPRESS)
+    p.add_argument("--stdin", action="store_true", help="read the value from stdin")
+    p.add_argument("--vendor")
+    p.add_argument("--notes")
+    p.set_defaults(fn=cmd_secrets_set)
+    p = sv.add_parser("check", parents=[common], help="present/MISSING, length, key id")
+    p.add_argument("names", nargs="*")
+    p.set_defaults(fn=cmd_secrets_check)
+    sv.add_parser("list", parents=[common], help="names and metadata, never values") \
+        .set_defaults(fn=cmd_secrets_list)
+    p = sv.add_parser("rotate", parents=[common], help="replace a secret's value")
+    p.add_argument("name")
+    p.add_argument("--stdin", action="store_true")
+    p.set_defaults(fn=cmd_secrets_rotate)
+    p = sv.add_parser("rm", parents=[common], help="delete a secret")
+    p.add_argument("name")
+    p.add_argument("--force", action="store_true", help="even if a lane uses it")
+    p.set_defaults(fn=cmd_secrets_rm)
+    sv.add_parser("rekey", parents=[common], help="re-encrypt every secret under a new DB key") \
+        .set_defaults(fn=cmd_secrets_rekey)
+
+    a = ap.parse_args(argv)
+    # Checked before any verb runs: `db init` would otherwise create a DB key
+    # before discovering it was pointed at the wrong file.
+    if a.config.suffix.lower() in (".yaml", ".yml"):
+        die(f"{a.config} is a YAML file; store commands take the database path.\n"
+            f"  (YAML still drives runs until #109 — these commands only touch the store.)")
+    return a.fn(a)
+
 
 
 class Pacer:
@@ -1662,6 +2275,11 @@ def run_discussion(lanes: list[dict], brief: str, prior: dict | None,
 
 
 def main() -> int:
+    # Store commands (`db ...`, `secrets ...`) get their own parser. This must
+    # run before argparse sees argv: the brief is free-text positional, so the
+    # guard decides, narrowly, which argv is a command and which is a question.
+    if is_admin_argv(sys.argv[1:]):
+        return admin_main(sys.argv[1:])
     ap = argparse.ArgumentParser(add_help=False)
     ap.add_argument("brief", nargs="*")
     ap.add_argument("--config", type=Path, default=DEFAULT_CONFIG)

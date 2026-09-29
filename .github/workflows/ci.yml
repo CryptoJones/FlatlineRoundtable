@@ -22,11 +22,12 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      # PyYAML is the tool's only dependency and it is deliberately the only one.
-      # If this line ever grows a second package, that is a signal the
-      # dependency budget was breached, not a routine change.
-      - name: Install PyYAML
-        run: python3 -m pip install --quiet pyyaml
+      # The dependency budget is one package, and for the length of epic #105 it
+      # is briefly two: `cryptography` backs the encrypted store (#107), and
+      # PyYAML leaves when runs read from the store (#109). If this line grows a
+      # third package, the budget was breached -- that is not a routine change.
+      - name: Install dependencies
+        run: python3 -m pip install --quiet pyyaml cryptography
 
       - name: Test suite
         run: python3 -m unittest discover -s tests -v
@@ -41,6 +42,15 @@ jobs:
           HTTP_PROXY=http://127.0.0.1:9 HTTPS_PROXY=http://127.0.0.1:9 \
           ALL_PROXY=http://127.0.0.1:9 \
           ./roundtable --config tests/fixtures/ci-config.yaml --list
+
+      # A throwaway key file stands in for `pass`, which the runner does not have.
+      - name: 'Store: db init, migrate twice, doctor'
+        run: |
+          export ROUNDTABLE_DB_KEY_FILE="$RUNNER_TEMP/db.key" XDG_DATA_HOME="$RUNNER_TEMP/data"
+          ./roundtable db init
+          ./roundtable db migrate
+          ./roundtable db migrate
+          ./roundtable db doctor
 
       - name: Shipped example config parses
         run: |

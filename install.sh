@@ -34,6 +34,12 @@ uninstall() {
 [[ -f "${SKILL_SRC}/SKILL.md" ]]  || die "Missing ${SKILL_SRC}/SKILL.md — repo is incomplete."
 [[ -x "${SCRIPT_DIR}/roundtable" ]] || die "Missing or non-executable ${SCRIPT_DIR}/roundtable."
 python3 -c 'import yaml' 2>/dev/null || die "PyYAML not installed — pip install pyyaml"
+# Only the store commands (`roundtable db ...`, `roundtable secrets ...`) need
+# this today; runs still read YAML until #109. So warn, don't fail.
+python3 -c 'import cryptography' 2>/dev/null || {
+    log "NOTE: \`cryptography\` not installed. Runs work without it; the encrypted"
+    log "      store (roundtable db init / secrets ...) does not. pip install cryptography"
+}
 
 # `pass` is how every key reaches a lane: config names an entry, never a value.
 # This is a warning rather than a hard failure because a roster of only `cli` /

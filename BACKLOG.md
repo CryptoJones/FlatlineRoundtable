@@ -14,9 +14,9 @@ and vice versa.
 ### Epic: encrypted SQLite is the authoritative store for lanes, secrets and (next) metrics — YAML retired ([#105](https://github.com/CryptoJones/FlatlineRoundtable/issues/105))
 
 - [x] Split config validation from YAML parsing; route scripts through
-      `rt.fetch_keys` ([#106](https://github.com/CryptoJones/FlatlineRoundtable/issues/106)) — on refactor/sqlite-store-split-validation
-- [ ] Encrypted store: `db init|migrate|doctor` and
-      `secrets set|check|list|rotate|rm|rekey` ([#107](https://github.com/CryptoJones/FlatlineRoundtable/issues/107))
+      `rt.fetch_keys` ([#106](https://github.com/CryptoJones/FlatlineRoundtable/issues/106)) — shipped in PR #113
+- [x] Encrypted store: `db init|migrate|doctor` and
+      `secrets set|check|list|rotate|rm|rekey` ([#107](https://github.com/CryptoJones/FlatlineRoundtable/issues/107)) — on feat/sqlite-store-encrypted-store
 - [ ] Lane config in the store: `lanes`, `defaults`, `globals`, `lane_versions`,
       `db export|import`, `import-yaml` ([#108](https://github.com/CryptoJones/FlatlineRoundtable/issues/108))
 - [ ] Run from the store: `load_config` reads the DB, `fetch_keys` reads secrets,
@@ -148,6 +148,13 @@ stub.
       golden fixtures; confirm by hand against a real transcript after a run.
 - [ ] `git check-ignore -v FlatlineRoundtable.yaml` confirms the real config
       cannot be committed; `git status --porcelain` is clean after a run. *(human)*
+- [ ] **Store secrets never in plaintext:** `secrets set X --stdin`, then the
+      `.db`, `-wal` and `-shm` bytes do not contain the value; a positional value
+      is refused; a different DB key dies on the key-check value.
+      *Automated:* `test_plaintext_is_absent_from_db_wal_and_shm`,
+      `test_a_positional_value_is_refused`,
+      `test_a_different_key_fails_on_the_key_check_value`. On a real host, also
+      `ps auxww` during `db init` shows no key (it goes to `pass insert` on stdin).
 - [ ] `./install.sh` then `./install.sh --uninstall` round-trips, and refuses to
       delete anything that is not a symlink. *(human — touches `$HOME`, no test)*
 

@@ -21,6 +21,7 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -1426,6 +1427,332 @@ class TestSecrets(unittest.TestCase):
 
     def test_lanes_without_keys_need_no_pass(self):
         self.assertEqual(rt.fetch_keys([{"name": "A", "harness": "cli"}]), {})
+
+
+class TestStore(unittest.TestCase):
+    """The encrypted store (#107): db init|migrate|doctor, secrets set|check|...
+
+    Every test runs the real entry point against a throwaway XDG_DATA_HOME and a
+    key file, so nothing here can touch a real store or a real `pass`.
+    """
+    SECRET = "sk-or-v1-PLAINTEXT-canary-0123456789"
+
+    def setUp(self):
+        self.d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.d, True)
+        self.key = self.d / "db.key"
+        self.db = self.d / "data" / "flatline-roundtable" / "roundtable.db"
+        self.env = {**os.environ, "HOME": str(self.d), "XDG_DATA_HOME": str(self.d / "data"),
+                    "XDG_CACHE_HOME": str(self.d / "cache"),
+                    "ROUNDTABLE_DB_KEY_FILE": str(self.key)}
+
+    def rt(self, *args, input=None, env=None):
+        return subprocess.run([sys.executable, str(ROOT / "roundtable"), *args],
+                              capture_output=True, text=True, timeout=60,
+                              input=input, env=env or self.env)
+
+    def init(self):
+        r = self.rt("db", "init")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return r
+
+    def test_init_then_migrate_twice_is_idempotent(self):
+        self.init()
+        conn = sqlite3.connect(self.db)
+        v1 = conn.execute("PRAGMA user_version").fetchone()[0]
+        conn.close()
+        for _ in range(2):
+            r = self.rt("db", "migrate")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("already current", r.stdout)
+        conn = sqlite3.connect(self.db)
+        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], v1)
+        self.assertEqual(v1, rt.SCHEMA_VERSION)
+
+    def test_concurrent_migrates_do_not_collide(self):
+        """`--each -j N` children and a hand-run `db migrate` can race. A
+        migrator must read the version under the write lock: one that read it
+        before waiting re-runs CREATE TABLE on an already-current store and dies
+        with a traceback.
+
+        Made deterministic by holding the lock on one connection while the
+        other starts, rather than hoping two processes interleave."""
+        self.db.parent.mkdir(parents=True, mode=0o700)
+        os.close(os.open(self.db, os.O_WRONLY | os.O_CREAT, 0o600))
+        holder = rt.open_db(self.db)
+        holder.execute("BEGIN IMMEDIATE")
+        errors = []
+
+        def racer():
+            try:
+                rt.migrate(rt.open_db(self.db))
+            except BaseException as e:   # noqa: BLE001 -- surfaced below
+                errors.append(e)
+
+        t = threading.Thread(target=racer)
+        t.start()
+        time.sleep(0.5)                  # racer is now parked on the lock
+        for stmt in (x.strip() for x in rt.MIGRATIONS[0].split(";")):
+            if stmt:
+                holder.execute(stmt)
+        holder.execute(f"PRAGMA user_version = {rt.SCHEMA_VERSION}")
+        holder.execute("COMMIT")
+        t.join(60)
+        self.assertEqual(errors, [])
+        self.assertEqual(rt.schema_version(holder), rt.SCHEMA_VERSION)
+
+    def test_store_and_key_file_are_private(self):
+        self.init()
+        self.assertEqual(self.db.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(self.db.parent.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(self.key.stat().st_mode & 0o777, 0o600)
+
+    def test_doctor_reports_version_integrity_key_and_mode(self):
+        r = self.init()
+        kid = re.search(r"key id ([0-9a-f]{16})", r.stdout).group(1)
+        r = self.rt("db", "doctor")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertRegex(r.stdout, rf"schema\s+{rt.SCHEMA_VERSION}")
+        self.assertRegex(r.stdout, r"integrity\s+ok")
+        self.assertRegex(r.stdout, r"mode\s+0600")
+        self.assertIn(f"id {kid} — unlocks this store", r.stdout)
+
+    def test_doctor_names_a_lane_whose_secret_is_missing(self):
+        self.init()
+        conn = sqlite3.connect(self.db)
+        conn.execute("INSERT INTO lanes (lane_id, name, key_entry, config, created_at, updated_at) "
+                     "VALUES ('u1', 'Skeptic', 'openrouter/skeptic', '{}', 'now', 'now')")
+        conn.commit()
+        conn.close()
+        r = self.rt("db", "doctor")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("Skeptic", r.stdout)
+        self.assertIn("openrouter/skeptic", r.stdout)
+
+    def test_set_then_check_reports_present_and_length(self):
+        self.init()
+        r = self.rt("secrets", "set", "or/x", "--stdin", input=self.SECRET + "\n")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = self.rt("secrets", "check", "or/x")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("present", r.stdout)
+        self.assertIn(f"{len(self.SECRET)} chars", r.stdout)
+        self.assertNotIn(self.SECRET, r.stdout + r.stderr)
+
+    def test_only_the_first_stdin_line_is_stored(self):
+        """Same rule as fetch_keys, so `pass show X | ... --stdin` is safe."""
+        self.init()
+        self.rt("secrets", "set", "or/x", "--stdin", input="abc\nurl: https://x.invalid\n")
+        r = self.rt("secrets", "check", "or/x")
+        self.assertIn("3 chars", r.stdout)
+
+    def test_plaintext_is_absent_from_db_wal_and_shm(self):
+        """The one property the encryption exists for, checked on the bytes.
+
+        A connection is held open across the write so the -wal and -shm files
+        still exist when they are read -- on last close SQLite checkpoints and
+        deletes them, which would make this test pass vacuously.
+        """
+        self.init()
+        holder = sqlite3.connect(self.db)
+        holder.execute("SELECT count(*) FROM secrets").fetchall()
+        self.addCleanup(holder.close)
+        r = self.rt("secrets", "set", "or/x", "--stdin", input=self.SECRET + "\n")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        files = [self.db, Path(f"{self.db}-wal"), Path(f"{self.db}-shm")]
+        for f in files:
+            self.assertTrue(f.exists(), f)
+            self.assertEqual(f.stat().st_mode & 0o777, 0o600, f)
+            self.assertNotIn(self.SECRET.encode(), f.read_bytes(), f)
+        # And the canary is really in there, encrypted: the check is not vacuous.
+        self.assertIn("present", self.rt("secrets", "check", "or/x").stdout)
+
+    def test_a_positional_value_is_refused(self):
+        self.init()
+        r = self.rt("secrets", "set", "or/x", self.SECRET)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("command line", r.stderr)
+        self.assertIn("--stdin", r.stderr)
+        self.assertNotIn("stored", r.stdout)
+
+    def test_a_different_key_fails_on_the_key_check_value(self):
+        self.init()
+        self.rt("secrets", "set", "or/x", "--stdin", input=self.SECRET + "\n")
+        other = self.d / "other.key"
+        other.write_text(os.urandom(32).hex() + "\n")
+        other.chmod(0o600)
+        r = self.rt("secrets", "check", env={**self.env, "ROUNDTABLE_DB_KEY_FILE": str(other)})
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("does not unlock this store", r.stderr)
+        # Died on the KCV, not on a per-row authentication failure.
+        self.assertNotIn("CORRUPT", r.stdout)
+
+    def test_verify_runs_before_any_secret_is_read(self):
+        """Unit-level: a wrong key must never reach a SELECT on secrets."""
+        self.init()
+        conn = rt.open_db(self.db)
+        seen = []
+        conn.set_trace_callback(seen.append)
+        with self.assertRaises(SystemExit):
+            rt.verify_db_key(conn, os.urandom(32))
+        self.assertFalse([s for s in seen if "secrets" in s], seen)
+
+    def test_a_world_readable_key_file_is_refused(self):
+        self.init()
+        self.key.chmod(0o644)
+        r = self.rt("secrets", "list")   # needs no key: list must still work
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = self.rt("secrets", "check")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("0600", r.stderr)
+
+    def test_set_refuses_to_overwrite_and_rotate_replaces(self):
+        self.init()
+        self.rt("secrets", "set", "or/x", "--stdin", input="one\n")
+        r = self.rt("secrets", "set", "or/x", "--stdin", input="twotwo\n")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("rotate", r.stderr)
+        r = self.rt("secrets", "rotate", "or/x", "--stdin", input="twotwo\n")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("6 chars", self.rt("secrets", "check", "or/x").stdout)
+        self.assertNotIn("rotated=-", self.rt("secrets", "list").stdout)
+
+    def test_check_reports_missing_and_fails(self):
+        self.init()
+        r = self.rt("secrets", "check", "nope")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("MISSING", r.stdout)
+
+    def test_rm_refuses_while_a_live_lane_uses_it(self):
+        self.init()
+        self.rt("secrets", "set", "or/x", "--stdin", input="v\n")
+        conn = sqlite3.connect(self.db)
+        conn.execute("INSERT INTO lanes (lane_id, name, key_entry, config, created_at, updated_at) "
+                     "VALUES ('u1', 'Skeptic', 'or/x', '{}', 'now', 'now')")
+        conn.commit()
+        conn.close()
+        r = self.rt("secrets", "rm", "or/x")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("Skeptic", r.stderr)
+        r = self.rt("secrets", "rm", "or/x", "--force")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("no secrets stored", self.rt("secrets", "list").stdout)
+
+    def test_rekey_keeps_every_value_and_retires_the_old_key(self):
+        self.init()
+        self.rt("secrets", "set", "a", "--stdin", input="aaaa\n")
+        self.rt("secrets", "set", "b", "--stdin", input="bbbbbbb\n")
+        old = self.key.read_text()
+        r = self.rt("secrets", "rekey")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotEqual(self.key.read_text(), old)
+        self.assertEqual(Path(f"{self.key}.prev").read_text(), old)
+        r = self.rt("secrets", "check")
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertIn("4 chars", r.stdout)
+        self.assertIn("7 chars", r.stdout)
+        r = self.rt("secrets", "check",
+                    env={**self.env, "ROUNDTABLE_DB_KEY_FILE": f"{self.key}.prev"})
+        self.assertIn("does not unlock", r.stderr)
+
+    def test_a_ciphertext_moved_to_another_row_does_not_decrypt(self):
+        """AAD binds the name: lane B must never receive lane A's key."""
+        self.init()
+        self.rt("secrets", "set", "a", "--stdin", input="aaaa\n")
+        self.rt("secrets", "set", "b", "--stdin", input="bbbb\n")
+        conn = sqlite3.connect(self.db)
+        ct, nonce = conn.execute("SELECT ciphertext, nonce FROM secrets WHERE name='a'").fetchone()
+        conn.execute("UPDATE secrets SET ciphertext=?, nonce=? WHERE name='b'", (ct, nonce))
+        conn.commit()
+        conn.close()
+        r = self.rt("secrets", "check", "b")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("CORRUPT", r.stdout)
+
+    def test_second_init_refuses(self):
+        self.init()
+        r = self.rt("db", "init")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("already a store", r.stderr)
+
+    def test_yaml_path_is_refused_before_a_key_is_made(self):
+        r = self.rt("db", "init", "--config", str(self.d / "c.yaml"))
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("YAML", r.stderr)
+        self.assertFalse(self.key.exists())
+
+    def test_commands_on_a_missing_store_point_at_init(self):
+        r = self.rt("secrets", "list")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("db init", r.stderr)
+
+    def _fake_pass(self):
+        """A `pass` that keeps plaintext files in $PASSWORD_STORE_DIR/<entry>.gpg."""
+        bin_ = self.d / "bin"
+        bin_.mkdir()
+        write_exe(bin_ / "pass", """\
+            store="${PASSWORD_STORE_DIR}"
+            case "$1" in
+              show) [ -f "$store/$2.gpg" ] && [ ! -f "$store/LOCKED" ] || exit 1
+                    cat "$store/$2.gpg" ;;
+              insert) entry="${@: -1}"; mkdir -p "$(dirname "$store/$entry.gpg")"
+                      echo "$@" >> "$store/argv.log"
+                      cat > "$store/$entry.gpg" ;;
+              *) exit 2 ;;
+            esac
+        """)
+        env = {k: v for k, v in self.env.items() if k != "ROUNDTABLE_DB_KEY_FILE"}
+        env["PASSWORD_STORE_DIR"] = str(self.d / "pw")
+        env["PATH"] = f"{bin_}{os.pathsep}{os.environ['PATH']}"
+        return env
+
+    def test_init_creates_the_pass_entry_via_stdin_not_argv(self):
+        env = self._fake_pass()
+        r = self.rt("db", "init", env=env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        stored = (self.d / "pw" / "flatline-roundtable" / "db-key.gpg").read_text().strip()
+        self.assertEqual(len(bytes.fromhex(stored)), 32)
+        argv_log = (self.d / "pw" / "argv.log").read_text()
+        self.assertIn("insert -m -f flatline-roundtable/db-key", argv_log)
+        self.assertNotIn(stored, argv_log)
+        r = self.rt("secrets", "set", "x", "--stdin", input="v\n", env=env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_init_never_overwrites_an_unreadable_pass_entry(self):
+        """`pass insert -f` over a locked-but-present key would orphan a store."""
+        env = self._fake_pass()
+        entry = self.d / "pw" / "flatline-roundtable" / "db-key.gpg"
+        entry.parent.mkdir(parents=True)
+        entry.write_text("precious\n")
+        (self.d / "pw" / "LOCKED").write_text("")
+        r = self.rt("db", "init", env=env)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("refusing to overwrite", r.stderr)
+        self.assertEqual(entry.read_text(), "precious\n")
+
+
+class TestAdminDispatch(unittest.TestCase):
+    """The brief is free text, so the command guard must be narrow."""
+
+    def test_briefs_that_start_with_a_group_word_stay_briefs(self):
+        for argv in (["lanes are slow"], ["db is slow"], ["db", "is", "slow"],
+                     ["secrets", "leak", "here?"], ["secrets are hard"], ["--list"], []):
+            self.assertFalse(rt.is_admin_argv(argv), argv)
+
+    def test_known_verbs_and_flags_dispatch(self):
+        for argv in (["db"], ["db", "init"], ["db", "doctor"], ["db", "-h"],
+                     ["secrets", "set", "x", "--stdin"], ["secrets", "rekey"]):
+            self.assertTrue(rt.is_admin_argv(argv), argv)
+
+    def test_lanes_are_slow_is_run_as_a_brief(self):
+        """End to end: it reaches the run path (and its config lookup)."""
+        d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d, True)
+        r = subprocess.run([sys.executable, str(ROOT / "roundtable"),
+                            "--config", str(d / "missing.yaml"), "lanes are slow"],
+                           capture_output=True, text=True, timeout=30)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("no config at", r.stderr)
 
 
 class TestPricing(unittest.TestCase):
