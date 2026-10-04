@@ -2327,6 +2327,19 @@ class TestRunId(unittest.TestCase):
                                    "model": "m", "route": "http://127.0.0.1:1/v1"}])
         self.assertNotIn("secret-entry", r.stdout)
 
+    def test_list_json_strips_credentials_from_base_url(self):
+        # Config forbids secrets in base_url, but nothing enforces it: a token in
+        # userinfo, query or fragment must not reach tool-facing JSON (PR #117 review).
+        lanes = [{"name": "A", "harness": "http", "model": "m",
+                  "base_url": "https://user:hunter2@api.example.com:8443/v1?key=sk-leak#frag"},
+                 {"name": "B", "harness": "http", "model": "m", "base_url": "http://[::1]:9/v1"}]
+        r, _ = self._run(lanes, "--list", "--json")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        routes = [l["route"] for l in json.loads(r.stdout)]
+        self.assertEqual(routes, ["https://api.example.com:8443/v1", "http://[::1]:9/v1"])
+        for leak in ("hunter2", "user", "sk-leak", "frag"):
+            self.assertNotIn(leak, r.stdout)
+
     def test_list_json_on_empty_roster_is_an_empty_array(self):
         r, _ = self._run([{"name": "P", "harness": "http", "model": "m",
                            "base_url": "http://127.0.0.1:1/v1", "active": False}],

@@ -74,6 +74,7 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -85,6 +86,26 @@ except ImportError:
 DEFAULT_CONFIG = Path.home() / ".config" / "flatline-roundtable" / "FlatlineRoundtable.yaml"
 TRANSCRIPT_DIR = Path.home() / ".local" / "share" / "flatline-roundtable" / "transcripts"
 RUN_ID_RE = re.compile(r"[A-Za-z0-9_-][A-Za-z0-9._-]{0,63}")
+
+
+def safe_route(base_url: str | None) -> str:
+    """A base_url fit for --list --json: scheme, host, port and path only.
+
+    Config forbids secrets in base_url, but nothing enforces it; a token in
+    userinfo or the query string must not ride out through tool-facing JSON.
+    """
+    if not base_url:
+        return ""
+    parts = urllib.parse.urlsplit(str(base_url))
+    host = parts.hostname or ""
+    if ":" in host:
+        host = f"[{host}]"
+    try:
+        port = parts.port
+    except ValueError:
+        port = None
+    netloc = host + (f":{port}" if port else "")
+    return urllib.parse.urlunsplit((parts.scheme, netloc, parts.path, "", ""))
 
 
 def new_run_id() -> str:
@@ -2418,7 +2439,7 @@ def main() -> int:
             # something a caller of --list needs.
             print(json.dumps([{"name": l["name"], "harness": l["harness"],
                                "vendor": l.get("vendor"), "model": l.get("model"),
-                               "route": l.get("base_url") or l.get("command") or ""}
+                               "route": safe_route(l.get("base_url")) or l.get("command") or ""}
                               for l in lanes], indent=2))
             return 0
         for l in lanes:
