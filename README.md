@@ -124,6 +124,7 @@ roundtable --list                       # roster + route; no network calls
 roundtable --json                       # structured output
 roundtable --list --json                # roster as JSON, for tools; no secret refs
 roundtable --each --run-id ID "..."     # tag every transcript of this run with ID
+roundtable --synthesize latest:12        # --diff readers over a finished run; no lane re-asked
 roundtable --config PATH
 roundtable --max-spend 0.50        # refuses BEFORE dispatch if the estimate exceeds it
 roundtable --panel --diff          # report only where the lanes disagree (not with --each)
@@ -139,8 +140,10 @@ the N per-lane transcripts of a fan-out can be grouped as one run; without
 because reading N full answers does not scale and disagreement is the product.
 It needs every answer in one process, so it pairs with `--panel`; `--each
 --diff` is refused up front rather than silently dropping the flag. To get the
-independent-process run *and* a comparison, run `--each` and synthesize from
-the transcripts afterwards.
+independent-process run *and* a comparison, run `--each`, then
+`--synthesize latest:N` (or the run's transcript paths). It sends the locked
+answers to the readers only — no lane is asked again — clears the budget gate
+first, and writes the synthesis as a transcript on the same `run_id`.
 
 It is opt-in and it is not neutral — a synthesizer is one model with its own
 priors deciding what counts as a disagreement, so the raw answers still go to
