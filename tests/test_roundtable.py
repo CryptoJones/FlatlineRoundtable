@@ -2348,6 +2348,116 @@ class TestRunId(unittest.TestCase):
         self.assertEqual(json.loads(r.stdout), [])
 
 
+class TestSynthesizeRun(unittest.TestCase):
+    """#118: --synthesize runs only the --diff readers over a finished run.
+
+    `--each --diff` is refused because synthesis needs every answer in one
+    process; this is the "synthesize the transcripts afterwards" step that
+    refusal pointed at. No lane may be re-asked, the readers' cost must clear
+    the budget gate first, and the result must land on the same run_id.
+    """
+
+    def setUp(self):
+        self.d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.d, True)
+        self.home = self.d / "home"
+        self.home.mkdir()
+        self.tdir = self.home / ".local" / "share" / "flatline-roundtable" / "transcripts"
+
+    def _run(self, lanes, *args, brief="brief", extra_cfg=None):
+        cfg = {"lanes": lanes, **(extra_cfg or {})}
+        (self.d / "c.yaml").write_text(json.dumps(cfg))
+        env = {**os.environ, "XDG_CACHE_HOME": str(self.d / "cache"), "HOME": str(self.home)}
+        return subprocess.run(
+            [sys.executable, str(ROOT / "roundtable"), "--config", str(self.d / "c.yaml"),
+             *args, "-"],
+            capture_output=True, text=True, timeout=120, env=env, input=brief)
+
+    @staticmethod
+    def _lanes(url, n, **extra):
+        return [{"name": f"L{i}", "harness": "http", "model": "m", "vendor": f"v{i}",
+                 "base_url": url, "timeout": 20, **extra} for i in range(n)]
+
+    def _synth_files(self):
+        return [f for f in self.tdir.glob("*-synthesis-*.json")]
+
+    def test_reads_a_finished_each_run_without_re_asking_any_lane(self):
+        with StubServer() as s:
+            lanes = self._lanes(s.url, 3)
+            r = self._run(lanes, "--each", "-j", "3", "--run-id", "run-118")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            asked = len(s.srv.requests)
+            paths = ",".join(str(p) for p in sorted(self.tdir.glob("*.json")))
+            r = self._run(lanes, "--synthesize", paths, brief="")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            readers = len(s.srv.requests) - asked
+        self.assertEqual(readers, 2, "only the two readers may be queried")
+        self.assertIn("WHERE THEY DIVERGE", r.stdout)
+        (f,) = self._synth_files()
+        rec = json.loads(f.read_text())
+        self.assertEqual(rec["run_id"], "run-118")
+        self.assertEqual(rec["results"], [], "a synthesis must not re-record answers")
+        self.assertEqual(rec["mode"], "synthesis")
+        self.assertEqual(len(rec["synthesis"]["readings"]), 2)
+        self.assertEqual(len(rec["parent"]), 3)
+
+    def test_latest_n_works_and_json_reports_the_run(self):
+        with StubServer() as s:
+            lanes = self._lanes(s.url, 2)
+            self.assertEqual(self._run(lanes, "--each", "--run-id", "r2").returncode, 0)
+            r = self._run(lanes, "--synthesize", "latest:2", "--json", brief="")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        out = json.loads(r.stdout)
+        self.assertEqual(out["run_id"], "r2")
+        self.assertIsNone(out["error"])
+
+    def test_refuses_to_start_a_run_alongside(self):
+        with StubServer() as s:
+            lanes = self._lanes(s.url, 2)
+            for extra in (["--each"], ["--panel"], ["--diff"], ["--revise", "latest"]):
+                with self.subTest(extra=extra):
+                    r = self._run(lanes, "--synthesize", "latest", *extra)
+                    self.assertNotEqual(r.returncode, 0)
+                    self.assertIn("--synthesize reads a finished run", r.stderr)
+            self.assertEqual(s.srv.requests, [])
+
+    def test_needs_two_answers(self):
+        with StubServer() as s:
+            lanes = self._lanes(s.url, 1)
+            self.assertEqual(self._run(lanes, "--each").returncode, 0)
+            asked = len(s.srv.requests)
+            r = self._run(lanes, "--synthesize", "latest", brief="")
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn("need at least 2 answers", r.stderr)
+            self.assertEqual(len(s.srv.requests), asked)
+
+    def test_budget_gate_runs_before_any_reader(self):
+        with StubServer() as s:
+            lanes = self._lanes(s.url, 2, price_per_mtok=1000.0, max_tokens=4000)
+            self.assertEqual(self._run(lanes, "--each").returncode, 0)
+            asked = len(s.srv.requests)
+            r = self._run(lanes, "--synthesize", "latest:2", "--max-spend", "0.0001", brief="")
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn("refusing to dispatch", r.stderr)
+            self.assertEqual(len(s.srv.requests), asked, "a reader ran past the budget")
+        self.assertEqual(self._synth_files(), [])
+
+    def test_null_panel_slots_do_not_crash_the_loader(self):
+        """A mid-run panel transcript holds None for unanswered lanes (17 such
+        slots in one real transcript history). Loading one was a traceback for
+        --revise too."""
+        self.tdir.mkdir(parents=True)
+        t = self.tdir / "20261003-100000-1.json"
+        t.write_text(json.dumps({"brief": "q", "partial": True, "results": [
+            {"lane": "L0", "model": "m", "harness": "http", "answer": "a0", "error": None},
+            None,
+            {"lane": "L1", "model": "m", "harness": "http", "answer": "a1", "error": None}]}))
+        with StubServer() as s:
+            r = self._run(self._lanes(s.url, 2), "--synthesize", str(t), brief="")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+
+
 # --------------------------------------------------------------------------- #
 # discussion mode
 # --------------------------------------------------------------------------- #

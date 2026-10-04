@@ -24,6 +24,8 @@ Usage:
     roundtable --list --json               roster as JSON for tools (no secret refs)
     roundtable --json > answers.json
     roundtable --each --run-id ID "..."    tag every transcript of this run with ID
+    roundtable --synthesize latest:12      --diff readers over a finished run's
+                                           transcripts; no lane is re-asked
     roundtable --config PATH
     roundtable --max-spend 0.50
     cat brief.md | roundtable --each -j 8 -  eight lanes at a time, each still
@@ -1978,8 +1980,8 @@ def parse_verdict(answer: str | None) -> str | None:
     return m.group(1) if m else None
 
 
-def load_transcripts(arg: str) -> tuple[list[Path], dict]:
-    """Resolve --revise's argument into one merged prior round.
+def load_transcripts(arg: str, flag: str = "--revise") -> tuple[list[Path], dict]:
+    """Resolve --revise's (or --synthesize's) argument into one merged prior round.
 
     Accepts explicit paths (comma-separated), `latest`, and `latest:N`. The
     multi-file forms exist because `--each` — the recommended way to run a
@@ -2003,11 +2005,11 @@ def load_transcripts(arg: str) -> tuple[list[Path], dict]:
             # refused too — cands[-0:] would silently mean "all of them".
             n_str = spec.split(":", 1)[1] if ":" in spec else "1"
             if not n_str.isdecimal() or int(n_str) < 1:
-                die("--revise latest:N needs a positive integer (e.g. latest:12)")
+                die(f"{flag} latest:N needs a positive integer (e.g. latest:12)")
             n = int(n_str)
             cands = sorted(TRANSCRIPT_DIR.glob("*.json"))
             if len(cands) < n:
-                die(f"--revise {spec}: only {len(cands)} transcript(s) in {TRANSCRIPT_DIR}")
+                die(f"{flag} {spec}: only {len(cands)} transcript(s) in {TRANSCRIPT_DIR}")
             paths.extend(cands[-n:])
         else:
             paths.append(Path(spec).expanduser())
@@ -2016,7 +2018,7 @@ def load_transcripts(arg: str) -> tuple[list[Path], dict]:
     # makes the later answer win below when the same lane appears twice.
     paths = sorted(set(paths), key=lambda p: p.name)
     if not paths:
-        die("--revise: no transcript named")
+        die(f"{flag}: no transcript named")
 
     briefs: set[str] = set()
     by_lane: dict[str, dict] = {}
@@ -2033,11 +2035,15 @@ def load_transcripts(arg: str) -> tuple[list[Path], dict]:
         round_no = max(round_no, int(data.get("round") or 1))
         rounds_seen.add(int(data.get("round") or 1))
         for r in data["results"]:
+            # A panel transcript written mid-run holds None for the lanes that
+            # had not answered yet; r.get() on one was a raw traceback (#118).
+            if not isinstance(r, dict):
+                continue
             # An answer never loses to a later failure of the same lane.
             if r.get("answer") or r["lane"] not in by_lane:
                 by_lane[r["lane"]] = r
     if len(briefs) > 1:
-        die("--revise: transcripts answer different briefs — refusing to mix them.\n"
+        die(f"{flag}: transcripts answer different briefs — refusing to mix them.\n"
             "  name the files explicitly, or use latest:N with N = that run's lane count")
     if len(rounds_seen) > 1:
         # Found in first live use: retrying one failed lane of a revision round
@@ -2045,13 +2051,131 @@ def load_transcripts(arg: str) -> tuple[list[Path], dict]:
         # guard cannot catch that — a revision round records the SAME brief —
         # and the merge would hand the lane its peers' round-2 answers labelled
         # as the round it is trying to redo.
-        die("--revise: transcripts span rounds {} — refusing to mix them.\n"
+        die(f"{flag}: transcripts span rounds {{}} — refusing to mix them.\n"
             "  name the files of ONE round explicitly".format(sorted(rounds_seen)))
 
     merged = {"brief": briefs.pop(), "results": list(by_lane.values()), "round": round_no}
     if not any(r.get("answer") for r in merged["results"]):
-        die("--revise: no answers in the named transcript(s) to revise against")
+        die(f"{flag}: no answers in the named transcript(s)")
     return paths, merged
+
+
+def print_synthesis(synth: dict | None, synth_err: str | None) -> None:
+    """Print a --diff synthesis: each reader's reading, then where the readers disagree."""
+    if synth:
+        for r in synth["readings"]:
+            print(f"\n{'=' * 74}\nWHERE THEY DIVERGE  (read by {r['by']})\n{'=' * 74}")
+            print(r["text"])
+        # Two readers exist so the reading's own bias is visible. Where they
+        # place the same lane differently, that is the synthesizer talking,
+        # not the panel -- go read that lane's raw answer.
+        if synth["conflicts"]:
+            print(f"\n{'=' * 74}\nTHE READERS DISAGREE\n{'=' * 74}")
+            for c in synth["conflicts"]:
+                where = "  ".join(
+                    f"{by}={'/'.join(sec) if sec else 'unmentioned'}"
+                    for by, sec in c["placements"].items()
+                )
+                print(f"  {c['lane']:<18} {where}")
+            print("\n  These are classification disputes between the readers, not\n"
+                  "  findings. Read those lanes' raw answers in the transcript.")
+        elif len(synth["readings"]) > 1:
+            print(f"\n  Both readers classified every lane the same way.")
+        for e in synth.get("errors") or []:
+            print(f"\n  !! reader failed — {e}", file=sys.stderr)
+        n = len(synth["readings"])
+        print(f"\n  -- {n} lane{'s' if n != 1 else ''} reading the others, not a verdict."
+              f" raw answers in the transcript.")
+    else:
+        print(f"\n  !! {synth_err}", file=sys.stderr)
+
+
+def synthesize_run(a, cfg: dict, lanes: list[dict]) -> int:
+    """--synthesize: run only the --diff readers over a FINISHED run (#118).
+
+    `--each --diff` is refused (#74) because synthesis needs every answer in one
+    process, and its refusal said to "synthesize the transcripts afterwards" --
+    but nothing did. This is that step. The answers are locked: they are read
+    from the transcripts, no lane is re-queried, and the run's independence is
+    untouched, because the readers see the answers only after every lane has
+    given one. The only requests are the readers' own, and they go through the
+    same budget gate, pricing, semaphores and pacing as a --diff run.
+
+    The result is written as its own transcript carrying the parent run's
+    run_id, with `results` empty so nothing that merges transcripts counts an
+    answer twice.
+    """
+    paths, prior = load_transcripts(a.synthesize, flag="--synthesize")
+    answered = [r for r in prior["results"] if r.get("answer")]
+    if len(answered) < 2:
+        die("--synthesize: need at least 2 answers to compare")
+    ids = set()
+    for p in paths:
+        try:
+            ids.add(json.loads(p.read_text()).get("run_id"))
+        except (OSError, ValueError):
+            pass
+    # Same run as the answers it reads, so a reader of runs (the UI) shows the
+    # synthesis on that run. An explicit --run-id wins; a mixed set gets a new one.
+    run_id = a.run_id or (ids.pop() if len(ids) == 1 and None not in ids else new_run_id())
+
+    count = int(cfg.get("synthesizers", 2))
+    readers = pick_synthesizers(lanes, cfg.get("synthesizer"), count)
+    if not readers:
+        die("--synthesize: no active lane is available to read")
+    budget = a.max_spend if a.max_spend is not None else cfg.get("budget_usd")
+    prices = load_pricing(readers)
+    if budget is not None:
+        unpriced = [l for l in readers if not lane_price_known(l, prices)]
+        if unpriced:
+            die("a budget is set but these readers have no known price, so it cannot bind:\n"
+                + "".join(f"  {l['name']}  (model {l.get('model') or '-'})\n" for l in unpriced)
+                + "  set price_per_mtok on the lane, or pick a reader with --lanes")
+    # The answers are known, so the estimate is exact on the input side rather
+    # than the max_tokens ceiling estimate_synthesis has to assume before a run.
+    calib = load_calibration()
+    defaults = cfg.get("defaults") or {}
+    body_chars = sum(len(r["answer"]) + len(r["lane"]) + 40 for r in answered)
+    prompt_chars = min(len(prior["brief"]), 4000) + body_chars + len(SYNTH_PROMPT)
+    estimate = 0.0
+    for r in readers:
+        pin, pout = lane_prices(r, prices)
+        in_tok = prompt_chars / chars_per_token(r.get("model"), calib)
+        out_tok = max(float(r.get("max_tokens", defaults.get("max_tokens", 2000))), 1500)
+        estimate += in_tok * pin + out_tok * pout
+    if budget is not None and estimate > budget:
+        die(f"estimated worst case ${estimate:.4f} exceeds budget ${budget:.2f} — refusing to dispatch\n"
+            f"  raise --max-spend or pick cheaper readers with --lanes")
+
+    keys = fetch_keys(readers)
+    sems = build_semaphores(readers, int(cfg.get("concurrency", 8)))
+    pacers = build_pacers(readers)
+    lock, spent = threading.Lock(), [0.0]
+    deadline = time.time() + cfg["deadline_seconds"] if cfg.get("deadline_seconds") else None
+    synth, synth_err = synthesize(answered, prior["brief"], cfg, readers, keys, prices,
+                                  count=count, sems=sems, lock=lock, spent=spent,
+                                  deadline=deadline, pacers=pacers,
+                                  retries=int(cfg.get("retries", 1)))
+
+    path = None
+    if not a.no_transcript:
+        private_transcript_dir()
+        stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+        path = TRANSCRIPT_DIR / f"{stamp}-synthesis-{os.getpid()}.json"
+        save_transcript({"run_id": run_id, "brief": prior["brief"], "results": [],
+                         "synthesis": synth, "synthesis_error": synth_err,
+                         "mode": "synthesis", "round": int(prior.get("round") or 1),
+                         "parent": [str(p) for p in paths],
+                         "cost": round(spent[0], 6)}, path)
+    if a.json:
+        print(json.dumps({"run_id": run_id, "synthesis": synth, "error": synth_err,
+                          "cost": round(spent[0], 6)}, indent=2))
+    else:
+        print(f"SYNTHESIS of {len(answered)} answers from {len(paths)} transcript(s)")
+        print_synthesis(synth, synth_err)
+        if path:
+            print(f"transcript: {path}")
+    return 0 if synth else 1
 
 
 def private_transcript_dir() -> Path:
@@ -2333,6 +2457,9 @@ def main() -> int:
                          "start cold from the brief")
     ap.add_argument("--discuss-rounds", type=int, default=2,
                     help="passes over the roster before closings (default 2)")
+    ap.add_argument("--synthesize", metavar="TRANSCRIPT",
+                    help="run only the --diff readers over a finished run's "
+                         "transcripts (paths, latest, latest:N); no lane is re-asked")
     ap.add_argument("--run-id", metavar="ID",
                     help="tag every transcript of this run with ID (default: generated)")
     ap.add_argument("-h", "--help", action="store_true")
@@ -2348,6 +2475,9 @@ def main() -> int:
     if a.run_id is not None and not RUN_ID_RE.fullmatch(a.run_id):
         die("--run-id must be 1-64 characters of A-Z a-z 0-9 . _ - (not starting with .)")
     run_id = a.run_id or new_run_id()
+    if a.synthesize and (a.each or a.panel or a.revise or a.discuss or a.diff):
+        die("--synthesize reads a finished run; it does not start one.\n"
+            "  Drop --each/--panel/--revise/--discuss/--diff.")
     if a.discuss:
         if a.revise:
             die("--discuss and --revise are two different second rounds; pick one")
@@ -2374,6 +2504,9 @@ def main() -> int:
         lanes = [l for l in lanes if l["name"].lower() in want]
         if not lanes:
             die(f"--lanes matched nothing in {a.config}")
+
+    if a.synthesize and not a.list:
+        return synthesize_run(a, cfg, lanes)
 
     # Resolve `latest`/`latest:N` to concrete paths HERE, before --each fans
     # out. Children run sequentially and each writes a transcript, so a child
@@ -2430,7 +2563,7 @@ def main() -> int:
             "  --each gives each lane its own. Either:\n"
             "\n"
             "  --panel --diff        one shared deadline, then synthesis\n"
-            "  --each, then synthesize the transcripts afterwards")
+            "  --each, then --synthesize latest:N   readers over the finished run")
 
     if a.list:
         if a.json:
@@ -2776,32 +2909,7 @@ def main() -> int:
             out = {"results": results, "synthesis": synth} if a.diff else results
         print(json.dumps(out, indent=2))
     elif a.diff:
-        if synth:
-            for r in synth["readings"]:
-                print(f"\n{'=' * 74}\nWHERE THEY DIVERGE  (read by {r['by']})\n{'=' * 74}")
-                print(r["text"])
-            # Two readers exist so the reading's own bias is visible. Where they
-            # place the same lane differently, that is the synthesizer talking,
-            # not the panel -- go read that lane's raw answer.
-            if synth["conflicts"]:
-                print(f"\n{'=' * 74}\nTHE READERS DISAGREE\n{'=' * 74}")
-                for c in synth["conflicts"]:
-                    where = "  ".join(
-                        f"{by}={'/'.join(sec) if sec else 'unmentioned'}"
-                        for by, sec in c["placements"].items()
-                    )
-                    print(f"  {c['lane']:<18} {where}")
-                print("\n  These are classification disputes between the readers, not\n"
-                      "  findings. Read those lanes' raw answers in the transcript.")
-            elif len(synth["readings"]) > 1:
-                print(f"\n  Both readers classified every lane the same way.")
-            for e in synth.get("errors") or []:
-                print(f"\n  !! reader failed — {e}", file=sys.stderr)
-            n = len(synth["readings"])
-            print(f"\n  -- {n} lane{'s' if n != 1 else ''} reading the others, not a verdict."
-                  f" raw answers in the transcript.")
-        else:
-            print(f"\n  !! {synth_err}", file=sys.stderr)
+        print_synthesis(synth, synth_err)
     else:
         if a.discuss:
             print(f"\n{'=' * 74}\nCLOSINGS — each lane's position after the discussion")
