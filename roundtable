@@ -21,7 +21,9 @@ Usage:
     cat brief.md | roundtable -
     roundtable --lanes Auditor,Builder "the brief"
     roundtable --list
+    roundtable --list --json               roster as JSON for tools (no secret refs)
     roundtable --json > answers.json
+    roundtable --each --run-id ID "..."    tag every transcript of this run with ID
     roundtable --config PATH
     roundtable --max-spend 0.50
     cat brief.md | roundtable --each -j 8 -  eight lanes at a time, each still
@@ -72,6 +74,7 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -82,6 +85,32 @@ except ImportError:
 
 DEFAULT_CONFIG = Path.home() / ".config" / "flatline-roundtable" / "FlatlineRoundtable.yaml"
 TRANSCRIPT_DIR = Path.home() / ".local" / "share" / "flatline-roundtable" / "transcripts"
+RUN_ID_RE = re.compile(r"[A-Za-z0-9_-][A-Za-z0-9._-]{0,63}")
+
+
+def safe_route(base_url: str | None) -> str:
+    """A base_url fit for --list --json: scheme, host, port and path only.
+
+    Config forbids secrets in base_url, but nothing enforces it; a token in
+    userinfo or the query string must not ride out through tool-facing JSON.
+    """
+    if not base_url:
+        return ""
+    parts = urllib.parse.urlsplit(str(base_url))
+    host = parts.hostname or ""
+    if ":" in host:
+        host = f"[{host}]"
+    try:
+        port = parts.port
+    except ValueError:
+        port = None
+    netloc = host + (f":{port}" if port else "")
+    return urllib.parse.urlunsplit((parts.scheme, netloc, parts.path, "", ""))
+
+
+def new_run_id() -> str:
+    """A run id that sorts by time and cannot collide across same-second runs."""
+    return dt.datetime.now().strftime("%Y%m%d-%H%M%S-") + os.urandom(4).hex()
 # Honours XDG_CACHE_HOME, which is both correct on Linux and what lets the tests
 # point the caches somewhere disposable instead of writing to a real one.
 CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "flatline-roundtable"
@@ -2304,11 +2333,21 @@ def main() -> int:
                          "start cold from the brief")
     ap.add_argument("--discuss-rounds", type=int, default=2,
                     help="passes over the roster before closings (default 2)")
+    ap.add_argument("--run-id", metavar="ID",
+                    help="tag every transcript of this run with ID (default: generated)")
     ap.add_argument("-h", "--help", action="store_true")
     a = ap.parse_args()
     if a.help:
         print(__doc__.strip())
         return 0
+    # One id for the whole run, forwarded to every --each child. Before this,
+    # a fan-out left N transcripts with nothing tying them together, and a
+    # reader (the UI, `--revise latest:N`) could only guess which belonged to
+    # one run from timestamps (#116). Validated because it reaches a filename
+    # reader and a URL in the UI: refuse anything but a plain token.
+    if a.run_id is not None and not RUN_ID_RE.fullmatch(a.run_id):
+        die("--run-id must be 1-64 characters of A-Z a-z 0-9 . _ - (not starting with .)")
+    run_id = a.run_id or new_run_id()
     if a.discuss:
         if a.revise:
             die("--discuss and --revise are two different second rounds; pick one")
@@ -2394,6 +2433,15 @@ def main() -> int:
             "  --each, then synthesize the transcripts afterwards")
 
     if a.list:
+        if a.json:
+            # For tools (the UI's lane picker). Names the route, never a secret
+            # or the `pass` entry holding one: a lane's key ref is config, not
+            # something a caller of --list needs.
+            print(json.dumps([{"name": l["name"], "harness": l["harness"],
+                               "vendor": l.get("vendor"), "model": l.get("model"),
+                               "route": safe_route(l.get("base_url")) or l.get("command") or ""}
+                              for l in lanes], indent=2))
+            return 0
         for l in lanes:
             route = l["harness"]
             where = l.get("base_url") or l.get("command") or ""
@@ -2525,7 +2573,8 @@ def main() -> int:
 
         def child_argv(l: dict) -> list[str]:
             argv = [sys.executable, str(Path(__file__).resolve()),
-                    "--lanes", l["name"], "--config", str(a.config)]
+                    "--lanes", l["name"], "--config", str(a.config),
+                    "--run-id", run_id]
             if a.json:
                 argv.append("--json")
             if a.no_transcript:
@@ -2613,7 +2662,7 @@ def main() -> int:
         # first round it is just `prompt`. A revision transcript also records the
         # round number, its parents, and the alias map, exactly as a completed
         # round does -- so a partial revision transcript reads like a full one.
-        payload = {"brief": brief_on_record, "results": results_so_far,
+        payload = {"run_id": run_id, "brief": brief_on_record, "results": results_so_far,
                    "synthesis": synthesis, "collisions": collisions}
         if prompts or a.discuss:
             payload.update({"round": round_no,
