@@ -2269,6 +2269,72 @@ class TestTranscriptUniqueness(unittest.TestCase):
         self.assertEqual(leftovers, [], f"staging files survived the run: {leftovers}")
 
 
+class TestRunId(unittest.TestCase):
+    """#116: an --each run's transcripts must be tied together by one run_id.
+
+    Without it a fan-out leaves N files that only timestamps relate, and the UI
+    (or anyone grouping a run) has to guess. Borrows the hermetic HOME runner.
+    """
+
+    _run = TestTranscriptUniqueness._run
+    _lanes = staticmethod(TestTranscriptUniqueness._lanes)
+
+    def _ids(self, tdir):
+        return [json.loads(f.read_text()).get("run_id") for f in tdir.glob("*.json")]
+
+    def test_each_children_share_the_given_run_id(self):
+        with StubServer() as s:
+            r, tdir = self._run(self._lanes(s.url, 3), "--each", "-j", "3",
+                                "--run-id", "ui-run_1.a")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self._ids(tdir), ["ui-run_1.a"] * 3)
+
+    def test_each_without_run_id_still_shares_one_generated_id(self):
+        with StubServer() as s:
+            r, tdir = self._run(self._lanes(s.url, 3), "--each", "-j", "3")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        ids = self._ids(tdir)
+        self.assertEqual(len(ids), 3)
+        self.assertEqual(len(set(ids)), 1, f"children generated their own ids: {ids}")
+        self.assertRegex(ids[0], r"^\d{8}-\d{6}-[0-9a-f]{8}$")
+
+    def test_separate_runs_get_different_ids(self):
+        with StubServer() as s:
+            lanes = self._lanes(s.url, 1)
+            r1, tdir = self._run(lanes)
+            r2, tdir2 = self._run(lanes)
+        self.assertEqual((r1.returncode, r2.returncode), (0, 0))
+        self.assertNotEqual(self._ids(tdir), self._ids(tdir2))
+
+    def test_malformed_run_id_is_refused_before_dispatch(self):
+        for bad in ["", ".hidden", "a/b", "x" * 65, "sp ace"]:
+            with self.subTest(bad=bad), StubServer() as s:
+                r, tdir = self._run(self._lanes(s.url, 1), "--run-id", bad)
+                self.assertNotEqual(r.returncode, 0)
+                self.assertIn("--run-id", r.stderr)
+                self.assertIsNone(s.srv.last_request, "dispatched with a bad run id")
+                self.assertFalse(tdir.exists() and any(tdir.iterdir()))
+
+    def test_list_json_names_routes_but_no_secret_refs(self):
+        lanes = [{"name": "A", "harness": "http", "model": "m", "vendor": "v",
+                  "base_url": "http://127.0.0.1:1/v1", "key_entry": "vendor/secret-entry"},
+                 {"name": "Parked", "harness": "http", "model": "m",
+                  "base_url": "http://127.0.0.1:1/v1", "active": False}]
+        r, _ = self._run(lanes, "--list", "--json")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        roster = json.loads(r.stdout)
+        self.assertEqual(roster, [{"name": "A", "harness": "http", "vendor": "v",
+                                   "model": "m", "route": "http://127.0.0.1:1/v1"}])
+        self.assertNotIn("secret-entry", r.stdout)
+
+    def test_list_json_on_empty_roster_is_an_empty_array(self):
+        r, _ = self._run([{"name": "P", "harness": "http", "model": "m",
+                           "base_url": "http://127.0.0.1:1/v1", "active": False}],
+                         "--list", "--json")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(json.loads(r.stdout), [])
+
+
 # --------------------------------------------------------------------------- #
 # discussion mode
 # --------------------------------------------------------------------------- #

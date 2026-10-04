@@ -122,12 +122,18 @@ cat brief.md | roundtable -             # long briefs on stdin
 roundtable --lanes Skeptic,Chair "..."  # a subset
 roundtable --list                       # roster + route; no network calls
 roundtable --json                       # structured output
+roundtable --list --json                # roster as JSON, for tools; no secret refs
+roundtable --each --run-id ID "..."     # tag every transcript of this run with ID
 roundtable --config PATH
 roundtable --max-spend 0.50        # refuses BEFORE dispatch if the estimate exceeds it
 roundtable --panel --diff          # report only where the lanes disagree (not with --each)
 roundtable --no-transcript
 roundtable --each --revise latest:12    # optional second round — see below
 ```
+
+Every transcript carries a `run_id`. `--each` hands its children one id, so
+the N per-lane transcripts of a fan-out can be grouped as one run; without
+`--run-id` a fresh one is generated per invocation.
 
 `--diff` asks lanes to report AGREED / SPLIT / LONE CLAIMS across the others,
 because reading N full answers does not scale and disagreement is the product.
