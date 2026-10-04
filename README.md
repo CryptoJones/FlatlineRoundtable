@@ -125,6 +125,7 @@ roundtable --json                       # structured output
 roundtable --list --json                # roster as JSON, for tools; no secret refs
 roundtable --each --run-id ID "..."     # tag every transcript of this run with ID
 roundtable --synthesize latest:12        # --diff readers over a finished run; no lane re-asked
+roundtable --each --revise latest-run    # round 2 over the newest run, found by run_id
 roundtable --config PATH
 roundtable --max-spend 0.50        # refuses BEFORE dispatch if the estimate exceeds it
 roundtable --panel --diff          # report only where the lanes disagree (not with --each)

@@ -24,6 +24,8 @@ Usage:
     roundtable --list --json               roster as JSON for tools (no secret refs)
     roundtable --json > answers.json
     roundtable --each --run-id ID "..."    tag every transcript of this run with ID
+    roundtable --each --revise latest-run  round 2 over the newest run, found by
+                                           run_id rather than by counting files
     roundtable --synthesize latest:12      --diff readers over a finished run's
                                            transcripts; no lane is re-asked
     roundtable --config PATH
@@ -1980,10 +1982,73 @@ def parse_verdict(answer: str | None) -> str | None:
     return m.group(1) if m else None
 
 
+# Children of one pre-run_id --each fan-out start minutes apart, never half an
+# hour: the same rule the UI uses to group them.
+LATEST_RUN_GAP = 30 * 60
+
+
+def transcript_time(p: Path) -> float:
+    m = re.match(r"(\d{8}-\d{6})", p.name)
+    if m:
+        try:
+            return dt.datetime.strptime(m.group(1), "%Y%m%d-%H%M%S").timestamp()
+        except ValueError:
+            pass
+    return p.stat().st_mtime
+
+
+def latest_run_paths(flag: str) -> list[Path]:
+    """`latest-run`: every transcript of the most recent round (#80).
+
+    `latest:N` counts files, so it is right only when N happens to equal the
+    run's lane count, and it reaches past the run boundary otherwise -- the
+    brief and round guards in load_transcripts exist to catch exactly that.
+    A round now has an identity (run_id, #116), so this resolves it directly:
+    the newest lane transcript names the run, and every transcript carrying the
+    same run_id is in it. Synthesis transcripts (#118) are not lanes and are
+    skipped. Transcripts written before run_id fall back to "same brief and
+    round, walking back until a 30-minute gap".
+
+    Scans newest-first and stops one gap past the earliest match, so it reads a
+    handful of files rather than the whole history.
+    """
+    files = sorted(TRANSCRIPT_DIR.glob("*.json"), key=lambda p: p.name, reverse=True)
+    newest = None
+    found: list[Path] = []
+    earliest = None
+    for p in files:
+        t = transcript_time(p)
+        if earliest is not None and t < earliest - LATEST_RUN_GAP:
+            break
+        try:
+            d = json.loads(p.read_text())
+        except (OSError, ValueError):
+            continue
+        if not isinstance(d, dict) or "results" not in d or d.get("mode") == "synthesis":
+            continue
+        if newest is None:
+            newest = d
+        elif newest.get("run_id"):
+            if d.get("run_id") != newest["run_id"]:
+                continue
+        elif d.get("run_id") or (str(d.get("brief", "")).strip(), int(d.get("round") or 1)) != \
+                (str(newest.get("brief", "")).strip(), int(newest.get("round") or 1)):
+            break     # pre-run_id: one contiguous stretch of the same question
+        if d.get("partial"):
+            die(f"{flag} latest-run: {p.name} is partial (a run still going, or one that "
+                "was killed).\n  Name the transcripts explicitly to use what it has.")
+        found.append(p)
+        earliest = t if earliest is None else min(earliest, t)
+    if not found:
+        die(f"{flag} latest-run: no lane transcripts in {TRANSCRIPT_DIR}")
+    return found
+
+
 def load_transcripts(arg: str, flag: str = "--revise") -> tuple[list[Path], dict]:
     """Resolve --revise's (or --synthesize's) argument into one merged prior round.
 
-    Accepts explicit paths (comma-separated), `latest`, and `latest:N`. The
+    Accepts explicit paths (comma-separated), `latest`, `latest:N`, and
+    `latest-run` (every transcript of the newest round, by run_id). The
     multi-file forms exist because `--each` — the recommended way to run a
     panel — writes ONE TRANSCRIPT PER LANE by design, so "the previous round"
     of a 12-lane run is 12 files, and `latest:12` is how you name them without
@@ -1997,6 +2062,9 @@ def load_transcripts(arg: str, flag: str = "--revise") -> tuple[list[Path], dict
     paths: list[Path] = []
     for spec in (s.strip() for s in arg.split(",")):
         if not spec:
+            continue
+        if spec == "latest-run":
+            paths.extend(latest_run_paths(flag))
             continue
         if spec == "latest" or spec.startswith("latest:"):
             # Parse N defensively (#76): a bare int() here was the one place
