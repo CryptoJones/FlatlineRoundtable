@@ -24,14 +24,14 @@ and vice versa.
 - [ ] `db backup|restore` and the telesto restic job ([#110](https://github.com/CryptoJones/FlatlineRoundtable/issues/110))
 - [ ] Fleet rollout notes and the Python 3.11 floor ([#111](https://github.com/CryptoJones/FlatlineRoundtable/issues/111))
 
-### Epic: run the roundtable from inside Orca — local web UI, no fork ([#115](https://github.com/CryptoJones/FlatlineRoundtable/issues/115))
+### Epic: run the roundtable from inside Orca — local web UI, no fork ([#115](https://github.com/CryptoJones/FlatlineRoundtable/issues/115)) — DONE 2026-10-03
 
 The UI lives in its own private repo,
 [FlatlineRoundtableUI](https://github.com/CryptoJones/FlatlineRoundtableUI). AGENTS.md
 § Scope keeps long-lived processes out of this one.
 
-- [ ] `--run-id` ties an `--each` run's transcripts together; `--list --json` for tools
-      ([#116](https://github.com/CryptoJones/FlatlineRoundtable/issues/116)). PR #117 is open.
+- [x] `--run-id` ties an `--each` run's transcripts together; `--list --json` for tools
+      ([#116](https://github.com/CryptoJones/FlatlineRoundtable/issues/116)). Merged in PR #117.
 - [x] UI: server skeleton and read-only run history browser
       ([UI#1](https://github.com/CryptoJones/FlatlineRoundtableUI/issues/1))
 - [x] UI: start a run, with live per-lane status and cancel
@@ -40,11 +40,12 @@ The UI lives in its own private repo,
       ([UI#3](https://github.com/CryptoJones/FlatlineRoundtableUI/issues/3))
 - [x] UI: Orca launcher (quick command and `orca tab create`)
       ([UI#4](https://github.com/CryptoJones/FlatlineRoundtableUI/issues/4))
-- [ ] Upstream Orca: let plugin panels reach loopback or their own worker. Needs CJ's OK
-      before posting ([UI#5](https://github.com/CryptoJones/FlatlineRoundtableUI/issues/5))
-- [ ] Synthesize (`--diff`) a finished `--each` run from its transcripts
-      ([#118](https://github.com/CryptoJones/FlatlineRoundtable/issues/118))
-- [ ] UI: a run cancelled before any lane answered vanishes after a server restart
+- [x] Upstream Orca: let plugin panels reach loopback or their own worker
+      ([UI#5](https://github.com/CryptoJones/FlatlineRoundtableUI/issues/5)). Filed as
+      [stablyai/orca#25129](https://github.com/stablyai/orca/issues/25129).
+- [x] `--synthesize`: the `--diff` readers over a finished run's transcripts
+      ([#118](https://github.com/CryptoJones/FlatlineRoundtable/issues/118)). Merged in PR #120.
+- [x] UI: a run cancelled before any lane answered survives a server restart
       ([UI#6](https://github.com/CryptoJones/FlatlineRoundtableUI/issues/6))
 
 ### Other open items
