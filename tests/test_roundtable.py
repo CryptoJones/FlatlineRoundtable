@@ -2442,6 +2442,51 @@ class TestSynthesizeRun(unittest.TestCase):
             self.assertEqual(len(s.srv.requests), asked, "a reader ran past the budget")
         self.assertEqual(self._synth_files(), [])
 
+    def test_latest_run_picks_the_newest_run_by_id_not_by_file_count(self):
+        """#80: latest:N is right only when N equals the lane count; latest-run
+        resolves the round by run_id. Two runs of different sizes, then a
+        synthesis transcript (not a lane) on top."""
+        with StubServer() as s:
+            self.assertEqual(self._run(self._lanes(s.url, 3), "--each", "--run-id", "old").returncode, 0)
+            time.sleep(1.1)   # distinct second-resolution stamps
+            lanes = self._lanes(s.url, 2)
+            self.assertEqual(self._run(lanes, "--each", "--run-id", "new").returncode, 0)
+            self.assertEqual(self._run(lanes, "--synthesize", "latest-run", brief="").returncode, 0)
+            r = self._run(lanes, "--synthesize", "latest-run", "--json", brief="")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(json.loads(r.stdout)["run_id"], "new")
+        newest = max(self._synth_files(), key=lambda f: f.name)
+        parents = json.loads(newest.read_text())["parent"]
+        self.assertEqual(len(parents), 2, "latest-run must take only the newest run's lanes")
+        self.assertFalse(any("synthesis" in p for p in parents))
+
+    def test_latest_run_falls_back_to_brief_and_round_for_old_transcripts(self):
+        self.tdir.mkdir(parents=True)
+        def t(name, brief, lane, **extra):
+            (self.tdir / name).write_text(json.dumps({"brief": brief, "results": [
+                {"lane": lane, "model": "m", "harness": "http", "answer": f"{lane} says", "error": None}],
+                **extra}))
+        t("20261003-090000-X-1.json", "older question", "X")
+        t("20261003-100000-L0-2.json", "q", "L0")
+        t("20261003-100500-L1-3.json", "q", "L1")
+        with StubServer() as s:
+            r = self._run(self._lanes(s.url, 2), "--synthesize", "latest-run", "--json", brief="")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        (f,) = self._synth_files()
+        self.assertEqual(sorted(Path(p).name for p in json.loads(f.read_text())["parent"]),
+                         ["20261003-100000-L0-2.json", "20261003-100500-L1-3.json"])
+
+    def test_latest_run_refuses_a_partial_run(self):
+        self.tdir.mkdir(parents=True)
+        (self.tdir / "20261003-100000-1.json").write_text(json.dumps({
+            "run_id": "p", "brief": "q", "partial": True,
+            "results": [{"lane": "L0", "answer": "a", "error": None}, None]}))
+        with StubServer() as s:
+            r = self._run(self._lanes(s.url, 2), "--synthesize", "latest-run", brief="")
+            self.assertEqual(s.srv.requests, [])
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("partial", r.stderr)
+
     def test_null_panel_slots_do_not_crash_the_loader(self):
         """A mid-run panel transcript holds None for unanswered lanes (17 such
         slots in one real transcript history). Loading one was a traceback for

@@ -102,9 +102,10 @@ The UI lives in its own private repo,
       prompts now call an unsourced mid-thread fact a claim, and the skill tells the
       reader to check it against the code
       ([#98](https://github.com/CryptoJones/FlatlineRoundtable/issues/98)) — shipped in PR #99
-- [ ] Give a round an identity (`run_id`) so `--revise latest-run` is robust —
+- [x] Give a round an identity (`run_id`) so `--revise latest-run` is robust —
       replaces the fragile `latest:N` file-count heuristic with a real "round"
-      ([#80](https://github.com/CryptoJones/FlatlineRoundtable/issues/80))
+      ([#80](https://github.com/CryptoJones/FlatlineRoundtable/issues/80)) — run_id in PR #117,
+      `latest-run` in PR #122
 - [ ] Add `--dry-run` / `--estimate` — a priced pre-flight that shows per-lane and
       panel worst-case cost without dispatching (and surfaces unpriced lanes)
       ([#81](https://github.com/CryptoJones/FlatlineRoundtable/issues/81))
