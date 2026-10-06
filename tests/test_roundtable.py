@@ -2154,6 +2154,102 @@ class TestLaneRoster(StoreCase):
         self.assertEqual(doc, rt.yaml_to_roster(LEGACY_YAML))
 
 
+class TestBackup(StoreCase):
+    """db backup / db restore (#110)."""
+
+    def ok(self, *args, **kw):
+        r = self.rt(*args, **kw)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return r
+
+    def seeded(self):
+        self.init()
+        self.ok("db", "import", str(ROSTER_EXAMPLE), "--replace")
+        self.ok("secrets", "set", "or/x", "--stdin", input="sk-backup-canary\n")
+        return self.ok("db", "export").stdout
+
+    def backups(self):
+        return sorted((self.db.parent / "backups").glob("roundtable-*.db"))
+
+    def test_backup_is_private_complete_and_checked(self):
+        before = self.seeded()
+        holder = sqlite3.connect(self.db)        # a live WAL reader, as during a run
+        holder.execute("SELECT count(*) FROM lanes").fetchall()
+        self.addCleanup(holder.close)
+        self.ok("db", "backup")
+        (b,) = self.backups()
+        self.assertEqual(b.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(b.parent.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(rt._integrity(b), "ok")
+        self.assertFalse(Path(f"{b}-wal").exists())      # one self-contained file
+        self.assertNotIn(b"sk-backup-canary", b.read_bytes())
+        other = {**self.env, "XDG_DATA_HOME": str(self.d / "restored")}
+        r = self.ok("db", "restore", str(b), env=other)
+        self.assertEqual(self.ok("db", "export", env=other).stdout, before)
+        self.assertIn("16 chars", self.ok("secrets", "check", "or/x", env=other).stdout)
+
+    def test_fifteen_backups_with_keep_14_leave_14(self):
+        self.seeded()
+        made = []
+        for _ in range(15):
+            out = self.ok("db", "backup", "--keep", "14").stdout
+            made.append(Path(re.search(r"backup (\S+\.db)", out).group(1)).name)
+        kept = {p.name for p in self.backups()}
+        self.assertEqual(len(kept), 14)
+        # The oldest went, not an arbitrary one -- same-second names carry -N,
+        # and a plain name sort would have pruned the newest of those instead.
+        self.assertEqual(kept, set(made[1:]))
+
+    def test_restore_refuses_a_corrupt_file(self):
+        self.seeded()
+        self.ok("db", "backup")
+        (b,) = self.backups()
+        data = bytearray(b.read_bytes())
+        data[4096:8192] = os.urandom(4096)           # trash page 2
+        b.write_bytes(bytes(data))
+        before = self.db.read_bytes()
+        r = self.rt("db", "restore", str(b), "--force")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("integrity", r.stderr)
+        self.assertEqual(self.db.read_bytes(), before)  # --force does not override this
+
+    def test_restore_refuses_a_newer_schema_unless_forced(self):
+        self.seeded()
+        self.ok("db", "backup")
+        (b,) = self.backups()
+        c = sqlite3.connect(b)
+        c.execute(f"PRAGMA user_version = {rt.SCHEMA_VERSION + 1}")
+        c.commit()
+        c.close()
+        r = self.rt("db", "restore", str(b))
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("newer than this roundtable", r.stderr)
+        r = self.ok("db", "restore", str(b), "--force")
+        self.assertIn("pre-restore", r.stdout)
+
+    def test_restore_keeps_the_replaced_store_aside(self):
+        before = self.seeded()
+        self.ok("db", "backup")
+        (b,) = self.backups()
+        self.ok("lanes", "retire", "Skeptic")
+        self.ok("db", "restore", str(b))
+        self.assertEqual(self.ok("db", "export").stdout, before)
+        (aside,) = self.db.parent.glob("roundtable.db.pre-restore-*")
+        self.assertEqual(aside.stat().st_mode & 0o777, 0o600)
+        c = sqlite3.connect(aside)
+        self.assertIsNotNone(c.execute(
+            "SELECT retired_at FROM lanes WHERE name = 'Skeptic'").fetchone()[0])
+        c.close()
+
+    def test_restore_refuses_a_file_that_is_not_a_store(self):
+        self.init()
+        f = self.d / "other.db"
+        sqlite3.connect(f).execute("CREATE TABLE t (x)").connection.close()
+        r = self.rt("db", "restore", str(f))
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("not a roundtable store", r.stderr)
+
+
 class TestAdminDispatch(unittest.TestCase):
     """The brief is free text, so the command guard must be narrow."""
 

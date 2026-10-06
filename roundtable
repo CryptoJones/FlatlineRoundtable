@@ -56,6 +56,7 @@ YAML is retired, and `import-yaml` moves an old config in once.
     roundtable lanes enable|disable|retire NAME | clone SRC NEW | rename OLD NEW
     roundtable defaults|globals show | set k=v ... | unset k ...
     roundtable db export [--out FILE] | import FILE [--merge|--replace]
+    roundtable db backup [--dir DIR] [--keep N] | restore FILE [--force]
     roundtable import-yaml PATH [--dry-run] [--pull-secrets]   one-time move off YAML
 
   * Round 1 is blind by construction — a lane cannot see the others because
@@ -891,7 +892,7 @@ def _referencing_lanes(conn: sqlite3.Connection, name: str) -> list[str]:
 # store admin commands
 # --------------------------------------------------------------------------- #
 ADMIN_VERBS = {
-    "db": ("init", "migrate", "doctor", "export", "import"),
+    "db": ("init", "migrate", "doctor", "export", "import", "backup", "restore"),
     "secrets": ("set", "check", "list", "rotate", "rm", "rekey"),
     "lanes": ("list", "show", "add", "edit", "enable", "disable", "retire", "clone",
               "rename", "history"),
@@ -1884,6 +1885,125 @@ def cmd_import_yaml(a) -> int:
     return 0
 
 
+# --------------------------------------------------------------------------- #
+# backup and restore (#110)
+#
+# A backup is a self-contained copy taken with SQLite's online backup API, so
+# it is consistent even while a run holds the store open in WAL mode -- a file
+# copy of roundtable.db alone would miss whatever still sits in -wal. The copy
+# is useless without the DB key, which lives in `pass`; scripts/backup-telesto.sh
+# ships both.
+# --------------------------------------------------------------------------- #
+def _sqlite_copy(src: sqlite3.Connection, dest: Path) -> None:
+    """Write `src` to a new, private `dest` as a rollback-journal database, so
+    the copy is one file with no -wal or -shm beside it."""
+    os.close(os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
+    dst = sqlite3.connect(dest, isolation_level=None)
+    try:
+        src.backup(dst)
+        dst.execute("PRAGMA journal_mode=DELETE")
+    finally:
+        dst.close()
+
+
+def _integrity(path: Path) -> str:
+    try:
+        c = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        try:
+            return c.execute("PRAGMA integrity_check").fetchone()[0]
+        finally:
+            c.close()
+    except sqlite3.DatabaseError as e:
+        return str(e)
+
+
+def cmd_db_backup(a) -> int:
+    conn = open_db(a.config)
+    out_dir = a.dir or a.config.parent / "backups"
+    out_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    host = re.sub(r"[^A-Za-z0-9.-]", "_", socket.gethostname().split(".")[0])
+    stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    dest = out_dir / f"roundtable-{host}-{stamp}.db"
+    n = 1
+    while dest.exists():                      # two backups in one second
+        dest = out_dir / f"roundtable-{host}-{stamp}-{n}.db"
+        n += 1
+    try:
+        _sqlite_copy(conn, dest)
+    finally:
+        conn.close()
+    result = _integrity(dest)
+    if result != "ok":
+        dest.unlink()
+        die(f"backup copy failed integrity_check ({result}) — nothing kept")
+    # Newest first: by stamp, then by the -N a same-second backup gets. Plain
+    # name order would put "...Z-1.db" before "...Z.db", which is backwards.
+    pat = re.compile(rf"roundtable-{re.escape(host)}-(\d{{8}}T\d{{6}}Z)(?:-(\d+))?\.db")
+    mine = sorted((p for p in out_dir.iterdir() if pat.fullmatch(p.name)),
+                  key=lambda p: (pat.fullmatch(p.name)[1], int(pat.fullmatch(p.name)[2] or 0)),
+                  reverse=True)
+    pruned = mine[a.keep:] if a.keep > 0 else []
+    for old in pruned:
+        old.unlink()
+    print(f"backup {dest} (integrity ok, kept {min(len(mine), a.keep)}"
+          + (f", pruned {len(pruned)}" if pruned else "") + ")")
+    return 0
+
+
+def cmd_db_restore(a) -> int:
+    src_path = a.file
+    if not src_path.exists():
+        die(f"no backup at {src_path}")
+    result = _integrity(src_path)
+    if result != "ok":
+        die(f"{src_path} fails integrity_check ({result}) — refusing to restore it")
+    src = sqlite3.connect(f"file:{src_path}?mode=ro", uri=True)
+    try:
+        ver = schema_version(src)
+        kid = src.execute("SELECT value FROM meta WHERE key = 'key_id'").fetchone()
+    except sqlite3.DatabaseError:
+        kid = None
+    if kid is None:
+        src.close()
+        die(f"{src_path} is not a roundtable store (no key id in its meta table)")
+    # --force exists for this check only. A newer schema may hold tables this
+    # code does not know, which is a choice; a corrupt file never is.
+    if ver > SCHEMA_VERSION and not a.force:
+        src.close()
+        die(f"{src_path} is at schema {ver}, newer than this roundtable ({SCHEMA_VERSION}) — "
+            f"update roundtable, or pass --force")
+    target = a.config
+    kept = None
+    if target.exists():
+        live = open_db(target)
+        # Fold -wal into the main file so the copy kept aside is complete.
+        live.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        live.close()
+        stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        kept = target.with_name(f"{target.name}.pre-restore-{stamp}")
+        target.rename(kept)
+        for side in ("-wal", "-shm"):
+            Path(f"{target}{side}").unlink(missing_ok=True)
+    else:
+        target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        _sqlite_copy(src, target)
+    except BaseException:
+        if kept is not None and not target.exists():
+            kept.rename(target)
+        raise
+    finally:
+        src.close()
+    restored = open_db(target)
+    restored.execute("PRAGMA journal_mode=WAL")
+    restored.close()
+    print(f"restored {src_path} -> {target} (schema {ver}, key id {kid[0]})")
+    if kept is not None:
+        print(f"  the store it replaced is kept as {kept}")
+    print("  check it with:  roundtable db doctor && roundtable secrets check")
+    return 0
+
+
 def admin_main(argv: list[str]) -> int:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--config", type=Path, default=DEFAULT_DB,
@@ -1911,6 +2031,17 @@ def admin_main(argv: list[str]) -> int:
     mode.add_argument("--replace", action="store_true",
                       help="make the roster exactly the file; unlisted lanes are retired")
     p.set_defaults(fn=cmd_db_import)
+    p = dbv.add_parser("backup", parents=[common],
+                       help="integrity-checked 0600 copy, safe while the store is in use")
+    p.add_argument("--dir", type=Path, help="where to write (default: backups/ beside the store)")
+    p.add_argument("--keep", type=int, default=14, help="newest copies to keep (default 14)")
+    p.set_defaults(fn=cmd_db_backup)
+    p = dbv.add_parser("restore", parents=[common],
+                       help="replace the store with a backup; the old one is kept aside")
+    p.add_argument("file", type=Path)
+    p.add_argument("--force", action="store_true",
+                   help="restore a backup from a newer schema (never a corrupt one)")
+    p.set_defaults(fn=cmd_db_restore)
 
     ln = groups.add_parser("lanes", help="the lane roster in the store")
     lv = ln.add_subparsers(dest="verb", required=True)
