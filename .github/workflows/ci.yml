@@ -51,6 +51,10 @@ jobs:
           ./roundtable db migrate
           ./roundtable db migrate
           ./roundtable db doctor
+          ./roundtable db import tests/fixtures/ci-roster.json --replace
+          ./roundtable lanes list
+          ./roundtable db export | diff - tests/fixtures/ci-roster.json
+          ./roundtable import-yaml FlatlineRoundtable.yaml.example --dry-run
 
       - name: Shipped example config parses
         run: |
