@@ -11,7 +11,7 @@ Bugs first — the cost-guard and answer-loss class this tool exists to prevent,
 then security, then features/optimisation, then tests. Each has a GitHub issue
 and vice versa.
 
-### Epic: encrypted SQLite is the authoritative store for lanes, secrets and (next) metrics — YAML retired ([#105](https://github.com/CryptoJones/FlatlineRoundtable/issues/105))
+### Epic: encrypted SQLite is the authoritative store for lanes, secrets and (next) metrics — YAML retired ([#105](https://github.com/CryptoJones/FlatlineRoundtable/issues/105)) — DONE 2026-10-06
 
 - [x] Split config validation from YAML parsing; route scripts through
       `rt.fetch_keys` ([#106](https://github.com/CryptoJones/FlatlineRoundtable/issues/106)) — shipped in PR #113
@@ -22,7 +22,7 @@ and vice versa.
 - [x] Run from the store: `load_config` reads the DB, `fetch_keys` reads secrets,
       YAML retired ([#109](https://github.com/CryptoJones/FlatlineRoundtable/issues/109)) — shipped in PR #124
 - [x] `db backup|restore` and the telesto restic job ([#110](https://github.com/CryptoJones/FlatlineRoundtable/issues/110)) — shipped in PR #125
-- [ ] Fleet rollout notes and the Python 3.11 floor ([#111](https://github.com/CryptoJones/FlatlineRoundtable/issues/111)) — on docs/sqlite-store-fleet-rollout
+- [x] Fleet rollout notes and the Python 3.11 floor ([#111](https://github.com/CryptoJones/FlatlineRoundtable/issues/111)) — shipped in PR #126
 
 ### Epic: run the roundtable from inside Orca — local web UI, no fork ([#115](https://github.com/CryptoJones/FlatlineRoundtable/issues/115)) — DONE 2026-10-03
 

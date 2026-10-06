@@ -47,6 +47,11 @@ command -v "${PYTHON}" >/dev/null || die "${PYTHON} not found"
 "${PYTHON}" -c 'import cryptography' 2>/dev/null || \
     die "\`cryptography\` not installed — ${PYTHON} -m pip install --user cryptography (the store needs it)"
 
+# The store (~/.local/share/flatline-roundtable/roundtable.db) is the only
+# configuration: lanes, and lane secrets encrypted under a DB key kept in pass.
+# It is read before any lane runs, so a broken store stops a run before it
+# spends -- a store failure never fails a paid run.
+#
 # `pass` holds the store's DB key, which unlocks every lane secret. This is a
 # warning rather than a hard failure because a roster of only `cli` / `acp`
 # lanes rides subscriptions and needs no secret at all. But a lane with any

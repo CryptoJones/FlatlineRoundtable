@@ -145,8 +145,11 @@ Rules:
 
 ### Lane settings (CJ, 2026-09-27)
 
-The settings live in the store, `~/.local/share/flatline-roundtable/roundtable.db`
-(`roundtable lanes show NAME`). Each lane's `notes` carry the reason, and `roundtable lanes
+The settings live in the store, `~/.local/share/flatline-roundtable/roundtable.db`.
+Secrets are encrypted in it; the DB key is the `pass` entry `flatline-roundtable/db-key`.
+A store failure never fails a paid run: lanes and secrets are read before anything is
+dispatched, so a broken store stops the run before it spends.
+One lane's settings: `roundtable lanes show NAME`. Each lane's `notes` carry the reason, and `roundtable lanes
 history NAME` shows every change since the YAML import.
 
 | Lane | Model / route | Setting | Why | Status |

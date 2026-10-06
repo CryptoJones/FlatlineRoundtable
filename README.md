@@ -80,6 +80,10 @@ Optionally `./install.sh` to expose it as a Claude Code skill.
 - Keys never reach the transcript or `--json` output.
 - A missing secret fails the run loudly and names the fix. It never silently
   falls back to an unauthenticated call.
+- A store failure never fails a paid run. The roster and secrets are read
+  before any lane is dispatched, so a broken store stops a run before it
+  spends; anything a run writes to the store later is best-effort, and an
+  answer already paid for is delivered regardless.
 
 **The store ([#105](https://github.com/CryptoJones/FlatlineRoundtable/issues/105)) is the only configuration.**
 `roundtable db init` creates `~/.local/share/flatline-roundtable/roundtable.db`
