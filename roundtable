@@ -1557,6 +1557,13 @@ def _check_roster_doc(doc, where: str) -> None:
         if not isinstance(l.get("name"), str) or not l["name"]:
             die(f"{where}: lane #{i + 1} has no name")
         _check_config_keys(l["config"])
+        # Checked, not coerced: bool("false") is True, and once runs read the
+        # store an "inactive" lane that is really active joins runs and bills.
+        if not isinstance(l.get("active", True), bool):
+            die(f"{where}: lane #{i + 1}: active must be true or false, got {l['active']!r}")
+        for k in ("key_entry", "notes", "lane_id"):
+            if l.get(k) is not None and not isinstance(l[k], str):
+                die(f"{where}: lane #{i + 1}: {k} must be a string, got {l[k]!r}")
         _check_key_entry(l.get("key_entry"))
 
 
@@ -1606,9 +1613,15 @@ def apply_roster(conn: sqlite3.Connection, doc: dict, replace: bool, reason: str
         changed = _update_config(conn, lane, d["config"], d.get("key_entry"), reason)
         if lane["name"] != d["name"]:
             _rename(conn, lane, d["name"])
-        conn.execute("UPDATE lanes SET active = ?, notes = ?, retired_at = NULL, "
-                     "position = coalesce(?, position) WHERE lane_id = ?",
-                     (int(active), d.get("notes"), pos if replace else None, lane["lane_id"]))
+        try:
+            conn.execute("UPDATE lanes SET active = ?, notes = ?, retired_at = NULL, "
+                         "position = coalesce(?, position), updated_at = ? WHERE lane_id = ?",
+                         (int(active), d.get("notes"), pos if replace else None, _now(),
+                          lane["lane_id"]))
+        except sqlite3.IntegrityError:
+            # A retired lane coming back while a newer live lane holds its name.
+            die(f"duplicate lane name {d['name']!r} — names must be unique "
+                f"(lane id {lane['lane_id']} is retired here and its name is taken)")
         counts["updated" if changed else "unchanged"] += 1
     validate_store(conn)
     return counts
@@ -1626,6 +1639,7 @@ def cmd_db_export(a) -> int:
     # Holds no secret value, but a base_url can carry credentials (safe_route
     # exists for that reason), so the file is private like everything else.
     fd = os.open(a.out, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.fchmod(fd, 0o600)          # O_CREAT's mode applies only to a NEW file
     with os.fdopen(fd, "w") as f:
         f.write(text)
     print(f"exported to {a.out}")
@@ -1672,11 +1686,12 @@ def yaml_lane_comments(text: str, n: int) -> list[list[str]] | None:
     start = next((i for i, l in enumerate(lines) if re.match(r"lanes\s*:\s*(#.*)?$", l)), None)
     if start is None:
         return None
-    items, indent = [], None
+    items, indent, stop = [], None, len(lines)
     for i in range(start + 1, len(lines)):
         l = lines[i]
         if l.strip() and not l[0].isspace() and l[0] not in "#-":
-            break                                   # the next top-level key
+            stop = i                                # the next top-level key
+            break
         m = re.match(r"( *)-(\s|$)", l)
         if m and (indent is None or len(m.group(1)) == indent):
             indent = len(m.group(1))
@@ -1704,7 +1719,7 @@ def yaml_lane_comments(text: str, n: int) -> list[list[str]] | None:
             elif t:
                 para.append(t)
         pieces += [" ".join(para)] if para else []
-        end = items[k + 1] if k + 1 < len(items) else len(lines)
+        end = items[k + 1] if k + 1 < len(items) else stop
         for line in lines[at:end]:
             m = _TRAILING.match(line)
             if m and m.group(1).strip():
@@ -1763,6 +1778,7 @@ def cmd_import_yaml(a) -> int:
     if not a.path.exists():
         die(f"no YAML at {a.path}")
     doc = yaml_to_roster(a.path)
+    _check_roster_doc(doc, str(a.path))
     entries = sorted({l["key_entry"] for l in doc["lanes"] if l["key_entry"]}
                      | ({doc["defaults"]["key_entry"]} if doc["defaults"].get("key_entry") else set()))
     if a.dry_run:

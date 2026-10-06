@@ -1917,8 +1917,38 @@ class TestLaneRoster(StoreCase):
         self.init()
         self.add_http()
         out = self.d / "x.json"
+        out.write_text("old")
+        out.chmod(0o644)                 # an existing file keeps its mode under O_CREAT
         self.ok("db", "export", "--out", str(out))
         self.assertEqual(out.stat().st_mode & 0o777, 0o600)
+
+    def test_import_refuses_wrong_types_before_writing(self):
+        self.init()
+        self.add_http()
+        doc = json.loads(self.ok("db", "export").stdout)
+        for k, bad in (("active", "false"), ("notes", 3), ("key_entry", 123), ("lane_id", 7)):
+            with self.subTest(k=k):
+                d = json.loads(json.dumps(doc))
+                d["lanes"][0][k] = bad
+                f = self.d / "bad.json"
+                f.write_text(json.dumps(d))
+                r = self.rt("db", "import", str(f))
+                self.assertNotEqual(r.returncode, 0)
+                self.assertIn(k, r.stderr)
+        self.assertEqual(json.loads(self.ok("db", "export").stdout), doc)
+
+    def test_reviving_a_retired_lane_whose_name_is_taken_is_refused_cleanly(self):
+        self.init()
+        self.add_http("Skeptic")
+        old = self.ok("db", "export").stdout
+        self.ok("lanes", "retire", "Skeptic")
+        self.add_http("Skeptic")
+        f = self.d / "old.json"
+        f.write_text(old)
+        r = self.rt("db", "import", str(f))
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("duplicate lane name 'Skeptic'", r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
 
     # -- import-yaml ----------------------------------------------------------
     def test_import_yaml_matches_load_config(self):
@@ -1982,6 +2012,20 @@ class TestLaneRoster(StoreCase):
             """)
         self.assertEqual(rt.yaml_lane_comments(text, 3),
                          [["first lane", "on for now"], ["the cheap key"], []])
+
+    def test_the_last_lane_does_not_take_comments_from_later_sections(self):
+        text = ("lanes:\n  - name: A\n    harness: cli\n"
+                "globals_after:\n  key_entry: shared  # the team key\n")
+        self.assertEqual(rt.yaml_lane_comments(text, 1), [[]])
+
+    def test_import_yaml_checks_key_entry_names(self):
+        self.init()
+        p = self.d / "k.yaml"
+        p.write_text("lanes:\n  - name: A\n    harness: http\n    model: m\n"
+                     "    base_url: http://x\n    key_entry: 123\n")
+        r = self.rt("import-yaml", str(p))
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("key_entry must be a string", r.stderr)
 
     def test_pull_secrets_stores_values_and_never_plaintext(self):
         self.init()
