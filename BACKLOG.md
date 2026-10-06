@@ -19,9 +19,9 @@ and vice versa.
       `secrets set|check|list|rotate|rm|rekey` ([#107](https://github.com/CryptoJones/FlatlineRoundtable/issues/107)) — shipped in PR #114
 - [x] Lane config in the store: `lanes`, `defaults`, `globals`, `lane_versions`,
       `db export|import`, `import-yaml` ([#108](https://github.com/CryptoJones/FlatlineRoundtable/issues/108)) — shipped in PR #123
-- [ ] Run from the store: `load_config` reads the DB, `fetch_keys` reads secrets,
-      YAML retired ([#109](https://github.com/CryptoJones/FlatlineRoundtable/issues/109)) — on feat/sqlite-store-run-from-store
-- [ ] `db backup|restore` and the telesto restic job ([#110](https://github.com/CryptoJones/FlatlineRoundtable/issues/110))
+- [x] Run from the store: `load_config` reads the DB, `fetch_keys` reads secrets,
+      YAML retired ([#109](https://github.com/CryptoJones/FlatlineRoundtable/issues/109)) — shipped in PR #124
+- [ ] `db backup|restore` and the telesto restic job ([#110](https://github.com/CryptoJones/FlatlineRoundtable/issues/110)) — on feat/sqlite-store-backup
 - [ ] Fleet rollout notes and the Python 3.11 floor ([#111](https://github.com/CryptoJones/FlatlineRoundtable/issues/111))
 
 ### Epic: run the roundtable from inside Orca — local web UI, no fork ([#115](https://github.com/CryptoJones/FlatlineRoundtable/issues/115)) — DONE 2026-10-03
@@ -183,6 +183,12 @@ stub.
       `ps auxww` during `db init` shows no key (it goes to `pass insert` on stdin).
 - [ ] `./install.sh` then `./install.sh --uninstall` round-trips, and refuses to
       delete anything that is not a symlink. *(human — touches `$HOME`, no test)*
+- [ ] **Restore drill:** `restic restore latest` from telesto → `db restore` into
+      a scratch `--config` → `db doctor` → `secrets check` → `--list`, and the
+      scratch store's `db export` equals the live one. *(human — needs telesto and
+      the real DB key; the commands are in the README.)* Last run 2026-10-06 on
+      makemake: all steps ok, 9/9 secrets present, export identical.
+      *Automated parts:* `TestBackup`.
 
 ## Done
 

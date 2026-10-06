@@ -126,6 +126,35 @@ copy. `--set` values are JSON when they parse and strings otherwise.
 [`examples/roster.example.json`](examples/roster.example.json) is the example
 YAML config after `import-yaml` and `db export`.
 
+**Backups (#110).** `roundtable db backup` writes an integrity-checked `0600`
+copy to `backups/` beside the store, with SQLite's online backup API, so it is
+consistent while a run has the store open. It keeps the newest 14 (`--keep N`).
+`roundtable db restore FILE` refuses a corrupt file, and a file from a newer
+schema unless `--force`; the store it replaces is kept as
+`roundtable.db.pre-restore-<stamp>`.
+
+[`scripts/backup-telesto.sh`](scripts/backup-telesto.sh) is a one-shot job: it
+takes a `db backup`, then pushes the backups and the gpg-encrypted DB key entry
+to a restic repository on telesto (`sftp:telesto:/NAS/backups/flatline-roundtable/<host>`,
+password in the `pass` entry `flatline-roundtable/restic-telesto`), prunes to
+14 daily, 8 weekly and 6 monthly snapshots, and runs `restic check` on Sundays.
+A store without its DB key cannot decrypt its secrets, which is why the key goes
+too; the key is in turn useless without your gpg private key.
+[`examples/net.thenetwerk.roundtable-backup.plist`](examples/net.thenetwerk.roundtable-backup.plist)
+runs it daily at 03:45 under launchd.
+
+The restore drill, run against a scratch path so the live store is untouched:
+
+```sh
+export RESTIC_REPOSITORY=sftp:telesto:/NAS/backups/flatline-roundtable/$(hostname -s)
+export RESTIC_PASSWORD_COMMAND="pass show flatline-roundtable/restic-telesto"
+restic restore latest --target /tmp/drill
+roundtable db restore /tmp/drill/.../backups/roundtable-<host>-<stamp>.db --config /tmp/drill/roundtable.db
+roundtable db doctor --config /tmp/drill/roundtable.db
+roundtable secrets check --config /tmp/drill/roundtable.db
+roundtable --config /tmp/drill/roundtable.db --list
+```
+
 ## Cost
 
 **`harness` decides cost, not `model`.**
