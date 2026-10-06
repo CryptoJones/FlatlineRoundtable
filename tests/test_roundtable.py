@@ -1429,13 +1429,9 @@ class TestSecrets(unittest.TestCase):
         self.assertEqual(rt.fetch_keys([{"name": "A", "harness": "cli"}]), {})
 
 
-class TestStore(unittest.TestCase):
-    """The encrypted store (#107): db init|migrate|doctor, secrets set|check|...
-
-    Every test runs the real entry point against a throwaway XDG_DATA_HOME and a
-    key file, so nothing here can touch a real store or a real `pass`.
-    """
-    SECRET = "sk-or-v1-PLAINTEXT-canary-0123456789"
+class StoreCase(unittest.TestCase):
+    """Every store test runs the real entry point against a throwaway
+    XDG_DATA_HOME and a key file, so nothing can touch a real store or `pass`."""
 
     def setUp(self):
         self.d = Path(tempfile.mkdtemp())
@@ -1455,6 +1451,11 @@ class TestStore(unittest.TestCase):
         r = self.rt("db", "init")
         self.assertEqual(r.returncode, 0, r.stderr)
         return r
+
+
+class TestStore(StoreCase):
+    """The encrypted store (#107): db init|migrate|doctor, secrets set|check|..."""
+    SECRET = "sk-or-v1-PLAINTEXT-canary-0123456789"
 
     def test_init_then_migrate_twice_is_idempotent(self):
         self.init()
@@ -1731,6 +1732,357 @@ class TestStore(unittest.TestCase):
         self.assertEqual(entry.read_text(), "precious\n")
 
 
+class TestLaneRoster(StoreCase):
+    """Lane config in the store (#108): lanes, defaults, globals, export/import,
+    import-yaml. Real entry point, throwaway store, no real `pass`."""
+
+    EXAMPLE = ROOT / "FlatlineRoundtable.yaml.example"
+
+    def ok(self, *args, **kw):
+        r = self.rt(*args, **kw)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return r
+
+    def versions(self, name):
+        conn = sqlite3.connect(self.db)
+        self.addCleanup(conn.close)
+        lane_id, version = conn.execute(
+            "SELECT lane_id, version FROM lanes WHERE name = ? AND retired_at IS NULL",
+            (name,)).fetchone()
+        rows = conn.execute("SELECT version, reason FROM lane_versions WHERE lane_id = ? "
+                            "ORDER BY version", (lane_id,)).fetchall()
+        return lane_id, version, rows
+
+    def add_http(self, name="Skeptic", *extra):
+        return self.ok("lanes", "add", name, "--harness", "http", "--set", "model=m/x",
+                       "--set", "base_url=https://example.invalid/v1", *extra)
+
+    def load_config_message(self, yaml_text):
+        """What load_config() says today about a YAML config."""
+        p = self.d / "c.yaml"
+        p.write_text(yaml_text)
+        with self.assertRaises(SystemExit) as e:
+            rt.load_config(p)
+        return str(e.exception)
+
+    @staticmethod
+    def normalise(lanes):
+        """Lane dicts without the parts import-yaml adds on purpose: notes
+        gain the YAML comments, and active is always explicit in the store."""
+        return [{**{k: v for k, v in l.items() if k != "notes"},
+                 "active": bool(l.get("active", True))} for l in lanes]
+
+    # -- versions -------------------------------------------------------------
+    def test_add_edit_retire_clone_rename_versions(self):
+        self.init()
+        self.add_http("Skeptic", "--key-entry", "or/skeptic")
+        lane_id, v, rows = self.versions("Skeptic")
+        self.assertEqual((v, [r[0] for r in rows]), (1, [1]))
+
+        r = self.ok("lanes", "edit", "Skeptic", "--set", "timeout=120", "--reason", "slow")
+        self.assertIn("version 1 -> 2", r.stdout)
+        _, v, rows = self.versions("Skeptic")
+        self.assertEqual((v, rows[-1]), (2, (2, "slow")))
+
+        # Same value again, notes, enable/disable: none of these is a new version.
+        self.assertIn("no change", self.ok("lanes", "edit", "Skeptic", "--set", "timeout=120").stdout)
+        self.ok("lanes", "edit", "Skeptic", "--notes", "keeps hedging")
+        self.ok("lanes", "disable", "Skeptic")
+        self.ok("lanes", "enable", "Skeptic")
+        self.assertEqual(self.versions("Skeptic")[1], 2)
+        # key_entry is part of what a version records, so changing it is one.
+        self.ok("lanes", "edit", "Skeptic", "--key-entry", "or/other")
+        self.assertEqual(self.versions("Skeptic")[1], 3)
+
+        # rename: same lane, same version, old name kept as an alias.
+        self.ok("lanes", "rename", "Skeptic", "Doubter")
+        lid, v, rows = self.versions("Doubter")
+        self.assertEqual((lid, v, len(rows)), (lane_id, 3, 3))
+        conn = sqlite3.connect(self.db)
+        self.assertEqual(conn.execute("SELECT lane_id FROM lane_aliases WHERE old_name='Skeptic'")
+                         .fetchone()[0], lane_id)
+        self.assertIn("Doubter", self.ok("lanes", "history", "Skeptic").stdout)
+
+        # clone: a new lane at version 1, inactive, pointing at its source.
+        r = self.ok("lanes", "clone", "Doubter", "Doubter2")
+        self.assertIn("inactive", r.stdout)
+        cid, v, rows = self.versions("Doubter2")
+        self.assertNotEqual(cid, lane_id)
+        self.assertEqual(v, 1)
+        self.assertIn(f"cloned from Doubter v3 ({lane_id})", rows[0][1])
+        show = json.loads(self.ok("lanes", "show", "Doubter2", "--json").stdout)
+        self.assertFalse(show["active"])
+        self.assertEqual(show["config"]["timeout"], 120)
+
+        # retire: name freed, history kept, a new lane may take the name.
+        self.ok("lanes", "retire", "Doubter")
+        self.assertNotIn("Doubter\t", self.ok("lanes", "list").stdout)
+        self.assertIn("retired", self.ok("lanes", "list", "--all").stdout)
+        self.add_http("Doubter")
+        nid, v, _ = self.versions("Doubter")
+        self.assertNotEqual(nid, lane_id)
+        self.assertEqual(v, 1)
+        self.assertEqual(conn.execute("SELECT count(*) FROM lane_versions WHERE lane_id = ?",
+                                      (lane_id,)).fetchone()[0], 3)
+        conn.close()
+
+    # -- validation ---------------------------------------------------------
+    def test_invalid_lanes_get_load_configs_own_message(self):
+        self.init()
+        self.add_http("Skeptic")
+        cases = [
+            (["lanes", "add", "Bad", "--harness", "foo"],
+             "lanes:\n  - name: Bad\n    harness: foo\n"),
+            (["lanes", "add", "C", "--harness", "cli", "--set", 'args=["-p"]', "--set", "stdin=true"],
+             "lanes:\n  - name: C\n    harness: cli\n    args: ['-p']\n    stdin: true\n"),
+            (["lanes", "add", "Skeptic", "--harness", "http", "--set", "model=m",
+              "--set", "base_url=http://x"],
+             "lanes:\n  - {name: Skeptic, harness: http, model: m, base_url: http://x}\n"
+             "  - {name: Skeptic, harness: http, model: m, base_url: http://x}\n"),
+        ]
+        for argv, yaml_text in cases:
+            r = self.rt(*argv)
+            self.assertNotEqual(r.returncode, 0, argv)
+            self.assertEqual(r.stderr.strip(), self.load_config_message(yaml_text), argv)
+        # Nothing half-written by the refusals.
+        self.assertEqual(self.ok("lanes", "list").stdout.count("\n"), 1)
+
+    def test_names_differing_only_in_case_are_duplicates(self):
+        """--lanes matches case-insensitively, so these would be one lane."""
+        self.init()
+        self.add_http("Skeptic")
+        r = self.rt("lanes", "add", "skeptic", "--harness", "http", "--set", "model=m",
+                    "--set", "base_url=http://x")
+        self.assertIn("duplicate lane name 'skeptic'", r.stderr)
+
+    def test_an_edit_that_breaks_the_lane_is_rolled_back(self):
+        self.init()
+        self.add_http("Skeptic")
+        r = self.rt("lanes", "edit", "Skeptic", "--unset", "base_url")
+        self.assertIn("http lane needs base_url", r.stderr)
+        show = json.loads(self.ok("lanes", "show", "Skeptic", "--json").stdout)
+        self.assertEqual(show["version"], 1)
+        self.assertIn("base_url", show["config"])
+
+    def test_columns_cannot_be_set_as_config(self):
+        self.init()
+        r = self.rt("lanes", "add", "X", "--harness", "http", "--set", "active=false")
+        self.assertIn("lanes enable|disable", r.stderr)
+
+    def test_globals_are_checked_and_defaults_validate_the_roster(self):
+        self.init()
+        self.add_http("Skeptic")
+        self.ok("globals", "set", "concurrency=4", "budget_usd=0.5")
+        self.assertIn("concurrency\t4", self.ok("globals", "show").stdout)
+        self.assertIn("not a valid value", self.rt("globals", "set", "retries=-1").stderr)
+        self.assertIn("unknown global", self.rt("globals", "set", "colour=red").stderr)
+        self.ok("defaults", "set", "timeout=300")
+        r = self.rt("defaults", "set", "harness=bogus")   # Skeptic sets its own harness...
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.ok("defaults", "unset", "harness", "timeout")
+        self.assertIn("no defaults set", self.ok("defaults", "show").stdout)
+
+    # -- export / import ------------------------------------------------------
+    def test_export_import_replace_export_is_byte_identical(self):
+        self.init()
+        self.ok("import-yaml", str(self.EXAMPLE))
+        self.ok("lanes", "rename", "Skeptic", "Doubter")
+        self.ok("lanes", "edit", "Local", "--set", "rpm=20")
+        first = self.ok("db", "export").stdout
+        f = self.d / "roster.json"
+        f.write_text(first)
+        r = self.ok("db", "import", str(f), "--replace")
+        self.assertIn("0 added, 0 updated", r.stdout)
+        self.assertEqual(self.ok("db", "export").stdout, first)
+        # And into a second, empty store: the same bytes, the same lane ids.
+        other = {**self.env, "XDG_DATA_HOME": str(self.d / "data2")}
+        self.ok("db", "init", env=other)
+        self.ok("db", "import", str(f), "--replace", env=other)
+        self.assertEqual(self.ok("db", "export", env=other).stdout, first)
+        self.assertNotIn("ciphertext", first)
+
+    def test_replace_retires_lanes_the_file_drops_and_merge_keeps_them(self):
+        self.init()
+        self.ok("import-yaml", str(self.EXAMPLE))
+        doc = json.loads(self.ok("db", "export").stdout)
+        doc["lanes"] = [l for l in doc["lanes"] if l["name"] != "Parked"]
+        f = self.d / "r.json"
+        f.write_text(json.dumps(doc))
+        self.ok("db", "import", str(f))
+        self.assertIn("Parked", self.ok("lanes", "list").stdout)
+        self.assertIn("1 retired", self.ok("db", "import", str(f), "--replace").stdout)
+        self.assertNotIn("Parked", self.ok("lanes", "list").stdout)
+
+    def test_export_out_file_is_private(self):
+        self.init()
+        self.add_http()
+        out = self.d / "x.json"
+        out.write_text("old")
+        out.chmod(0o644)                 # an existing file keeps its mode under O_CREAT
+        self.ok("db", "export", "--out", str(out))
+        self.assertEqual(out.stat().st_mode & 0o777, 0o600)
+
+    def test_import_refuses_wrong_types_before_writing(self):
+        self.init()
+        self.add_http()
+        doc = json.loads(self.ok("db", "export").stdout)
+        for k, bad in (("active", "false"), ("notes", 3), ("key_entry", 123), ("lane_id", 7)):
+            with self.subTest(k=k):
+                d = json.loads(json.dumps(doc))
+                d["lanes"][0][k] = bad
+                f = self.d / "bad.json"
+                f.write_text(json.dumps(d))
+                r = self.rt("db", "import", str(f))
+                self.assertNotEqual(r.returncode, 0)
+                self.assertIn(k, r.stderr)
+        self.assertEqual(json.loads(self.ok("db", "export").stdout), doc)
+
+    def test_reviving_a_retired_lane_whose_name_is_taken_is_refused_cleanly(self):
+        self.init()
+        self.add_http("Skeptic")
+        old = self.ok("db", "export").stdout
+        self.ok("lanes", "retire", "Skeptic")
+        self.add_http("Skeptic")
+        f = self.d / "old.json"
+        f.write_text(old)
+        r = self.rt("db", "import", str(f))
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("duplicate lane name 'Skeptic'", r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+
+    # -- import-yaml ----------------------------------------------------------
+    def test_import_yaml_matches_load_config(self):
+        self.init()
+        self.ok("import-yaml", str(self.EXAMPLE))
+        conn = rt.open_db(self.db)
+        stored = rt.validate_config(rt.store_roster(conn), "the store")
+        conn.close()
+        yaml_cfg = rt.load_config(self.EXAMPLE)
+        self.assertEqual(self.normalise(stored["lanes"]), self.normalise(yaml_cfg["lanes"]))
+        for k in rt.GLOBAL_KEYS:
+            self.assertEqual(stored.get(k), yaml_cfg.get(k), k)
+        # A YAML `notes:` value survives, ahead of the comment-derived pieces.
+        parked = next(l for l in stored["lanes"] if l["name"] == "Parked")
+        self.assertTrue(parked["notes"].startswith("parked 2026-08-25"))
+        # Re-running it is a no-op, not a second set of versions.
+        self.assertIn("0 added, 0 updated, 7 unchanged",
+                      self.ok("import-yaml", str(self.EXAMPLE)).stdout)
+
+    def test_import_yaml_refuses_the_yaml_off_name_like_load_config(self):
+        """#29: unquoted `Off` arrives as a boolean."""
+        self.init()
+        text = "lanes:\n  - name: Off\n    harness: http\n    model: m\n    base_url: http://x\n"
+        p = self.d / "off.yaml"
+        p.write_text(text)
+        r = self.rt("import-yaml", str(p))
+        self.assertNotEqual(r.returncode, 0)
+        self.assertEqual(r.stderr.strip(), self.load_config_message(text))
+        self.assertIn("quote the name", r.stderr)
+
+    def test_dry_run_shows_comment_notes_and_writes_nothing(self):
+        r = self.ok("import-yaml", str(self.EXAMPLE), "--dry-run")
+        self.assertIn("a pass ENTRY NAME, never a key", r.stdout)       # trailing comment
+        self.assertIn("A free-tier model: same shape, no price.", r.stdout)  # block above
+        self.assertIn("Nothing written", r.stdout)
+        self.assertFalse(self.db.exists())        # no store needed, none created
+
+    def test_comments_follow_their_own_lane(self):
+        text = textwrap.dedent("""\
+            lanes:
+              # first lane
+              - name: A
+                active: true   # on for now
+                harness: http
+                model: m
+                base_url: http://x
+                personality: |
+                  # not a comment, a heading in a block scalar
+              - name: B         # nothing to take: not an active/key_entry line
+                harness: http
+                model: m
+                base_url: http://x
+                key_entry: or/b  # the cheap key
+
+              # separated by a blank line, so it belongs to nobody
+
+              - name: C
+                harness: http
+                model: m
+                base_url: http://x
+            """)
+        self.assertEqual(rt.yaml_lane_comments(text, 3),
+                         [["first lane", "on for now"], ["the cheap key"], []])
+
+    def test_the_last_lane_does_not_take_comments_from_later_sections(self):
+        text = ("lanes:\n  - name: A\n    harness: cli\n"
+                "globals_after:\n  key_entry: shared  # the team key\n")
+        self.assertEqual(rt.yaml_lane_comments(text, 1), [[]])
+
+    def test_import_yaml_checks_key_entry_names(self):
+        self.init()
+        p = self.d / "k.yaml"
+        p.write_text("lanes:\n  - name: A\n    harness: http\n    model: m\n"
+                     "    base_url: http://x\n    key_entry: 123\n")
+        r = self.rt("import-yaml", str(p))
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("key_entry must be a string", r.stderr)
+
+    def test_pull_secrets_stores_values_and_never_plaintext(self):
+        self.init()
+        bin_ = self.d / "bin"
+        bin_.mkdir()
+        canary = "sk-or-v1-PULLED-canary-9876543210"
+        write_exe(bin_ / "pass", f"""\
+            [ "$1" = show ] || exit 2
+            printf '{canary}-%s\\nurl: https://x.invalid\\n' "$(basename "$2")"
+        """)
+        env = {**self.env, "PATH": f"{bin_}{os.pathsep}{os.environ['PATH']}"}
+        holder = sqlite3.connect(self.db)      # keep -wal/-shm alive to read them
+        holder.execute("SELECT 1").fetchall()
+        self.addCleanup(holder.close)
+        r = self.ok("import-yaml", str(self.EXAMPLE), "--pull-secrets", env=env)
+        self.assertIn("2 pulled from pass", r.stdout)
+        self.assertNotIn(canary, r.stdout + r.stderr)
+        r = self.ok("secrets", "check")
+        self.assertIn(f"{len(canary) + len('-skeptic')} chars", r.stdout)  # first line only
+        for f in (self.db, Path(f"{self.db}-wal"), Path(f"{self.db}-shm")):
+            if f.exists():
+                self.assertNotIn(canary.encode(), f.read_bytes(), f)
+        # Already-stored secrets are kept, not re-pulled.
+        self.assertIn("2 already in the store",
+                      self.ok("import-yaml", str(self.EXAMPLE), "--pull-secrets", env=env).stdout)
+
+    # -- schema and shipped files -------------------------------------------
+    def test_a_schema_1_store_migrates_and_keeps_its_lanes(self):
+        self.db.parent.mkdir(parents=True, mode=0o700)
+        os.close(os.open(self.db, os.O_WRONLY | os.O_CREAT, 0o600))
+        conn = rt.open_db(self.db)
+        for stmt in (x.strip() for x in rt.MIGRATIONS[0].split(";")):
+            if stmt:
+                conn.execute(stmt)
+        conn.execute("PRAGMA user_version = 1")
+        conn.execute("INSERT INTO lanes (lane_id, name, config, created_at, updated_at) VALUES "
+                     "('u1', 'Old', '{\"harness\":\"http\",\"model\":\"m\",\"base_url\":\"http://x\"}',"
+                     " 'now', 'now')")
+        conn.close()
+        self.assertIn("db migrate", self.rt("lanes", "list").stderr)
+        self.ok("db", "migrate")
+        self.assertIn("Old\tactive", self.ok("lanes", "list").stdout)
+
+    def test_shipped_rosters_import_and_match_their_yaml(self):
+        for json_path, yaml_path in (
+                (ROOT / "tests" / "fixtures" / "ci-roster.json",
+                 ROOT / "tests" / "fixtures" / "ci-config.yaml"),
+                (ROOT / "examples" / "roster.example.json", self.EXAMPLE)):
+            doc = json.loads(json_path.read_text())
+            want = rt.yaml_to_roster(yaml_path)
+            for l in doc["lanes"]:
+                l["lane_id"] = None
+            self.assertEqual(doc, want, json_path)
+            self.assertEqual(json_path.read_text(),
+                             rt.dump_roster(json.loads(json_path.read_text())), json_path)
+
+
 class TestAdminDispatch(unittest.TestCase):
     """The brief is free text, so the command guard must be narrow."""
 
@@ -1741,8 +2093,16 @@ class TestAdminDispatch(unittest.TestCase):
 
     def test_known_verbs_and_flags_dispatch(self):
         for argv in (["db"], ["db", "init"], ["db", "doctor"], ["db", "-h"],
-                     ["secrets", "set", "x", "--stdin"], ["secrets", "rekey"]):
+                     ["secrets", "set", "x", "--stdin"], ["secrets", "rekey"],
+                     ["lanes", "list"], ["lanes", "add", "X", "--harness", "http"],
+                     ["defaults", "show"], ["globals", "set", "retries=0"],
+                     ["db", "export"], ["import-yaml", "c.yaml"], ["import-yaml", "--dry-run"]):
             self.assertTrue(rt.is_admin_argv(argv), argv)
+
+    def test_import_yaml_followed_by_words_stays_a_brief(self):
+        for argv in (["import-yaml", "is", "broken"], ["import-yaml is broken"],
+                     ["lanes", "keep", "timing", "out"], ["globals", "are", "bad"]):
+            self.assertFalse(rt.is_admin_argv(argv), argv)
 
     def test_lanes_are_slow_is_run_as_a_brief(self):
         """End to end: it reaches the run path (and its config lookup)."""

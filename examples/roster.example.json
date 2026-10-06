@@ -1,0 +1,127 @@
+{
+  "defaults": {
+    "max_tokens": 2000,
+    "temperature": 0.7,
+    "timeout": 300
+  },
+  "format": "flatline-roundtable/roster",
+  "format_version": 1,
+  "globals": {
+    "concurrency": 8,
+    "deadline_seconds": 600,
+    "retries": 1
+  },
+  "lanes": [
+    {
+      "active": true,
+      "config": {
+        "base_url": "https://openrouter.ai/api/v1",
+        "harness": "http",
+        "model": "some-vendor/some-model",
+        "personality": "You are the Skeptic. Assume every claim is unproven until it is shown.\nAttack the weakest link in the argument, not the conclusion.\n",
+        "price_per_mtok": 1.5,
+        "vendor": "openrouter"
+      },
+      "key_entry": "openrouter/agent/skeptic",
+      "lane_id": "4df90436e446425aa1904b1b4ccd195e",
+      "name": "Skeptic",
+      "notes": "http | Any OpenAI-compatible endpoint. `vendor` is a human label used for grouping, per-vendor concurrency and per-vendor rate limiting; routing depends on harness + base_url, not on it. | a pass ENTRY NAME, never a key"
+    },
+    {
+      "active": true,
+      "config": {
+        "base_url": "https://openrouter.ai/api/v1",
+        "harness": "http",
+        "model": "some-vendor/some-model:free",
+        "personality": "You are the Contrarian. Argue the position the others are least likely\nto take, as long as it is defensible.\n",
+        "vendor": "openrouter"
+      },
+      "key_entry": "openrouter/agent/contrarian",
+      "lane_id": "e2b70e9eefcf460a97e85d5d58e9e8b7",
+      "name": "Contrarian",
+      "notes": "A free-tier model: same shape, no price."
+    },
+    {
+      "active": false,
+      "config": {
+        "base_url": "http://localhost:8080/v1",
+        "concurrency": 1,
+        "harness": "http",
+        "model": "your-local-model",
+        "personality": "You are the house model. Be concise and concrete.\n",
+        "timeout": 180,
+        "vendor": "local"
+      },
+      "key_entry": null,
+      "lane_id": "8710760359fc4f4cb3a6efa6d6b3b1a4",
+      "name": "Local",
+      "notes": "local | A llama.cpp / vLLM server on your own hardware. No key needed."
+    },
+    {
+      "active": false,
+      "config": {
+        "args": [
+          "-p"
+        ],
+        "command": "claude",
+        "harness": "cli",
+        "model": "opus",
+        "personality": "You chair the roundtable. Weigh the strongest case on each side and say\nwhich one actually survives.\n",
+        "stdin": true,
+        "vendor": "anthropic"
+      },
+      "key_entry": null,
+      "lane_id": "094cda59430d405e8ce8c77d36be5ce0",
+      "name": "Chair",
+      "notes": "cli | Subscription-backed assistants, driven in one-shot print mode. THIS IS A COST BOUNDARY, NOT A STYLE CHOICE. These are $0 only through their own OAuth session. Rewriting one as an `http` lane pointed at the vendor API silently moves it onto metered credits, which bill separately from the subscription. The tool scrubs ANTHROPIC_API_KEY / OPENAI_API_KEY and friends from the child environment for exactly this reason."
+    },
+    {
+      "active": false,
+      "config": {
+        "args": [
+          "--model",
+          "some-model",
+          "-p",
+          "{prompt}"
+        ],
+        "command": "agy",
+        "harness": "cli",
+        "model": "some-model",
+        "personality": "You are the outsider. You have not seen this codebase before. Say what is\nconfusing on first read.\n",
+        "vendor": "google"
+      },
+      "key_entry": null,
+      "lane_id": "a5c645ac69084069a6a46e4fc4c5189b",
+      "name": "Outsider",
+      "notes": "Arg templates rather than hardcoded per-CLI logic: some CLIs take the prompt as an argument and consume the NEXT token as its value, so flags must come first. Encoding that here means a CLI change is a config edit, not a patch."
+    },
+    {
+      "active": false,
+      "config": {
+        "command": "/path/to/some-acp-binary",
+        "harness": "acp",
+        "model": "some-model",
+        "personality": "You are the protocol lane.\n",
+        "timeout": 180,
+        "vendor": "example"
+      },
+      "key_entry": null,
+      "lane_id": "c310510a988240d485a87080ec1fd023",
+      "name": "Protocol",
+      "notes": "acp | For agents that speak JSON-RPC over stdio and have no one-shot print mode. The tool does initialize -> session/new -> session/prompt -> kill, for one turn only. An ACP agent is a SERVER: it will sit there forever if allowed, so the process is created for the turn and killed with its process group at the end of it. Do not keep one warm between lanes."
+    },
+    {
+      "active": false,
+      "config": {
+        "base_url": "https://example.invalid/v1",
+        "harness": "http",
+        "model": "some-model",
+        "vendor": "example"
+      },
+      "key_entry": null,
+      "lane_id": "1b2436e0c4254cf48b991c9c882f48ec",
+      "name": "Parked",
+      "notes": "parked 2026-08-25 — answers were incoherent; see lane quality notes | disabled | Keep a lane with active:false rather than deleting it, so the reason it is off does not get lost."
+    }
+  ]
+}

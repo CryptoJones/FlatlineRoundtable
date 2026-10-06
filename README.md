@@ -90,6 +90,40 @@ value AES-256-GCM-encrypted under that key. A value typed on the command line is
 refused. `secrets check` prints only presence, length and key id. Runs do not
 read the store yet; until #109 lands they still use YAML and `pass`.
 
+The store also holds the lane roster (#108). Move a YAML config in once:
+
+```sh
+roundtable import-yaml ~/.config/flatline-roundtable/FlatlineRoundtable.yaml --dry-run
+roundtable import-yaml ~/.config/flatline-roundtable/FlatlineRoundtable.yaml --pull-secrets
+```
+
+`--dry-run` writes nothing and prints each lane with the notes taken from its
+YAML comments, because the store has no comments of its own. `--pull-secrets`
+copies each `key_entry` value from `pass` into the store, encrypted. Re-running
+the import changes nothing that has not changed.
+
+After that, lanes are edited with commands, and every write is checked by the
+same rules `load_config()` applies:
+
+```sh
+roundtable lanes list [--all]
+roundtable lanes add Skeptic --harness http --set model=vendor/model \
+    --set base_url=https://openrouter.ai/api/v1 --key-entry openrouter/skeptic
+roundtable lanes edit Skeptic --set timeout=120 --reason "slow on long briefs"
+roundtable lanes history Skeptic
+roundtable globals set budget_usd=0.50
+roundtable db export --out roster.json      # no secret values, ever
+roundtable db import roster.json --replace  # on another host
+```
+
+A change to a lane's config or `key_entry` is a new version in `lane_versions`.
+Renaming, enabling, disabling and editing notes are not, so a lane's record
+follows the lane rather than its name. `rename` keeps the old name as an alias,
+`retire` frees the name and keeps the history, and `clone` makes an inactive
+copy. `--set` values are JSON when they parse and strings otherwise.
+[`examples/roster.example.json`](examples/roster.example.json) is the example
+YAML config after `import-yaml` and `db export`.
+
 ## Cost
 
 **`harness` decides cost, not `model`.**

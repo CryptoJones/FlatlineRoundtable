@@ -49,6 +49,13 @@ Store (#105; runs do not read it yet -- YAML stays authoritative until #109):
                                            never argv
     roundtable secrets check [NAME...] | list | rotate NAME | rm NAME [--force]
     roundtable secrets rekey
+    roundtable lanes list [--all] | show NAME [--json] | history NAME
+    roundtable lanes add NAME --harness http|cli|acp [--set k=v ...] [--key-entry S]
+    roundtable lanes edit NAME [--set k=v] [--unset k] [--key-entry S] [--notes T]
+    roundtable lanes enable|disable|retire NAME | clone SRC NEW | rename OLD NEW
+    roundtable defaults|globals show | set k=v ... | unset k ...
+    roundtable db export [--out FILE] | import FILE [--merge|--replace]
+    roundtable import-yaml PATH [--dry-run] [--pull-secrets]   one-time move off YAML
 
   * Round 1 is blind by construction — a lane cannot see the others because
     their answers do not exist yet in its process. `--revise` and `--discuss`
@@ -61,6 +68,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures as cf
+import contextlib
 import datetime as dt
 import email.utils
 import getpass
@@ -80,6 +88,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from pathlib import Path
 
 try:
@@ -519,9 +528,9 @@ def fetch_keys(lanes: list[dict]) -> dict[str, str]:
 # --------------------------------------------------------------------------- #
 # store (#105)
 #
-# One SQLite file per host that will hold the lane roster, the lane secrets and
-# (later) metrics. In this PR it holds secrets only and nothing on the run path
-# reads it: load_config() / fetch_keys() still go to YAML and `pass` until #109.
+# One SQLite file per host holding the lane roster (#108), the lane secrets
+# (#107) and, later, metrics. Nothing on the run path reads it yet:
+# load_config() / fetch_keys() still go to YAML and `pass` until #109.
 #
 # Encryption is column-level: secrets.ciphertext is AES-256-GCM, everything else
 # is plain SQLite so `sqlite3` can still query it. SQLCipher was rejected -- it
@@ -596,6 +605,12 @@ MIGRATIONS = [
         lane_id TEXT NOT NULL REFERENCES lanes(lane_id),
         renamed_at TEXT NOT NULL
     );
+    """,
+    # 2 (#108): roster order. YAML order is the order --list shows and lanes run
+    # in. rowid is not a substitute: VACUUM may renumber the rowids of a table
+    # without an INTEGER PRIMARY KEY.
+    """
+    ALTER TABLE lanes ADD COLUMN position INTEGER
     """,
 ]
 SCHEMA_VERSION = len(MIGRATIONS)
@@ -800,10 +815,7 @@ def verify_db_key(conn: sqlite3.Connection, key: bytes) -> None:
 
 def open_store(path: Path) -> tuple[sqlite3.Connection, bytes]:
     """An initialised, migrated store plus its verified key."""
-    conn = open_db(path)
-    if schema_version(conn) < SCHEMA_VERSION:
-        die(f"store is at schema {schema_version(conn)}, this roundtable needs "
-            f"{SCHEMA_VERSION} — run:  roundtable db migrate")
+    conn = open_roster(path)
     key = load_db_key()
     verify_db_key(conn, key)
     return conn, key
@@ -842,8 +854,12 @@ def _referencing_lanes(conn: sqlite3.Connection, name: str) -> list[str]:
 # store admin commands
 # --------------------------------------------------------------------------- #
 ADMIN_VERBS = {
-    "db": ("init", "migrate", "doctor"),
+    "db": ("init", "migrate", "doctor", "export", "import"),
     "secrets": ("set", "check", "list", "rotate", "rm", "rekey"),
+    "lanes": ("list", "show", "add", "edit", "enable", "disable", "retire", "clone",
+              "rename", "history"),
+    "defaults": ("show", "set", "unset"),
+    "globals": ("show", "set", "unset"),
 }
 
 
@@ -854,6 +870,10 @@ def is_admin_argv(argv: list[str]) -> bool:
     stay a brief. Only a known group followed by nothing, a known verb or a
     flag counts.
     """
+    if argv and argv[0] == "import-yaml":
+        # Takes a path, not a verb: `import-yaml is broken` stays a brief.
+        return len(argv) == 1 or argv[1].startswith("-") or \
+            argv[1].lower().endswith((".yaml", ".yml", ".example"))
     if not argv or argv[0] not in ADMIN_VERBS:
         return False
     return len(argv) == 1 or argv[1] in ADMIN_VERBS[argv[0]] or argv[1].startswith("-")
@@ -939,6 +959,10 @@ def cmd_db_doctor(a) -> int:
         problems += 1
     n = conn.execute("SELECT count(*) FROM secrets").fetchone()[0]
     print(f"secrets    {n}")
+    if ver >= 2:
+        live, on = conn.execute("SELECT count(*), coalesce(sum(active), 0) FROM lanes "
+                                "WHERE retired_at IS NULL").fetchone()
+        print(f"lanes      {live} live, {on} active")
     orphans = conn.execute(
         "SELECT l.name, l.key_entry FROM lanes l LEFT JOIN secrets s ON s.name = l.key_entry "
         "WHERE l.key_entry IS NOT NULL AND l.retired_at IS NULL AND s.name IS NULL "
@@ -1066,6 +1090,736 @@ def cmd_secrets_rekey(a) -> int:
     return 0
 
 
+# --------------------------------------------------------------------------- #
+# lane roster in the store (#108)
+#
+# A YAML lane dict is split four ways on the way in: `name`, `active`, `notes`
+# and `key_entry` are columns, everything else is the `config` JSON. Only a
+# change to config or key_entry is a new version -- the record a lane's track
+# record will hang on (#89) -- so renaming, parking or annotating a lane does
+# not reset its history. store_roster() puts the pieces back together in the
+# shape yaml.safe_load() returns, so validate_config() is the one rule set for
+# both sources. Nothing on the run path reads any of this until #109.
+# --------------------------------------------------------------------------- #
+LANE_COLUMNS = {
+    "name": "roundtable lanes rename OLD NEW",
+    "active": "roundtable lanes enable|disable NAME",
+    "notes": "--notes",
+    "key_entry": "--key-entry",
+}
+GLOBAL_KEYS = ("budget_usd", "concurrency", "deadline_seconds", "retries",
+               "synthesizer", "synthesizers")
+ROSTER_FORMAT = "flatline-roundtable/roster"
+LANE_SELECT = ("SELECT lane_id, name, active, notes, key_entry, config, version, "
+               "retired_at, created_at, updated_at FROM lanes")
+# NULL positions (rows written before migration 2) sort last, oldest first.
+LANE_ORDER = " ORDER BY position IS NULL, position, created_at, lane_id"
+
+
+@contextlib.contextmanager
+def _tx(conn: sqlite3.Connection):
+    """One write transaction. die() raises SystemExit, which rolls back too:
+    a lane that fails validation is never left half-written."""
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        yield
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
+    conn.execute("COMMIT")
+
+
+def _canon(obj) -> str:
+    # One spelling per config, so a version bump means the config changed and
+    # never that a dict happened to iterate in another order.
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _actor() -> str:
+    try:
+        user = getpass.getuser()
+    except Exception:  # noqa: BLE001 -- no passwd entry in some containers
+        user = "?"
+    return f"{user}@{socket.gethostname()}"
+
+
+def open_roster(path: Path) -> sqlite3.Connection:
+    """A migrated store, without the DB key: lanes, defaults and globals hold
+    no secret, so reading or editing them must not need gpg-agent."""
+    conn = open_db(path)
+    if schema_version(conn) < SCHEMA_VERSION:
+        die(f"store is at schema {schema_version(conn)}, this roundtable needs "
+            f"{SCHEMA_VERSION} — run:  roundtable db migrate")
+    return conn
+
+
+def _lane(r) -> dict:
+    keys = ("lane_id", "name", "active", "notes", "key_entry", "config", "version",
+            "retired_at", "created_at", "updated_at")
+    lane = dict(zip(keys, r))
+    lane["active"] = bool(lane["active"])
+    lane["config"] = json.loads(lane["config"])
+    return lane
+
+
+def _live_lanes(conn: sqlite3.Connection) -> list[dict]:
+    return [_lane(r) for r in conn.execute(LANE_SELECT + " WHERE retired_at IS NULL" + LANE_ORDER)]
+
+
+def _find_lane(conn: sqlite3.Connection, name: str, retired: bool = False) -> dict:
+    """The live lane called `name`, case-insensitively like --lanes.
+
+    With retired=True an old name also resolves -- through lane_aliases, or to
+    the most recently retired lane of that name -- so `lanes history` and
+    `lanes show` still answer for a lane that is gone.
+    """
+    r = conn.execute(LANE_SELECT + " WHERE lower(name) = lower(?) AND retired_at IS NULL",
+                     (name,)).fetchone()
+    if r is None and retired:
+        r = conn.execute(LANE_SELECT + " WHERE lane_id = (SELECT lane_id FROM lane_aliases "
+                         "WHERE lower(old_name) = lower(?))", (name,)).fetchone()
+        r = r or conn.execute(LANE_SELECT + " WHERE lower(name) = lower(?) "
+                              "ORDER BY retired_at DESC", (name,)).fetchone()
+    if r is None:
+        die(f"no lane {name!r} — `roundtable lanes list --all` shows every lane")
+    return _lane(r)
+
+
+def _kv(conn: sqlite3.Connection, table: str) -> dict:
+    assert table in ("globals", "defaults")
+    return {k: json.loads(v) for k, v in conn.execute(f"SELECT key, value FROM {table} ORDER BY key")}
+
+
+def _lane_dict(lane: dict) -> dict:
+    """A stored lane as the YAML lane dict it came from."""
+    d = {"name": lane["name"], "active": lane["active"]}
+    if lane["key_entry"] is not None:
+        d["key_entry"] = lane["key_entry"]
+    if lane["notes"] is not None:
+        d["notes"] = lane["notes"]
+    return {**d, **lane["config"]}
+
+
+def store_roster(conn: sqlite3.Connection) -> dict:
+    """The live roster in the shape yaml.safe_load() returns, so the same
+    validate_config() call accepts either."""
+    cfg = _kv(conn, "globals")
+    defaults = _kv(conn, "defaults")
+    if defaults:
+        cfg["defaults"] = defaults
+    cfg["lanes"] = [_lane_dict(l) for l in _live_lanes(conn)]
+    return cfg
+
+
+def validate_store(conn: sqlite3.Connection) -> None:
+    """Die, inside the caller's transaction, unless the live roster would pass
+    load_config(). Run after every write, so the messages are load_config()'s
+    own and the store never holds a roster a run would refuse."""
+    roster = store_roster(conn)
+    if not roster["lanes"]:
+        return
+    validate_config(roster, "the store")
+    # validate_config() compares names exactly, but --lanes matches them
+    # case-insensitively, so `Skeptic` and `skeptic` would be one lane to a run.
+    seen: set[str] = set()
+    for lane in roster["lanes"]:
+        if lane["name"].lower() in seen:
+            die(f"duplicate lane name {lane['name']!r} — names must be unique")
+        seen.add(lane["name"].lower())
+
+
+def _check_config_keys(keys) -> None:
+    for k in keys:
+        if k in LANE_COLUMNS:
+            die(f"{k} is not part of a lane's config — use:  {LANE_COLUMNS[k]}")
+
+
+def _check_key_entry(name: str | None) -> None:
+    if name is not None and not SECRET_NAME_RE.match(name):
+        die(f"key_entry {name!r} may use only letters, digits and . _ @ + / -")
+
+
+def _check_global(key: str, value) -> None:
+    if key not in GLOBAL_KEYS:
+        die(f"unknown global {key!r} — one of: {', '.join(GLOBAL_KEYS)}")
+    num = isinstance(value, (int, float)) and not isinstance(value, bool)
+    whole = num and float(value).is_integer()
+    ok = {
+        "concurrency": whole and value >= 1,
+        "retries": whole and value >= 0,
+        "synthesizers": whole and value >= 1,
+        "deadline_seconds": num and value > 0,
+        "budget_usd": num and value >= 0,
+        "synthesizer": isinstance(value, str) and value != "",
+    }[key]
+    if not ok:
+        die(f"{key}: {value!r} is not a valid value")
+
+
+def _parse_sets(items) -> dict:
+    """`--set k=v`: v is JSON when it parses (300, true, ["-p"]), else a string."""
+    out = {}
+    for item in items or []:
+        k, sep, v = item.partition("=")
+        if not sep or not k:
+            die(f"expected KEY=VALUE, got {item!r}")
+        try:
+            out[k] = json.loads(v)
+        except ValueError:
+            out[k] = v
+    return out
+
+
+def _record_version(conn, lane_id: str, version: int, config: dict,
+                    key_entry: str | None, reason: str | None) -> None:
+    text = _canon(config)
+    conn.execute(
+        "INSERT INTO lane_versions (lane_id, version, config, config_sha256, key_entry, "
+        "changed_at, changed_by, reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (lane_id, version, text, hashlib.sha256(text.encode()).hexdigest(), key_entry,
+         _now(), _actor(), reason))
+
+
+def _next_position(conn) -> int:
+    return conn.execute("SELECT coalesce(max(position), -1) + 1 FROM lanes").fetchone()[0]
+
+
+def _insert_lane(conn, name: str, config: dict, key_entry: str | None, notes: str | None,
+                 active: bool, reason: str | None, lane_id: str | None = None,
+                 position: int | None = None) -> str:
+    lane_id = lane_id or uuid.uuid4().hex
+    now = _now()
+    try:
+        conn.execute(
+            "INSERT INTO lanes (lane_id, name, active, notes, key_entry, config, version, "
+            "position, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?)",
+            (lane_id, name, int(active), notes, key_entry, _canon(config),
+             _next_position(conn) if position is None else position, now, now))
+    except sqlite3.IntegrityError:
+        # The live-name index is case-insensitive; the message is load_config()'s.
+        die(f"duplicate lane name {name!r} — names must be unique")
+    _record_version(conn, lane_id, 1, config, key_entry, reason)
+    return lane_id
+
+
+def _update_config(conn, lane: dict, config: dict, key_entry: str | None,
+                   reason: str | None) -> bool:
+    """New version only if config or key_entry really changed."""
+    if _canon(config) == _canon(lane["config"]) and key_entry == lane["key_entry"]:
+        return False
+    version = lane["version"] + 1
+    conn.execute("UPDATE lanes SET config = ?, key_entry = ?, version = ?, updated_at = ? "
+                 "WHERE lane_id = ?", (_canon(config), key_entry, version, _now(), lane["lane_id"]))
+    _record_version(conn, lane["lane_id"], version, config, key_entry, reason)
+    lane.update(config=config, key_entry=key_entry, version=version)
+    return True
+
+
+def _rename(conn, lane: dict, new: str) -> None:
+    try:
+        conn.execute("UPDATE lanes SET name = ?, updated_at = ? WHERE lane_id = ?",
+                     (new, _now(), lane["lane_id"]))
+    except sqlite3.IntegrityError:
+        die(f"duplicate lane name {new!r} — names must be unique")
+    # So a transcript written under the old name stays attributable. A name
+    # reused and renamed again later points at its latest owner.
+    conn.execute("INSERT OR REPLACE INTO lane_aliases (old_name, lane_id, renamed_at) "
+                 "VALUES (?, ?, ?)", (lane["name"], lane["lane_id"], _now()))
+    lane["name"] = new
+
+
+def _warn_missing_secret(conn, key_entry: str | None) -> None:
+    if key_entry and not conn.execute("SELECT 1 FROM secrets WHERE name = ?",
+                                      (key_entry,)).fetchone():
+        print(f"  note: secret {key_entry!r} is not in the store yet — "
+              f"roundtable secrets set {key_entry}")
+
+
+def cmd_lanes_list(a) -> int:
+    conn = open_roster(a.config)
+    where = "" if a.all else " WHERE retired_at IS NULL"
+    lanes = [_lane(r) for r in conn.execute(LANE_SELECT + where + LANE_ORDER)]
+    if not lanes:
+        print("no lanes stored")
+    for l in lanes:
+        state = "retired" if l["retired_at"] else ("active" if l["active"] else "inactive")
+        c = l["config"]
+        print(f"{l['name']}\t{state}\t{c.get('harness', '-')}\t{c.get('vendor') or '-'}\t"
+              f"{c.get('model') or '-'}\tv{l['version']}\tkey={l['key_entry'] or '-'}")
+    return 0
+
+
+def cmd_lanes_show(a) -> int:
+    conn = open_roster(a.config)
+    lane = _find_lane(conn, a.name, retired=True)
+    lane["aliases"] = [r[0] for r in conn.execute(
+        "SELECT old_name FROM lane_aliases WHERE lane_id = ? ORDER BY renamed_at",
+        (lane["lane_id"],))]
+    if a.json:
+        print(json.dumps(lane, indent=2, sort_keys=True, ensure_ascii=False))
+        return 0
+    for k in ("name", "lane_id", "active", "retired_at", "version", "key_entry", "notes",
+              "aliases", "created_at", "updated_at"):
+        v = lane[k]
+        print(f"{k:<11}{', '.join(v) if isinstance(v, list) else ('-' if v is None else v)}")
+    print("config")
+    for line in json.dumps(lane["config"], indent=2, sort_keys=True,
+                           ensure_ascii=False).splitlines():
+        print(f"  {line}")
+    return 0
+
+
+def cmd_lanes_add(a) -> int:
+    config = {"harness": a.harness, **_parse_sets(a.set)}
+    _check_config_keys(config)
+    _check_key_entry(a.key_entry)
+    conn = open_roster(a.config)
+    with _tx(conn):
+        lane_id = _insert_lane(conn, a.name, config, a.key_entry, a.notes, True,
+                               a.reason or "added")
+        validate_store(conn)
+    print(f"added {a.name} (lane id {lane_id}, version 1)")
+    _warn_missing_secret(conn, a.key_entry)
+    return 0
+
+
+def cmd_lanes_edit(a) -> int:
+    sets = _parse_sets(a.set)
+    _check_config_keys(sets)
+    _check_config_keys(u for u in a.unset if u != "key_entry")
+    _check_key_entry(a.key_entry)
+    conn = open_roster(a.config)
+    with _tx(conn):
+        lane = _find_lane(conn, a.name)
+        config = {**lane["config"], **sets}
+        for k in a.unset:
+            if k != "key_entry" and k not in config:
+                die(f"{lane['name']} has no {k} to unset")
+            config.pop(k, None)
+        key_entry = None if "key_entry" in a.unset else (a.key_entry or lane["key_entry"])
+        before = lane["version"]
+        changed = _update_config(conn, lane, config, key_entry, a.reason)
+        if a.notes is not None:
+            conn.execute("UPDATE lanes SET notes = ?, updated_at = ? WHERE lane_id = ?",
+                         (a.notes or None, _now(), lane["lane_id"]))
+        validate_store(conn)
+    if changed:
+        print(f"{lane['name']}: version {before} -> {lane['version']}")
+    elif a.notes is not None:
+        print(f"{lane['name']}: notes updated (version {before}, unchanged)")
+    else:
+        print(f"{lane['name']}: no change (version {before})")
+    if changed:
+        _warn_missing_secret(conn, key_entry)
+    return 0
+
+
+def _set_active(a, active: bool) -> int:
+    conn = open_roster(a.config)
+    with _tx(conn):
+        lane = _find_lane(conn, a.name)
+        conn.execute("UPDATE lanes SET active = ?, updated_at = ? WHERE lane_id = ?",
+                     (int(active), _now(), lane["lane_id"]))
+    word = "active" if active else "inactive"
+    print(f"{lane['name']}: {'already ' if lane['active'] == active else ''}{word}")
+    return 0
+
+
+def cmd_lanes_retire(a) -> int:
+    conn = open_roster(a.config)
+    with _tx(conn):
+        lane = _find_lane(conn, a.name)
+        conn.execute("UPDATE lanes SET retired_at = ?, updated_at = ? WHERE lane_id = ?",
+                     (_now(), _now(), lane["lane_id"]))
+    print(f"retired {lane['name']} (lane id {lane['lane_id']}, version {lane['version']}); "
+          f"the name is free and its history is kept")
+    return 0
+
+
+def cmd_lanes_clone(a) -> int:
+    conn = open_roster(a.config)
+    with _tx(conn):
+        src = _find_lane(conn, a.src)
+        # Inactive on purpose: once runs read the store (#109), an active clone
+        # would join the next --each run and bill alongside its original.
+        lane_id = _insert_lane(conn, a.new, src["config"], src["key_entry"], None, False,
+                               f"cloned from {src['name']} v{src['version']} ({src['lane_id']})")
+        validate_store(conn)
+    print(f"cloned {src['name']} as {a.new} (lane id {lane_id}, version 1, inactive — "
+          f"roundtable lanes enable {a.new})")
+    return 0
+
+
+def cmd_lanes_rename(a) -> int:
+    conn = open_roster(a.config)
+    with _tx(conn):
+        lane = _find_lane(conn, a.old)
+        old = lane["name"]
+        if old == a.new:
+            die(f"{old} is already called {a.new}")
+        _rename(conn, lane, a.new)
+        validate_store(conn)
+    print(f"renamed {old} -> {a.new} (lane id {lane['lane_id']}, version {lane['version']}; "
+          f"{old} stays as an alias)")
+    return 0
+
+
+def cmd_lanes_history(a) -> int:
+    conn = open_roster(a.config)
+    lane = _find_lane(conn, a.name, retired=True)
+    print(f"{lane['name']} (lane id {lane['lane_id']})")
+    for v, at, by, sha, ke, why in conn.execute(
+            "SELECT version, changed_at, changed_by, config_sha256, key_entry, reason "
+            "FROM lane_versions WHERE lane_id = ? ORDER BY version", (lane["lane_id"],)):
+        print(f"v{v}\t{at}\t{by or '-'}\tsha {sha[:12]}\tkey={ke or '-'}\t{why or ''}")
+    for old, at in conn.execute("SELECT old_name, renamed_at FROM lane_aliases "
+                                "WHERE lane_id = ? ORDER BY renamed_at", (lane["lane_id"],)):
+        print(f"renamed from {old} at {at}")
+    if lane["retired_at"]:
+        print(f"retired at {lane['retired_at']}")
+    return 0
+
+
+def _kv_cmd(table: str):
+    def show(a) -> int:
+        rows = _kv(open_roster(a.config), table)
+        if not rows:
+            print(f"no {table} set")
+        for k, v in rows.items():
+            print(f"{k}\t{json.dumps(v, ensure_ascii=False)}")
+        return 0
+
+    def set_(a) -> int:
+        items = _parse_sets(a.items)
+        for k, v in items.items():
+            if table == "globals":
+                _check_global(k, v)
+            elif k == "name":
+                die("defaults cannot set a lane's name")
+        conn = open_roster(a.config)
+        with _tx(conn):
+            conn.executemany(f"INSERT OR REPLACE INTO {table} (key, value, updated_at) "
+                             f"VALUES (?, ?, ?)",
+                             [(k, _canon(v), _now()) for k, v in items.items()])
+            validate_store(conn)
+        print(f"{table}: set {', '.join(items)}")
+        return 0
+
+    def unset(a) -> int:
+        conn = open_roster(a.config)
+        with _tx(conn):
+            for k in a.keys:
+                if conn.execute(f"DELETE FROM {table} WHERE key = ?", (k,)).rowcount == 0:
+                    die(f"{table} has no {k}")
+            validate_store(conn)
+        print(f"{table}: unset {', '.join(a.keys)}")
+        return 0
+
+    return show, set_, unset
+
+
+def export_roster(conn: sqlite3.Connection) -> dict:
+    """Everything a second host needs to run the same panel, except values.
+
+    lane_id rides along so a lane keeps one identity -- and one track record
+    -- on every host it is imported to. Versions and timestamps do not: they
+    describe this host's edit history, and leaving them out is what lets
+    export -> import --replace -> export come back byte-identical.
+    """
+    return {
+        "format": ROSTER_FORMAT,
+        "format_version": 1,
+        "globals": _kv(conn, "globals"),
+        "defaults": _kv(conn, "defaults"),
+        "lanes": [{"lane_id": l["lane_id"], "name": l["name"], "active": l["active"],
+                   "key_entry": l["key_entry"], "notes": l["notes"], "config": l["config"]}
+                  for l in _live_lanes(conn)],
+    }
+
+
+def dump_roster(doc: dict) -> str:
+    return json.dumps(doc, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+
+
+def _check_roster_doc(doc, where: str) -> None:
+    if not isinstance(doc, dict) or doc.get("format") != ROSTER_FORMAT:
+        die(f"{where} is not a roster export (no \"format\": \"{ROSTER_FORMAT}\")")
+    if doc.get("format_version") != 1:
+        die(f"{where} is roster format {doc.get('format_version')!r}; this roundtable reads 1")
+    for k in ("globals", "defaults"):
+        if not isinstance(doc.get(k, {}), dict):
+            die(f"{where}: {k} must be a mapping")
+    if not isinstance(doc.get("lanes"), list):
+        die(f"{where}: lanes must be a list")
+    for i, l in enumerate(doc["lanes"]):
+        if not isinstance(l, dict) or not isinstance(l.get("config"), dict):
+            die(f"{where}: lane #{i + 1} needs a config mapping")
+        if not isinstance(l.get("name"), str) or not l["name"]:
+            die(f"{where}: lane #{i + 1} has no name")
+        _check_config_keys(l["config"])
+        # Checked, not coerced: bool("false") is True, and once runs read the
+        # store an "inactive" lane that is really active joins runs and bills.
+        if not isinstance(l.get("active", True), bool):
+            die(f"{where}: lane #{i + 1}: active must be true or false, got {l['active']!r}")
+        for k in ("key_entry", "notes", "lane_id"):
+            if l.get(k) is not None and not isinstance(l[k], str):
+                die(f"{where}: lane #{i + 1}: {k} must be a string, got {l[k]!r}")
+        _check_key_entry(l.get("key_entry"))
+
+
+def apply_roster(conn: sqlite3.Connection, doc: dict, replace: bool, reason: str) -> dict:
+    """Make the store hold `doc`, inside the caller's transaction.
+
+    A lane is matched by lane_id, else by live name. replace retires every live
+    lane the document does not mention and makes globals and defaults exactly
+    the document's; merge only adds and updates. Returns counts for the report.
+    """
+    counts = {"added": 0, "updated": 0, "unchanged": 0, "retired": 0}
+    for table in ("globals", "defaults"):
+        if replace:
+            conn.execute(f"DELETE FROM {table}")
+        for k, v in doc.get(table, {}).items():
+            if table == "globals":
+                _check_global(k, v)
+            conn.execute(f"INSERT OR REPLACE INTO {table} (key, value, updated_at) "
+                         f"VALUES (?, ?, ?)", (k, _canon(v), _now()))
+
+    ids = {l.get("lane_id") for l in doc["lanes"]} - {None}
+    names = {l["name"].lower() for l in doc["lanes"] if not l.get("lane_id")}
+    if replace:
+        # Before any insert: a lane the document drops may hold a name that one
+        # of its own lanes is about to take.
+        for l in _live_lanes(conn):
+            if l["lane_id"] not in ids and l["name"].lower() not in names:
+                conn.execute("UPDATE lanes SET retired_at = ?, updated_at = ? WHERE lane_id = ?",
+                             (_now(), _now(), l["lane_id"]))
+                counts["retired"] += 1
+
+    for pos, d in enumerate(doc["lanes"]):
+        r = None
+        if d.get("lane_id"):
+            r = conn.execute(LANE_SELECT + " WHERE lane_id = ?", (d["lane_id"],)).fetchone()
+        else:
+            r = conn.execute(LANE_SELECT + " WHERE lower(name) = lower(?) AND retired_at IS NULL",
+                             (d["name"],)).fetchone()
+        active = bool(d.get("active", True))
+        if r is None:
+            _insert_lane(conn, d["name"], d["config"], d.get("key_entry"), d.get("notes"),
+                         active, reason, lane_id=d.get("lane_id"),
+                         position=pos if replace else None)
+            counts["added"] += 1
+            continue
+        lane = _lane(r)
+        changed = _update_config(conn, lane, d["config"], d.get("key_entry"), reason)
+        if lane["name"] != d["name"]:
+            _rename(conn, lane, d["name"])
+        try:
+            conn.execute("UPDATE lanes SET active = ?, notes = ?, retired_at = NULL, "
+                         "position = coalesce(?, position), updated_at = ? WHERE lane_id = ?",
+                         (int(active), d.get("notes"), pos if replace else None, _now(),
+                          lane["lane_id"]))
+        except sqlite3.IntegrityError:
+            # A retired lane coming back while a newer live lane holds its name.
+            die(f"duplicate lane name {d['name']!r} — names must be unique "
+                f"(lane id {lane['lane_id']} is retired here and its name is taken)")
+        counts["updated" if changed else "unchanged"] += 1
+    validate_store(conn)
+    return counts
+
+
+def _report(counts: dict) -> str:
+    return ", ".join(f"{n} {k}" for k, n in counts.items())
+
+
+def cmd_db_export(a) -> int:
+    text = dump_roster(export_roster(open_roster(a.config)))
+    if a.out is None:
+        sys.stdout.write(text)
+        return 0
+    # Holds no secret value, but a base_url can carry credentials (safe_route
+    # exists for that reason), so the file is private like everything else.
+    fd = os.open(a.out, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.fchmod(fd, 0o600)          # O_CREAT's mode applies only to a NEW file
+    with os.fdopen(fd, "w") as f:
+        f.write(text)
+    print(f"exported to {a.out}")
+    return 0
+
+
+def cmd_db_import(a) -> int:
+    try:
+        doc = json.loads(a.file.read_text())
+    except (OSError, ValueError) as e:
+        die(f"cannot read {a.file}: {e}")
+    _check_roster_doc(doc, str(a.file))
+    conn = open_roster(a.config)
+    with _tx(conn):
+        counts = apply_roster(conn, doc, a.replace, f"db import {a.file.name}")
+    print(f"imported {a.file} ({'replace' if a.replace else 'merge'}): {_report(counts)}")
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+# import-yaml: the one-time move off YAML
+# --------------------------------------------------------------------------- #
+_DECORATION = re.compile(r"^[-=*#~_ ]+|[-=*#~_ ]+$")
+_TRAILING = re.compile(r"^\s*(?:-\s+)?(?:active|key_entry)\s*:\s*[^#\n]*?\s#\s?(.*)$")
+
+
+def _comment_text(line: str) -> tuple[str, bool]:
+    text = line.strip().lstrip("#").strip()
+    return _DECORATION.sub("", text), bool(re.search(r"[-=]{3,}", text))
+
+
+def yaml_lane_comments(text: str, n: int) -> list[list[str]] | None:
+    """The comments that explain each lane, as a list of notes per lane.
+
+    Comments in this YAML are load-bearing ("keep it off: answers were
+    incoherent"), and the store has no comments, so they move into `notes`:
+    the full-line comment block directly above a lane (no blank line between)
+    and a trailing `# ...` on its `active:` or `key_entry:` line. Which comment
+    belongs to which lane is a guess -- a section banner lands on the first
+    lane under it -- so `import-yaml --dry-run` prints the result for review.
+    None when the lanes cannot be lined up with the parsed list.
+    """
+    lines = text.splitlines()
+    start = next((i for i, l in enumerate(lines) if re.match(r"lanes\s*:\s*(#.*)?$", l)), None)
+    if start is None:
+        return None
+    items, indent, stop = [], None, len(lines)
+    for i in range(start + 1, len(lines)):
+        l = lines[i]
+        if l.strip() and not l[0].isspace() and l[0] not in "#-":
+            stop = i                                # the next top-level key
+            break
+        m = re.match(r"( *)-(\s|$)", l)
+        if m and (indent is None or len(m.group(1)) == indent):
+            indent = len(m.group(1))
+            items.append(i)
+    if len(items) != n:
+        return None
+    notes = []
+    for k, at in enumerate(items):
+        pieces: list[str] = []
+        block = []
+        j = at - 1
+        # Only comments at or left of the item's dash: a deeper `# ...` is the
+        # tail of the previous lane's block scalar, not a comment.
+        while j > start and lines[j].strip().startswith("#") \
+                and len(lines[j]) - len(lines[j].lstrip()) <= indent:
+            block.append(lines[j])
+            j -= 1
+        para: list[str] = []
+        for line in reversed(block):
+            t, banner = _comment_text(line)
+            if banner:
+                pieces += [" ".join(para)] if para else []
+                para = []
+                pieces += [t] if t else []
+            elif t:
+                para.append(t)
+        pieces += [" ".join(para)] if para else []
+        end = items[k + 1] if k + 1 < len(items) else stop
+        for line in lines[at:end]:
+            m = _TRAILING.match(line)
+            if m and m.group(1).strip():
+                pieces.append(m.group(1).strip())
+        notes.append(pieces)
+    return notes
+
+
+def yaml_to_roster(path: Path) -> dict:
+    """A YAML config as a roster document db import accepts.
+
+    load_config() runs first, so a config a run would refuse -- the YAML 1.1
+    `Off` lane name (#29), a cli lane with no prompt -- is refused here with
+    the same message, before anything is written.
+    """
+    text = path.read_text()
+    load_config(path)
+    raw = yaml.safe_load(text)
+    defaults = raw.get("defaults") or {}
+    globals_ = {k: v for k, v in raw.items() if k not in ("lanes", "defaults")}
+    for k in sorted(set(globals_) - set(GLOBAL_KEYS)):
+        print(f"  note: top-level {k!r} is not a setting roundtable reads — not imported",
+              file=sys.stderr)
+        globals_.pop(k)
+    comments = yaml_lane_comments(text, len(raw["lanes"]))
+    if comments is None:
+        print("  note: could not line comments up with lanes — only `notes:` values are kept",
+              file=sys.stderr)
+        comments = [[] for _ in raw["lanes"]]
+    lanes = []
+    for l, extra in zip(raw["lanes"], comments):
+        config = {k: v for k, v in l.items() if k not in LANE_COLUMNS}
+        try:
+            _canon(config)
+        except TypeError as e:
+            die(f"{l['name']}: a value is not plain data ({e}) — quote it in the YAML")
+        pieces = ([str(l["notes"])] if l.get("notes") else []) + extra
+        lanes.append({
+            "lane_id": None,
+            "name": l["name"],
+            # Same truthiness the run path applies: l.get("active", True).
+            "active": bool(l.get("active", defaults.get("active", True))),
+            "key_entry": l.get("key_entry"),
+            "notes": " | ".join(pieces) or None,
+            "config": config,
+        })
+    try:
+        _canon([globals_, defaults])
+    except TypeError as e:
+        die(f"{path}: a default or global is not plain data ({e}) — quote it")
+    return {"format": ROSTER_FORMAT, "format_version": 1, "globals": globals_,
+            "defaults": defaults, "lanes": lanes}
+
+
+def cmd_import_yaml(a) -> int:
+    if not a.path.exists():
+        die(f"no YAML at {a.path}")
+    doc = yaml_to_roster(a.path)
+    _check_roster_doc(doc, str(a.path))
+    entries = sorted({l["key_entry"] for l in doc["lanes"] if l["key_entry"]}
+                     | ({doc["defaults"]["key_entry"]} if doc["defaults"].get("key_entry") else set()))
+    if a.dry_run:
+        for l in doc["lanes"]:
+            print(f"{l['name']}\t{'active' if l['active'] else 'inactive'}\t"
+                  f"{l['config'].get('harness')}\tnotes: {l['notes'] or '-'}")
+        print(f"{len(doc['lanes'])} lane(s), globals {sorted(doc['globals']) or '-'}, "
+              f"defaults {sorted(doc['defaults']) or '-'}, {len(entries)} key entr"
+              f"{'y' if len(entries) == 1 else 'ies'}. Nothing written (--dry-run).")
+        return 0
+    if a.pull_secrets:
+        conn, key = open_store(a.config)
+        have = {r[0] for r in conn.execute("SELECT name FROM secrets")}
+        # Every value is read before anything is written, through the same
+        # one-pass-per-entry path a run uses, so a locked gpg-agent fails the
+        # import cleanly instead of half-way through.
+        pulled = fetch_keys([{"key_entry": e} for e in entries if e not in have])
+    else:
+        conn, pulled = open_roster(a.config), {}
+    vendor = {}
+    for l in doc["lanes"]:
+        vendor.setdefault(l["key_entry"], l["config"].get("vendor"))
+    with _tx(conn):
+        counts = apply_roster(conn, doc, False, f"import-yaml {a.path.name}")
+        for name, value in pulled.items():
+            ct, nonce, kid = encrypt_secret(key, name, value)
+            conn.execute(
+                "INSERT INTO secrets (name, ciphertext, nonce, key_id, vendor, notes, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (name, ct, nonce, kid, vendor.get(name), f"pulled from pass {name}", _now()))
+    print(f"imported {a.path}: {_report(counts)}")
+    if a.pull_secrets:
+        kept = [e for e in entries if e not in pulled]
+        print(f"secrets: {len(pulled)} pulled from pass"
+              + (f", {len(kept)} already in the store" if kept else ""))
+    else:
+        for e in entries:
+            _warn_missing_secret(conn, e)
+    return 0
+
+
 def admin_main(argv: list[str]) -> int:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--config", type=Path, default=DEFAULT_DB,
@@ -1081,6 +1835,85 @@ def admin_main(argv: list[str]) -> int:
         .set_defaults(fn=cmd_db_migrate)
     dbv.add_parser("doctor", parents=[common], help="check mode, schema, integrity and key") \
         .set_defaults(fn=cmd_db_doctor)
+    p = dbv.add_parser("export", parents=[common],
+                       help="roster as JSON: globals, defaults, lanes; never a secret value")
+    p.add_argument("--out", type=Path, help="write here (0600) instead of stdout")
+    p.set_defaults(fn=cmd_db_export)
+    p = dbv.add_parser("import", parents=[common], help="load a `db export` file")
+    p.add_argument("file", type=Path)
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument("--merge", action="store_true",
+                      help="add and update lanes, keep the rest (default)")
+    mode.add_argument("--replace", action="store_true",
+                      help="make the roster exactly the file; unlisted lanes are retired")
+    p.set_defaults(fn=cmd_db_import)
+
+    ln = groups.add_parser("lanes", help="the lane roster in the store")
+    lv = ln.add_subparsers(dest="verb", required=True)
+    p = lv.add_parser("list", parents=[common], help="live lanes, in roster order")
+    p.add_argument("--all", action="store_true", help="include retired lanes")
+    p.set_defaults(fn=cmd_lanes_list)
+    p = lv.add_parser("show", parents=[common], help="one lane; the secret's name only")
+    p.add_argument("name")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_lanes_show)
+    p = lv.add_parser("add", parents=[common], help="a new lane, validated like load_config")
+    p.add_argument("name")
+    p.add_argument("--harness", required=True)
+    p.add_argument("--set", action="append", metavar="KEY=VALUE",
+                   help="config key; VALUE is JSON when it parses, else a string")
+    p.add_argument("--key-entry", help="the NAME of the secret this lane uses")
+    p.add_argument("--notes")
+    p.add_argument("--reason")
+    p.set_defaults(fn=cmd_lanes_add)
+    p = lv.add_parser("edit", parents=[common], help="change config; a real change is a new version")
+    p.add_argument("name")
+    p.add_argument("--set", action="append", metavar="KEY=VALUE")
+    p.add_argument("--unset", action="append", default=[], metavar="KEY")
+    p.add_argument("--key-entry")
+    p.add_argument("--notes", help="replace the notes ('' clears); no new version")
+    p.add_argument("--reason", help="recorded with the new version")
+    p.set_defaults(fn=cmd_lanes_edit)
+    for verb, on in (("enable", True), ("disable", False)):
+        p = lv.add_parser(verb, parents=[common], help=f"set active {str(on).lower()}; no new version")
+        p.add_argument("name")
+        p.set_defaults(fn=lambda a, on=on: _set_active(a, on))
+    p = lv.add_parser("retire", parents=[common], help="free the name, keep the history")
+    p.add_argument("name")
+    p.set_defaults(fn=cmd_lanes_retire)
+    p = lv.add_parser("clone", parents=[common], help="copy a lane's config under a new name (inactive)")
+    p.add_argument("src")
+    p.add_argument("new")
+    p.set_defaults(fn=cmd_lanes_clone)
+    p = lv.add_parser("rename", parents=[common], help="new name, same lane; the old name stays an alias")
+    p.add_argument("old")
+    p.add_argument("new")
+    p.set_defaults(fn=cmd_lanes_rename)
+    p = lv.add_parser("history", parents=[common], help="every version of a lane")
+    p.add_argument("name")
+    p.set_defaults(fn=cmd_lanes_history)
+
+    for table, what in (("defaults", "applied under every lane"),
+                        ("globals", f"run settings: {', '.join(GLOBAL_KEYS)}")):
+        show, set_, unset = _kv_cmd(table)
+        g = groups.add_parser(table, help=what)
+        gv = g.add_subparsers(dest="verb", required=True)
+        gv.add_parser("show", parents=[common]).set_defaults(fn=show)
+        p = gv.add_parser("set", parents=[common])
+        p.add_argument("items", nargs="+", metavar="KEY=VALUE")
+        p.set_defaults(fn=set_)
+        p = gv.add_parser("unset", parents=[common])
+        p.add_argument("keys", nargs="+", metavar="KEY")
+        p.set_defaults(fn=unset)
+
+    p = groups.add_parser("import-yaml", parents=[common],
+                          help="one-time: move a YAML config's lanes into the store")
+    p.add_argument("path", type=Path)
+    p.add_argument("--dry-run", action="store_true",
+                   help="print each lane and the notes taken from its comments; write nothing")
+    p.add_argument("--pull-secrets", action="store_true",
+                   help="also copy each key_entry's value from pass into the store")
+    p.set_defaults(fn=cmd_import_yaml)
 
     sec = groups.add_parser("secrets", help="lane secrets, encrypted in the store")
     sv = sec.add_subparsers(dest="verb", required=True)
@@ -1114,7 +1947,9 @@ def admin_main(argv: list[str]) -> int:
     # before discovering it was pointed at the wrong file.
     if a.config.suffix.lower() in (".yaml", ".yml"):
         die(f"{a.config} is a YAML file; store commands take the database path.\n"
-            f"  (YAML still drives runs until #109 — these commands only touch the store.)")
+            f"  (YAML still drives runs until #109 — these commands only touch the store.)"
+            + ("\n  To move a YAML config into the store:  roundtable import-yaml PATH"
+               if a.group != "import-yaml" else ""))
     return a.fn(a)
 
 

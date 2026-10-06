@@ -1,0 +1,58 @@
+{
+  "defaults": {
+    "max_tokens": 100
+  },
+  "format": "flatline-roundtable/roster",
+  "format_version": 1,
+  "globals": {
+    "concurrency": 2,
+    "retries": 0
+  },
+  "lanes": [
+    {
+      "active": true,
+      "config": {
+        "base_url": "https://openrouter.ai/api/v1",
+        "harness": "http",
+        "model": "some/model",
+        "vendor": "openrouter"
+      },
+      "key_entry": null,
+      "lane_id": "04364d53c6624c42b058b13785da1178",
+      "name": "ProbeHttp",
+      "notes": null
+    },
+    {
+      "active": true,
+      "config": {
+        "args": [
+          "--model",
+          "sonnet",
+          "-p"
+        ],
+        "command": "claude",
+        "harness": "cli",
+        "model": "sonnet",
+        "stdin": true,
+        "vendor": "anthropic"
+      },
+      "key_entry": null,
+      "lane_id": "f57eda25af0445ee986ce62e015558fc",
+      "name": "ProbeCli",
+      "notes": null
+    },
+    {
+      "active": false,
+      "config": {
+        "base_url": "https://openrouter.ai/api/v1",
+        "harness": "http",
+        "model": "other/model",
+        "vendor": "openrouter"
+      },
+      "key_entry": null,
+      "lane_id": "b953904e7ac340a5a1d4ce2a05f08446",
+      "name": "ProbeInactive",
+      "notes": null
+    }
+  ]
+}
