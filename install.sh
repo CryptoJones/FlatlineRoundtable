@@ -114,6 +114,8 @@ else
     if [[ -f "${OLD_YAML}" ]]; then
         log "  roundtable import-yaml ${OLD_YAML} --dry-run      # needs PyYAML, once"
         log "  roundtable import-yaml ${OLD_YAML} --pull-secrets"
+        log "  (or, on a host other than makemake: db import makemake's export —"
+        log "   see the README's Fleet section)"
     else
         log "  roundtable db import ${SCRIPT_DIR}/examples/roster.example.json"
     fi

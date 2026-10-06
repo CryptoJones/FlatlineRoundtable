@@ -198,8 +198,17 @@ through `~/.local/bin/grok-stdin`, because Linux caps one argument at 128 KB:
 
 ```sh
 roundtable lanes edit GLaDOS --set command=/home/akclark/.local/bin/grok-stdin --set stdin=true \
-    --set 'args=[...pluto args...]' --reason "pluto: Linux argv limit"
+    --set 'args=["--no-auto-update","--disable-web-search","--no-subagents","--no-plan","--tools","","--max-turns","1","--output-format","plain","-m","grok-4.6"]' \
+    --reason "pluto: Linux caps one argv at 128KB; grok-stdin passes --prompt-file"
+roundtable globals set concurrency=16      # pluto's own capacity
 ```
+
+A CLI lane also needs its CLI signed in on that host (`grok login --device-code`,
+`codex login`, `claude`); the store holds only API-key secrets.
+
+After the move, a host's old YAML files are archived into `backups/` beside the
+store (so `scripts/backup-telesto.sh` ships them) and removed, so nobody edits a
+file that is no longer read.
 
 ## Cost
 
