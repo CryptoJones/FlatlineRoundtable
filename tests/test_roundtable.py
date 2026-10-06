@@ -16,6 +16,7 @@ this file contacts a real vendor, spends money, or needs a credential.
 """
 from __future__ import annotations
 
+import atexit
 import importlib.util
 import json
 import os
@@ -38,6 +39,47 @@ spec = importlib.util.spec_from_loader(
 )
 rt = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(rt)
+
+# PyYAML is needed by `import-yaml` and nothing else (#109). CI runs the suite
+# without it, then once more with it so the import path is still covered.
+HAVE_YAML = importlib.util.find_spec("yaml") is not None
+needs_yaml = unittest.skipUnless(HAVE_YAML, "PyYAML is only needed by import-yaml")
+
+# Runs read their lanes and secrets from a store, and the store's DB key comes
+# from this throwaway file -- never from a real `pass`. Set in os.environ so the
+# roundtable subprocesses the end-to-end tests start inherit it.
+_KEY_DIR = Path(tempfile.mkdtemp(prefix="roundtable-test-key-"))
+atexit.register(shutil.rmtree, _KEY_DIR, True)
+TEST_KEY = _KEY_DIR / "db.key"
+TEST_KEY.write_text(os.urandom(32).hex() + "\n")
+TEST_KEY.chmod(0o600)
+os.environ[rt.DB_KEY_FILE_ENV] = str(TEST_KEY)
+ROSTER_EXAMPLE = ROOT / "examples" / "roster.example.json"
+LEGACY_YAML = ROOT / "tests" / "fixtures" / "legacy-example.yaml"
+
+
+def make_db(d: Path, cfg: dict, secrets: dict | None = None) -> Path:
+    """A store at d/c.db holding `cfg` -- a dict in the old YAML shape -- and
+    `secrets` encrypted under TEST_KEY. What `c.yaml` used to be for a test.
+
+    Invalid config dies here with validate_config()'s message, which is the
+    message a run gives, so tests that expect a refusal still see it.
+    """
+    db = d / "c.db"
+    conn = rt.open_db(db, create=True)
+    try:
+        rt.migrate(conn)
+        key = rt.load_db_key()
+        with rt._tx(conn):
+            rt._write_kcv(conn, key)
+            rt.apply_roster(conn, rt.roster_from_cfg(cfg, str(db)), True, "test")
+            for name, value in (secrets or {}).items():
+                ct, nonce, kid = rt.encrypt_secret(key, name, value)
+                conn.execute("INSERT OR REPLACE INTO secrets (name, ciphertext, nonce, key_id, "
+                             "created_at) VALUES (?, ?, ?, ?, 'test')", (name, ct, nonce, kid))
+    finally:
+        conn.close()
+    return db
 
 
 # --------------------------------------------------------------------------- #
@@ -180,9 +222,9 @@ class TestConfigValidation(unittest.TestCase):
     """Bad config must be rejected up front, not discovered mid-run."""
 
     def _cfg(self, lanes):
-        f = Path(tempfile.mkdtemp()) / "c.yaml"
-        f.write_text(json.dumps({"lanes": lanes}))  # JSON is valid YAML
-        return f
+        d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d, True)
+        return make_db(d, {"lanes": lanes})
 
     def _dies(self, lanes, needle):
         with self.assertRaises(SystemExit) as e:
@@ -193,8 +235,8 @@ class TestConfigValidation(unittest.TestCase):
         return rt.load_config(self._cfg(lanes))
 
     def test_validate_config_takes_a_dict_directly(self):
-        """#106: validation is separate from the YAML read, so a roster from
-        any source gets the same rules and the same error text."""
+        """#106: validation is separate from the read, so a roster from any
+        source gets the same rules and the same error text."""
         cfg = rt.validate_config(
             {"defaults": {"max_tokens": 7},
              "lanes": [{"name": "A", "harness": "http", "model": "m",
@@ -226,6 +268,7 @@ class TestConfigValidation(unittest.TestCase):
     def test_rejects_http_lane_without_base_url(self):
         self._dies([{"name": "A", "harness": "http", "model": "m"}], "needs base_url")
 
+    @needs_yaml
     def test_a_yaml_boolean_name_is_explained_not_just_rejected(self):
         """#29: `name: Off` arrives as False and reported "has no name" -- an
         error naming neither the cause nor the fix."""
@@ -233,11 +276,12 @@ class TestConfigValidation(unittest.TestCase):
         f.write_text("lanes:\n  - name: Off\n    harness: cli\n"
                      "    command: x\n    args: ['-p']\n    stdin: true\n")
         with self.assertRaises(SystemExit) as e:
-            rt.load_config(f)
+            rt.yaml_to_roster(f)          # where YAML is still read: import-yaml
         msg = str(e.exception)
         self.assertIn("name must be a string", msg)
         self.assertIn("quote the name", msg)
 
+    @needs_yaml
     def test_yes_and_on_are_caught_too(self):
         for word in ("Yes", "On", "No"):
             with self.subTest(word=word):
@@ -245,14 +289,15 @@ class TestConfigValidation(unittest.TestCase):
                 f.write_text(f"lanes:\n  - name: {word}\n    harness: cli\n"
                              "    command: x\n    args: ['-p']\n    stdin: true\n")
                 with self.assertRaises(SystemExit) as e:
-                    rt.load_config(f)
+                    rt.yaml_to_roster(f)
                 self.assertIn("name must be a string", str(e.exception))
 
+    @needs_yaml
     def test_a_quoted_boolean_word_is_a_valid_name(self):
         f = Path(tempfile.mkdtemp()) / "c.yaml"
         f.write_text('lanes:\n  - name: "Off"\n    harness: cli\n'
                      "    command: x\n    args: ['-p']\n    stdin: true\n")
-        self.assertEqual(rt.load_config(f)["lanes"][0]["name"], "Off")
+        self.assertEqual(rt.yaml_to_roster(f)["lanes"][0]["name"], "Off")
 
     def test_rejects_duplicate_lane_names(self):
         self._dies(
@@ -974,12 +1019,12 @@ class TestLineageCollisions(unittest.TestCase):
         self.assertEqual(rt.lineage_collisions(results, self.LANES), [])
 
     def test_lineage_must_be_a_string(self):
-        f = Path(tempfile.mkdtemp()) / "c.yaml"
-        f.write_text(json.dumps({"lanes": [
-            {"name": "A", "harness": "http", "model": "m",
-             "base_url": "http://x/v1", "lineage": 3}]}))
+        d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d, True)
         with self.assertRaises(SystemExit) as e:
-            rt.load_config(f)
+            rt.load_config(make_db(d, {"lanes": [
+                {"name": "A", "harness": "http", "model": "m",
+                 "base_url": "http://x/v1", "lineage": 3}]}))
         self.assertIn("lineage must be a string", str(e.exception))
 
 
@@ -1053,17 +1098,9 @@ class TestPacer(unittest.TestCase):
 def _write_cfg_and_load(case, rpm):
     d = Path(tempfile.mkdtemp())
     case.addCleanup(shutil.rmtree, d, True)
-    p = d / "cfg.yaml"
-    p.write_text(textwrap.dedent(f"""
-        lanes:
-          - name: A
-            vendor: openrouter
-            harness: http
-            model: m
-            base_url: http://127.0.0.1:1/v1
-            rpm: {rpm!r}
-    """).lstrip())
-    return rt.load_config(p)
+    return rt.load_config(make_db(d, {"lanes": [
+        {"name": "A", "vendor": "openrouter", "harness": "http", "model": "m",
+         "base_url": "http://127.0.0.1:1/v1", "rpm": rpm}]}))
 
 
 class TestGoldenResponses(unittest.TestCase):
@@ -1378,54 +1415,63 @@ __ON_PROMPT__
 
 
 class TestSecrets(unittest.TestCase):
-    def _fake_pass(self, body):
-        """Put a stub `pass` first on PATH.
+    """fetch_keys() decrypts from the store (#109). It must never proceed
+    unauthenticated, and never with a value from the wrong place."""
+    LANE = {"name": "A", "harness": "http", "model": "m",
+            "base_url": "http://127.0.0.1:1/v1", "key_entry": "or/a"}
 
-        This test used to depend on the host having a real `pass` installed --
-        it passed on a developer machine and failed the moment it ran anywhere
-        else, because roundtable dies on "pass is not installed" before it can
-        reach the missing-entry branch. Supplying the binary keeps the test
-        hermetic and lets each branch be exercised on purpose.
-        """
+    def _lanes(self, secrets, lane=None):
         d = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, d, True)
-        write_exe(d / "pass", body)
-        orig = os.environ["PATH"]
-        os.environ["PATH"] = f"{d}{os.pathsep}{orig}"
-        self.addCleanup(lambda: os.environ.__setitem__("PATH", orig))
+        return rt.load_config(make_db(d, {"lanes": [lane or self.LANE]}, secrets))["lanes"]
 
-    def test_missing_pass_entry_aborts_the_run(self):
-        """It must never proceed unauthenticated."""
-        self._fake_pass('echo "pass: xyzzy is not in the password store" >&2\nexit 1\n')
-        lanes = [{"name": "A", "harness": "http", "model": "m",
-                  "base_url": "http://127.0.0.1:1/v1",
-                  "key_entry": "definitely/not/a/real/entry/xyzzy"}]
+    def _env(self, **kv):
+        orig = dict(os.environ)
+        self.addCleanup(lambda: (os.environ.clear(), os.environ.update(orig)))
+        for k, v in kv.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def test_a_secret_round_trips_through_fetch_keys(self):
+        self.assertEqual(rt.fetch_keys(self._lanes({"or/a": "THE-SECRET"})), {"or/a": "THE-SECRET"})
+
+    def test_missing_secret_aborts_the_run(self):
+        lanes = self._lanes({"or/other": "x"})
         with self.assertRaises(SystemExit) as e:
             rt.fetch_keys(lanes)
-        self.assertIn("xyzzy", str(e.exception))
+        self.assertIn("no secret 'or/a'", str(e.exception))
+        self.assertIn("secrets set or/a", str(e.exception))
 
-    def test_absent_pass_binary_aborts_the_run(self):
-        """The other way to have no secret: no `pass` at all."""
-        d = Path(tempfile.mkdtemp())
-        self.addCleanup(shutil.rmtree, d, True)
-        orig = os.environ["PATH"]
-        os.environ["PATH"] = str(d)          # an empty dir -- no `pass` anywhere
-        self.addCleanup(lambda: os.environ.__setitem__("PATH", orig))
-        lanes = [{"name": "A", "harness": "http", "model": "m",
-                  "base_url": "http://127.0.0.1:1/v1", "key_entry": "some/entry"}]
+    def test_a_wrong_db_key_dies_on_the_key_check_value(self):
+        lanes = self._lanes({"or/a": "v"})
+        other = Path(tempfile.mkdtemp()) / "other.key"
+        self.addCleanup(shutil.rmtree, other.parent, True)
+        other.write_text(os.urandom(32).hex() + "\n")
+        other.chmod(0o600)
+        self._env(**{rt.DB_KEY_FILE_ENV: str(other)})
+        with self.assertRaises(SystemExit) as e:
+            rt.fetch_keys(lanes)
+        self.assertIn("does not unlock this store", str(e.exception))
+
+    def test_no_db_key_and_no_pass_aborts_the_run(self):
+        lanes = self._lanes({"or/a": "v"})
+        empty = Path(tempfile.mkdtemp())             # a PATH with no `pass` anywhere
+        self.addCleanup(shutil.rmtree, empty, True)
+        self._env(**{rt.DB_KEY_FILE_ENV: None, "PATH": str(empty)})
         with self.assertRaises(SystemExit) as e:
             rt.fetch_keys(lanes)
         self.assertIn("not installed", str(e.exception))
 
-    def test_only_the_first_line_of_a_pass_entry_is_used(self):
-        """`pass` returns the whole file; a blob would land in an auth header."""
-        self._fake_pass('printf "THE-SECRET\nurl: https://example.invalid\n"\n')
-        keys = rt.fetch_keys([{"name": "A", "harness": "http", "model": "m",
-                               "base_url": "http://127.0.0.1:1/v1",
-                               "key_entry": "some/entry"}])
-        self.assertEqual(keys["some/entry"], "THE-SECRET")
+    def test_fetch_keys_reads_the_store_load_config_read(self):
+        """--config names one store for both halves of a run."""
+        self._lanes({"or/a": "FIRST"})
+        second = self._lanes({"or/a": "SECOND"})
+        self.assertEqual(rt.fetch_keys(second)["or/a"], "SECOND")
 
-    def test_lanes_without_keys_need_no_pass(self):
+    def test_lanes_without_keys_need_no_store_key(self):
+        self._env(**{rt.DB_KEY_FILE_ENV: None, "PATH": ""})
         self.assertEqual(rt.fetch_keys([{"name": "A", "harness": "cli"}]), {})
 
 
@@ -1736,7 +1782,7 @@ class TestLaneRoster(StoreCase):
     """Lane config in the store (#108): lanes, defaults, globals, export/import,
     import-yaml. Real entry point, throwaway store, no real `pass`."""
 
-    EXAMPLE = ROOT / "FlatlineRoundtable.yaml.example"
+    EXAMPLE = LEGACY_YAML
 
     def ok(self, *args, **kw):
         r = self.rt(*args, **kw)
@@ -1757,13 +1803,22 @@ class TestLaneRoster(StoreCase):
         return self.ok("lanes", "add", name, "--harness", "http", "--set", "model=m/x",
                        "--set", "base_url=https://example.invalid/v1", *extra)
 
-    def load_config_message(self, yaml_text):
-        """What load_config() says today about a YAML config."""
+    def config_message(self, cfg):
+        """What validate_config() -- and so a run -- says about a roster."""
+        with self.assertRaises(SystemExit) as e:
+            rt.validate_config(cfg, "test")
+        return str(e.exception)
+
+    def yaml_message(self, yaml_text):
+        """What the YAML reader says, before import-yaml writes anything."""
         p = self.d / "c.yaml"
         p.write_text(yaml_text)
         with self.assertRaises(SystemExit) as e:
-            rt.load_config(p)
+            rt.yaml_to_roster(p)
         return str(e.exception)
+
+    def import_example(self, *extra):
+        return self.ok("db", "import", str(ROSTER_EXAMPLE), "--replace", *extra)
 
     @staticmethod
     def normalise(lanes):
@@ -1830,20 +1885,19 @@ class TestLaneRoster(StoreCase):
     def test_invalid_lanes_get_load_configs_own_message(self):
         self.init()
         self.add_http("Skeptic")
+        dup = {"name": "Skeptic", "harness": "http", "model": "m", "base_url": "http://x"}
         cases = [
             (["lanes", "add", "Bad", "--harness", "foo"],
-             "lanes:\n  - name: Bad\n    harness: foo\n"),
+             {"lanes": [{"name": "Bad", "harness": "foo"}]}),
             (["lanes", "add", "C", "--harness", "cli", "--set", 'args=["-p"]', "--set", "stdin=true"],
-             "lanes:\n  - name: C\n    harness: cli\n    args: ['-p']\n    stdin: true\n"),
+             {"lanes": [{"name": "C", "harness": "cli", "args": ["-p"], "stdin": True}]}),
             (["lanes", "add", "Skeptic", "--harness", "http", "--set", "model=m",
-              "--set", "base_url=http://x"],
-             "lanes:\n  - {name: Skeptic, harness: http, model: m, base_url: http://x}\n"
-             "  - {name: Skeptic, harness: http, model: m, base_url: http://x}\n"),
+              "--set", "base_url=http://x"], {"lanes": [dup, dup]}),
         ]
-        for argv, yaml_text in cases:
+        for argv, cfg in cases:
             r = self.rt(*argv)
             self.assertNotEqual(r.returncode, 0, argv)
-            self.assertEqual(r.stderr.strip(), self.load_config_message(yaml_text), argv)
+            self.assertEqual(r.stderr.strip(), self.config_message(cfg), argv)
         # Nothing half-written by the refusals.
         self.assertEqual(self.ok("lanes", "list").stdout.count("\n"), 1)
 
@@ -1885,7 +1939,7 @@ class TestLaneRoster(StoreCase):
     # -- export / import ------------------------------------------------------
     def test_export_import_replace_export_is_byte_identical(self):
         self.init()
-        self.ok("import-yaml", str(self.EXAMPLE))
+        self.import_example()
         self.ok("lanes", "rename", "Skeptic", "Doubter")
         self.ok("lanes", "edit", "Local", "--set", "rpm=20")
         first = self.ok("db", "export").stdout
@@ -1903,7 +1957,7 @@ class TestLaneRoster(StoreCase):
 
     def test_replace_retires_lanes_the_file_drops_and_merge_keeps_them(self):
         self.init()
-        self.ok("import-yaml", str(self.EXAMPLE))
+        self.import_example()
         doc = json.loads(self.ok("db", "export").stdout)
         doc["lanes"] = [l for l in doc["lanes"] if l["name"] != "Parked"]
         f = self.d / "r.json"
@@ -1951,13 +2005,14 @@ class TestLaneRoster(StoreCase):
         self.assertNotIn("Traceback", r.stderr)
 
     # -- import-yaml ----------------------------------------------------------
-    def test_import_yaml_matches_load_config(self):
+    @needs_yaml
+    def test_import_yaml_matches_the_yaml_reader(self):
+        """The store a run reads equals what the retired YAML path produced."""
         self.init()
         self.ok("import-yaml", str(self.EXAMPLE))
-        conn = rt.open_db(self.db)
-        stored = rt.validate_config(rt.store_roster(conn), "the store")
-        conn.close()
-        yaml_cfg = rt.load_config(self.EXAMPLE)
+        stored = rt.load_config(self.db)
+        raw, _ = rt.read_yaml_config(self.EXAMPLE)
+        yaml_cfg = rt.validate_config(raw, "yaml")
         self.assertEqual(self.normalise(stored["lanes"]), self.normalise(yaml_cfg["lanes"]))
         for k in rt.GLOBAL_KEYS:
             self.assertEqual(stored.get(k), yaml_cfg.get(k), k)
@@ -1968,6 +2023,7 @@ class TestLaneRoster(StoreCase):
         self.assertIn("0 added, 0 updated, 7 unchanged",
                       self.ok("import-yaml", str(self.EXAMPLE)).stdout)
 
+    @needs_yaml
     def test_import_yaml_refuses_the_yaml_off_name_like_load_config(self):
         """#29: unquoted `Off` arrives as a boolean."""
         self.init()
@@ -1976,9 +2032,10 @@ class TestLaneRoster(StoreCase):
         p.write_text(text)
         r = self.rt("import-yaml", str(p))
         self.assertNotEqual(r.returncode, 0)
-        self.assertEqual(r.stderr.strip(), self.load_config_message(text))
+        self.assertEqual(r.stderr.strip(), self.yaml_message(text))
         self.assertIn("quote the name", r.stderr)
 
+    @needs_yaml
     def test_dry_run_shows_comment_notes_and_writes_nothing(self):
         r = self.ok("import-yaml", str(self.EXAMPLE), "--dry-run")
         self.assertIn("a pass ENTRY NAME, never a key", r.stdout)       # trailing comment
@@ -2018,6 +2075,7 @@ class TestLaneRoster(StoreCase):
                 "globals_after:\n  key_entry: shared  # the team key\n")
         self.assertEqual(rt.yaml_lane_comments(text, 1), [[]])
 
+    @needs_yaml
     def test_import_yaml_checks_key_entry_names(self):
         self.init()
         p = self.d / "k.yaml"
@@ -2027,6 +2085,7 @@ class TestLaneRoster(StoreCase):
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("key_entry must be a string", r.stderr)
 
+    @needs_yaml
     def test_pull_secrets_stores_values_and_never_plaintext(self):
         self.init()
         bin_ = self.d / "bin"
@@ -2048,6 +2107,11 @@ class TestLaneRoster(StoreCase):
         for f in (self.db, Path(f"{self.db}-wal"), Path(f"{self.db}-shm")):
             if f.exists():
                 self.assertNotIn(canary.encode(), f.read_bytes(), f)
+        # Only the first line is stored, and runs then read it from the store.
+        os.environ[rt.DB_KEY_FILE_ENV] = str(self.key)        # this store's key, in-process
+        self.addCleanup(os.environ.__setitem__, rt.DB_KEY_FILE_ENV, str(TEST_KEY))
+        self.assertEqual(rt.fetch_keys(rt.load_config(self.db)["lanes"])["openrouter/agent/skeptic"],
+                         f"{canary}-skeptic")
         # Already-stored secrets are kept, not re-pulled.
         self.assertIn("2 already in the store",
                       self.ok("import-yaml", str(self.EXAMPLE), "--pull-secrets", env=env).stdout)
@@ -2069,18 +2133,25 @@ class TestLaneRoster(StoreCase):
         self.ok("db", "migrate")
         self.assertIn("Old\tactive", self.ok("lanes", "list").stdout)
 
-    def test_shipped_rosters_import_and_match_their_yaml(self):
-        for json_path, yaml_path in (
-                (ROOT / "tests" / "fixtures" / "ci-roster.json",
-                 ROOT / "tests" / "fixtures" / "ci-config.yaml"),
-                (ROOT / "examples" / "roster.example.json", self.EXAMPLE)):
-            doc = json.loads(json_path.read_text())
-            want = rt.yaml_to_roster(yaml_path)
-            for l in doc["lanes"]:
-                l["lane_id"] = None
-            self.assertEqual(doc, want, json_path)
-            self.assertEqual(json_path.read_text(),
-                             rt.dump_roster(json.loads(json_path.read_text())), json_path)
+    def test_shipped_rosters_import_cleanly_and_are_canonical(self):
+        for path in (ROOT / "tests" / "fixtures" / "ci-roster.json", ROSTER_EXAMPLE,
+                     ROOT / "examples" / "full-roster.json"):
+            with self.subTest(path=path.name):
+                self.assertEqual(path.read_text(), rt.dump_roster(json.loads(path.read_text())))
+                r = self.rt("db", "import", str(path), "--replace",
+                            "--config", str(self.d / f"{path.stem}.db"))
+                if "no store" in r.stderr:
+                    self.ok("db", "init", "--config", str(self.d / f"{path.stem}.db"))
+                    r = self.rt("db", "import", str(path), "--replace",
+                                "--config", str(self.d / f"{path.stem}.db"))
+                self.assertEqual(r.returncode, 0, r.stderr)
+
+    @needs_yaml
+    def test_roster_example_is_the_legacy_yaml_converted(self):
+        doc = json.loads(ROSTER_EXAMPLE.read_text())
+        for l in doc["lanes"]:
+            l["lane_id"] = None
+        self.assertEqual(doc, rt.yaml_to_roster(LEGACY_YAML))
 
 
 class TestAdminDispatch(unittest.TestCase):
@@ -2109,10 +2180,10 @@ class TestAdminDispatch(unittest.TestCase):
         d = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, d, True)
         r = subprocess.run([sys.executable, str(ROOT / "roundtable"),
-                            "--config", str(d / "missing.yaml"), "lanes are slow"],
+                            "--config", str(d / "missing.db"), "lanes are slow"],
                            capture_output=True, text=True, timeout=30)
         self.assertNotEqual(r.returncode, 0)
-        self.assertIn("no config at", r.stderr)
+        self.assertIn("no store at", r.stderr)
 
 
 class TestPricing(unittest.TestCase):
@@ -2175,7 +2246,7 @@ class TestEndToEnd(unittest.TestCase):
         self.addCleanup(shutil.rmtree, d, True)
         cfg = {"lanes": lanes}
         cfg.update(extra_cfg or {})
-        (d / "c.yaml").write_text(json.dumps(cfg))
+        make_db(d, cfg)
         # Point the caches at the throwaway dir. A test must not fold its stub's
         # fake usage numbers into the developer's real token calibration.
         env = {**os.environ, "XDG_CACHE_HOME": str(d / "cache")}
@@ -2187,10 +2258,40 @@ class TestEndToEnd(unittest.TestCase):
         if len(lanes) > 1 and not any(a in ("--each", "--panel", "--lanes") for a in args):
             args.insert(0, "--panel")
         return subprocess.run(
-            [sys.executable, str(ROOT / "roundtable"), "--config", str(d / "c.yaml"),
+            [sys.executable, str(ROOT / "roundtable"), "--config", str(d / "c.db"),
              "--no-transcript", *args, "brief"],
             capture_output=True, text=True, timeout=90, env=env,
         )
+
+    def test_a_yaml_config_is_refused_with_the_import_yaml_pointer(self):
+        d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d, True)
+        (d / "c.yaml").write_text("lanes: []\n")
+        r = subprocess.run([sys.executable, str(ROOT / "roundtable"), "--config",
+                            str(d / "c.yaml"), "--list"], capture_output=True, text=True, timeout=30)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("YAML is retired", r.stderr)
+        self.assertIn(f"roundtable import-yaml {d / 'c.yaml'}", r.stderr)
+
+    def test_a_store_secret_reaches_the_authorization_header(self):
+        """#109 end to end: lane and key both come from the store, decrypted in
+        the child process, and nothing else -- no `pass` is on PATH."""
+        d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d, True)
+        with StubServer() as s:
+            db = make_db(d, {"lanes": [{"name": "A", "harness": "http", "model": "m",
+                                        "base_url": s.url, "key_entry": "or/a"}]},
+                         {"or/a": "sk-from-the-store"})
+            bare = d / "bin"
+            bare.mkdir()
+            env = {**os.environ, "XDG_CACHE_HOME": str(d / "cache"),
+                   "PATH": f"{bare}{os.pathsep}{Path(sys.executable).parent}"}
+            r = subprocess.run([sys.executable, str(ROOT / "roundtable"), "--config", str(db),
+                                "--no-transcript", "brief"],
+                               capture_output=True, text=True, timeout=90, env=env)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(s.srv.last_auth, "Bearer sk-from-the-store")
+            self.assertNotIn("sk-from-the-store", r.stdout + r.stderr)
 
     def test_all_answered_exits_zero(self):
         with StubServer() as s:
@@ -2543,8 +2644,7 @@ class TestRevisionEndToEnd(unittest.TestCase):
             {"lane": "B", "answer": "round-one answer from B", "model": "m", "harness": "http"},
         ]}))
         with StubServer() as s:
-            cfg = d / "c.yaml"
-            cfg.write_text(json.dumps({"lanes": [
+            cfg = make_db(d, ({"lanes": [
                 {"name": "A", "harness": "http", "model": "m", "base_url": s.url}]}))
             env = {**os.environ, "XDG_CACHE_HOME": str(d / "cache")}
             r = subprocess.run(
@@ -2579,13 +2679,13 @@ class TestTranscriptUniqueness(unittest.TestCase):
         self.addCleanup(shutil.rmtree, d, True)
         cfg = {"lanes": lanes}
         cfg.update(extra_cfg or {})
-        (d / "c.yaml").write_text(json.dumps(cfg))
+        make_db(d, cfg)
         home = d / "home"
         home.mkdir()
         env = {**os.environ, "XDG_CACHE_HOME": str(d / "cache"), "HOME": str(home)}
         tdir = home / ".local" / "share" / "flatline-roundtable" / "transcripts"
         return subprocess.run(
-            [sys.executable, str(ROOT / "roundtable"), "--config", str(d / "c.yaml"),
+            [sys.executable, str(ROOT / "roundtable"), "--config", str(d / "c.db"),
              *args, "brief"],
             capture_output=True, text=True, timeout=120, env=env, input="brief\n",
         ), tdir
@@ -2726,10 +2826,10 @@ class TestSynthesizeRun(unittest.TestCase):
 
     def _run(self, lanes, *args, brief="brief", extra_cfg=None):
         cfg = {"lanes": lanes, **(extra_cfg or {})}
-        (self.d / "c.yaml").write_text(json.dumps(cfg))
+        make_db(self.d, cfg)
         env = {**os.environ, "XDG_CACHE_HOME": str(self.d / "cache"), "HOME": str(self.home)}
         return subprocess.run(
-            [sys.executable, str(ROOT / "roundtable"), "--config", str(self.d / "c.yaml"),
+            [sys.executable, str(ROOT / "roundtable"), "--config", str(self.d / "c.db"),
              *args, "-"],
             capture_output=True, text=True, timeout=120, env=env, input=brief)
 
@@ -2880,8 +2980,7 @@ class TestDiscussion(unittest.TestCase):
         self.tdir = self.home / ".local" / "share" / "flatline-roundtable" / "transcripts"
 
     def _run(self, url, *args, brief=""):
-        cfg = self.d / "c.yaml"
-        cfg.write_text(json.dumps({"lanes": [
+        cfg = make_db(self.d, ({"lanes": [
             {"name": "A", "harness": "http", "model": "speaker_a", "base_url": url},
             {"name": "B", "harness": "http", "model": "speaker_b", "base_url": url},
         ]}))

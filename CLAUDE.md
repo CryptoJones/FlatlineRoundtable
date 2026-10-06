@@ -39,14 +39,15 @@ a child process tree. A hung CLI — or one sitting at a login prompt — surviv
 as an orphan. Orphaned lanes billing forever are the exact failure this project
 was built to eliminate.
 
-**Keys fetched once, before fan-out.** Concurrent `pass show` calls against one
-`gpg-agent` either serialize behind a single pinentry or storm and fail in a
-non-tty context. Resolve them while still single-threaded so one clear error
-replaces N identical ones.
+**Keys fetched once, before fan-out.** The DB key comes from `pass`, and
+concurrent `pass show` calls against one `gpg-agent` either serialize behind a
+single pinentry or storm and fail in a non-tty context. Resolve every secret
+while still single-threaded so one clear error replaces N identical ones.
 
-**`.splitlines()[0]` on `pass` output.** `pass` returns the whole file; the
-secret is the first line. Using the blob puts trailing metadata into an
-`Authorization` header.
+**`.splitlines()[0]` on a stored value.** `pass` returns the whole file; the
+secret is the first line. `secrets set` and `import-yaml --pull-secrets` keep
+only that line. Storing the blob puts trailing metadata into an `Authorization`
+header.
 
 **Per-vendor concurrency.** A llama.cpp server run with `--parallel 1` serves one
 request at a time. Fanning out against it queues every lane past its own timeout.
@@ -67,11 +68,22 @@ every turn precisely so a sequential run that dies keeps what was said.
 
 ## Secrets
 
-No key value goes in a config file, this repo, `argv`, a transcript, or `--json`
-output. Config names a `pass` entry; the key is read into memory only while that
-lane is being queried. The real config lives at
-`~/.config/flatline-roundtable/`, deliberately outside the worktree —
-`.gitignore` is not a security boundary.
+No key value goes in this repo, `argv`, a transcript, or `--json` output, and
+the store never holds one in plaintext. A lane names a secret; its value is
+AES-256-GCM-encrypted in the store and decrypted into memory only for the run.
+The DB key lives in `pass` (`flatline-roundtable/db-key`), never beside the
+store. The store lives at `~/.local/share/flatline-roundtable/roundtable.db`,
+deliberately outside the worktree — `.gitignore` is not a security boundary.
+
+**A store failure must never fail a paid run.** Reading the roster and secrets
+happens before any lane is dispatched, so a broken store stops the run before
+it spends. Anything the run path WRITES to the store later (metrics, grades)
+must be best-effort: an answer already paid for is delivered even if the write
+fails.
+
+**YAML is retired.** The store is the only configuration. PyYAML is imported
+only inside `import-yaml`, the one-time move off YAML; do not bring it back to
+the run path.
 
 ## Scope
 

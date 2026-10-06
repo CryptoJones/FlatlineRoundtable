@@ -9,8 +9,8 @@ SKILL_SRC="${SCRIPT_DIR}/skill"
 TARGET="${HOME}/.claude/skills/flatline-roundtable"
 BIN_DIR="${HOME}/.local/bin"
 BIN_LINK="${BIN_DIR}/roundtable"
-CONFIG_DIR="${HOME}/.config/flatline-roundtable"
-CONFIG="${CONFIG_DIR}/FlatlineRoundtable.yaml"
+STORE="${XDG_DATA_HOME:-${HOME}/.local/share}/flatline-roundtable/roundtable.db"
+OLD_YAML="${HOME}/.config/flatline-roundtable/FlatlineRoundtable.yaml"
 
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 log() { printf '%s\n' "$*"; }
@@ -24,7 +24,7 @@ uninstall() {
             die "${link} exists but is not a symlink — refusing to delete it."
         fi
     done
-    log "Left ${CONFIG} alone (your config, your call)."
+    log "Left ${STORE} alone (your lanes and secrets, your call)."
     exit 0
 }
 
@@ -33,19 +33,18 @@ uninstall() {
 
 [[ -f "${SKILL_SRC}/SKILL.md" ]]  || die "Missing ${SKILL_SRC}/SKILL.md — repo is incomplete."
 [[ -x "${SCRIPT_DIR}/roundtable" ]] || die "Missing or non-executable ${SCRIPT_DIR}/roundtable."
-python3 -c 'import yaml' 2>/dev/null || die "PyYAML not installed — pip install pyyaml"
-# Only the store commands (`roundtable db ...`, `roundtable secrets ...`) need
-# this today; runs still read YAML until #109. So warn, don't fail.
-python3 -c 'import cryptography' 2>/dev/null || {
-    log "NOTE: \`cryptography\` not installed. Runs work without it; the encrypted"
-    log "      store (roundtable db init / secrets ...) does not. pip install cryptography"
-}
+# The floor is 3.11 (the store code and CI assume it). pluto's default python3
+# is 3.9 with 3.11 installed beside it, so name the fix rather than just failing.
+python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)' 2>/dev/null || \
+    die "Python 3.11+ required; python3 is $(python3 -V 2>&1). Put python3.11 first on PATH."
+python3 -c 'import cryptography' 2>/dev/null || \
+    die "\`cryptography\` not installed — python3 -m pip install --user cryptography (the store needs it)"
 
-# `pass` is how every key reaches a lane: config names an entry, never a value.
-# This is a warning rather than a hard failure because a roster of only `cli` /
-# `acp` lanes rides subscriptions and needs no secret at all. But a config with
-# any `key_entry` will abort at run time without it, so say so now rather than
-# on the first real run.
+# `pass` holds the store's DB key, which unlocks every lane secret. This is a
+# warning rather than a hard failure because a roster of only `cli` / `acp`
+# lanes rides subscriptions and needs no secret at all. But a lane with any
+# `key_entry` will abort at run time without it, so say so now rather than on
+# the first real run.
 check_pass() {
     local hint_pass hint_gpg
     case "$(uname -s)" in
@@ -64,9 +63,9 @@ check_pass() {
 
     if ! command -v pass >/dev/null 2>&1; then
         log ""
-        log "NOTE: \`pass\` not found. Lanes name a pass entry via key_entry; a key"
-        log "      value never appears in config, argv, or a transcript. Without pass,"
-        log "      any lane carrying a key_entry aborts at run time."
+        log "NOTE: \`pass\` not found. It holds the DB key that decrypts the store's"
+        log "      secrets; a key value never appears in plaintext, argv, or a"
+        log "      transcript. Without pass, any lane carrying a key_entry aborts."
         log "  ${hint_pass}"
         log "  then:  pass init <your-gpg-key-id>"
         log ""
@@ -86,17 +85,22 @@ check_pass() {
 }
 check_pass
 
-mkdir -p "${HOME}/.claude/skills" "${BIN_DIR}" "${CONFIG_DIR}"
+mkdir -p "${HOME}/.claude/skills" "${BIN_DIR}"
 ln -sfn "${SKILL_SRC}" "${TARGET}";              log "Skill  -> ${TARGET}"
 ln -sfn "${SCRIPT_DIR}/roundtable" "${BIN_LINK}"; log "Binary -> ${BIN_LINK}"
 
-if [[ ! -f "${CONFIG}" ]]; then
-    log ""
-    log "No config yet. Start from the example:"
-    log "  cp ${SCRIPT_DIR}/FlatlineRoundtable.yaml.example ${CONFIG}"
-    log "  \$EDITOR ${CONFIG}"
+if [[ -f "${STORE}" ]]; then
+    log "Store found at ${STORE} — left untouched."
 else
-    log "Config found at ${CONFIG} — left untouched."
+    log ""
+    log "No store yet. Create it, then add lanes:"
+    log "  roundtable db init"
+    if [[ -f "${OLD_YAML}" ]]; then
+        log "  roundtable import-yaml ${OLD_YAML} --dry-run      # needs PyYAML, once"
+        log "  roundtable import-yaml ${OLD_YAML} --pull-secrets"
+    else
+        log "  roundtable db import ${SCRIPT_DIR}/examples/roster.example.json"
+    fi
 fi
 
 case ":${PATH}:" in

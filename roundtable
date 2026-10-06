@@ -28,7 +28,7 @@ Usage:
                                            run_id rather than by counting files
     roundtable --synthesize latest:12      --diff readers over a finished run's
                                            transcripts; no lane is re-asked
-    roundtable --config PATH
+    roundtable --config DB                 another store instead of the default
     roundtable --max-spend 0.50
     cat brief.md | roundtable --each -j 8 -  eight lanes at a time, each still
                                            its own process and its own deadline
@@ -43,7 +43,8 @@ Usage:
     cat brief.md | roundtable --discuss new -   start cold, no blind round
     roundtable --converse latest:12        the same flag, by its other name
 
-Store (#105; runs do not read it yet -- YAML stays authoritative until #109):
+Store (#105): the only configuration. Runs read lanes and secrets from it;
+YAML is retired, and `import-yaml` moves an old config in once.
     roundtable db init | migrate | doctor  [--config DB]
     roundtable secrets set NAME [--stdin]  value from stdin or a no-echo prompt,
                                            never argv
@@ -91,12 +92,6 @@ import urllib.request
 import uuid
 from pathlib import Path
 
-try:
-    import yaml
-except ImportError:
-    sys.exit("roundtable: PyYAML is required — pip install pyyaml")
-
-DEFAULT_CONFIG = Path.home() / ".config" / "flatline-roundtable" / "FlatlineRoundtable.yaml"
 TRANSCRIPT_DIR = Path.home() / ".local" / "share" / "flatline-roundtable" / "transcripts"
 RUN_ID_RE = re.compile(r"[A-Za-z0-9_-][A-Za-z0-9._-]{0,63}")
 
@@ -389,26 +384,61 @@ def estimate_run(lanes: list[dict], prompt: str, table: dict, defaults: dict,
 # --------------------------------------------------------------------------- #
 # config
 # --------------------------------------------------------------------------- #
+# The store load_config() last read. fetch_keys() decrypts from the same file,
+# so `--config` names one store for both halves of a run, and for its --each
+# children, which are handed the same --config.
+DB_PATH: Path | None = None
+
+
 def load_config(path: Path) -> dict:
+    """The live roster from the store at `path`, validated (#109).
+
+    YAML is retired: the store is the only configuration. A YAML path is
+    refused with the one command that moves it in.
+    """
+    global DB_PATH
+    if path.suffix.lower() in (".yaml", ".yml"):
+        die(f"{path} is a YAML config, and YAML is retired — the store is the config now.\n"
+            f"  Move it in once with:  roundtable import-yaml {path}")
     if not path.exists():
-        die(
-            f"no config at {path}\n"
-            f"  copy FlatlineRoundtable.yaml.example there and edit it, "
-            f"or pass --config PATH"
-        )
+        die(f"no store at {path}\n"
+            f"  create one with:  roundtable db init\n"
+            f"  then add lanes:   roundtable import-yaml OLD.yaml | db import FILE | lanes add")
+    conn = open_roster(path)
     try:
-        cfg = yaml.safe_load(path.read_text()) or {}
+        cfg = store_roster(conn)
+    finally:
+        conn.close()
+    DB_PATH = path
+    return validate_config(cfg, str(path))
+
+
+def read_yaml_config(path: Path) -> tuple[dict, str]:
+    """The retired YAML reader, kept for `import-yaml` only.
+
+    PyYAML is imported here and nowhere else: a run never needs it, and a host
+    that has already imported its YAML does not need it installed at all.
+    """
+    try:
+        import yaml
+    except ImportError:
+        die("import-yaml needs PyYAML for this one-time import — pip install pyyaml")
+    if not path.exists():
+        die(f"no YAML at {path}")
+    text = path.read_text()
+    try:
+        cfg = yaml.safe_load(text) or {}
     except yaml.YAMLError as e:
         die(f"{path} is not valid YAML: {e}")
-    return validate_config(cfg, str(path))
+    return cfg, text
 
 
 def validate_config(cfg: dict, where: str) -> dict:
     """Validate a roster dict and apply `defaults` to each lane.
 
-    Kept apart from the YAML read so a roster from any source -- a file today,
-    the store next (#105) -- passes through exactly one set of rules. `where`
-    names the source in error messages.
+    Kept apart from the read so a roster from any source -- the store, a YAML
+    file on its way in through import-yaml, a `db import` file -- passes
+    through exactly one set of rules. `where` names the source in errors.
     """
     if not isinstance(cfg, dict):
         die(f"{where} is not a mapping")
@@ -488,49 +518,51 @@ def validate_config(cfg: dict, where: str) -> dict:
 # secrets
 # --------------------------------------------------------------------------- #
 def fetch_keys(lanes: list[dict]) -> dict[str, str]:
-    """Resolve every pass entry ONCE, before fan-out.
+    """Resolve every secret ONCE, before fan-out.
 
-    Doing this inside the worker threads instead means N concurrent `pass show`
-    calls hitting one gpg-agent. If the store is locked that either serialises
-    behind a single pinentry or, in a non-tty context, storms and fails. Resolve
-    up front, deduped, while we are still single-threaded and can report one
-    clear error instead of N identical ones.
+    Doing this inside the worker threads instead means N concurrent reads, and
+    -- because the DB key lives in `pass` -- N `pass show` calls against one
+    gpg-agent, which either serialise behind a single pinentry or, in a non-tty
+    context, storm and fail. Resolve up front, deduped, while still
+    single-threaded, so one clear error replaces N identical ones.
+
+    Values come from the store (#109), decrypted in memory only. `pass` is now
+    needed for one thing, the DB key: one `pass show` per process, where there
+    used to be one per distinct entry. The first-line rule that kept `pass`
+    metadata out of an Authorization header is applied when a value is stored
+    (`secrets set`, `import-yaml --pull-secrets`).
     """
     entries = {l["key_entry"] for l in lanes if l.get("key_entry")}
     if not entries:
         return {}
-    if not shutil.which("pass"):
-        die(
-            "lanes reference pass entries but `pass` is not installed.\n"
-            "  install it, or remove key_entry from those lanes"
-        )
+    from cryptography.exceptions import InvalidTag
+    conn, key = open_store(DB_PATH or DEFAULT_DB)
     keys: dict[str, str] = {}
-    for entry in sorted(entries):
-        try:
-            p = subprocess.run(
-                ["pass", "show", entry], capture_output=True, text=True, timeout=30
-            )
-        except subprocess.TimeoutExpired:
-            die(f"`pass show {entry}` timed out — is gpg-agent waiting on a passphrase?")
-        if p.returncode != 0:
-            die(
-                f"no pass entry {entry!r}\n"
-                f"  create it with:  pass insert {entry}"
-            )
-        # pass returns the whole file; the secret is the first line. Taking the
-        # blob would put trailing metadata into an Authorization header.
-        first = p.stdout.splitlines()[0].strip() if p.stdout.strip() else ""
-        if not first:
-            die(f"pass entry {entry!r} is empty")
-        keys[entry] = first
+    try:
+        for entry in sorted(entries):
+            row = conn.execute("SELECT ciphertext, nonce, key_id FROM secrets WHERE name = ?",
+                               (entry,)).fetchone()
+            if row is None:
+                die(f"no secret {entry!r} in the store\n"
+                    f"  create it with:  roundtable secrets set {entry}")
+            try:
+                value = decrypt_secret(key, entry, *row)
+            except InvalidTag:
+                die(f"secret {entry!r} does not decrypt — `roundtable secrets check` "
+                    f"lists the damaged rows")
+            if not value:
+                die(f"secret {entry!r} is empty")
+            keys[entry] = value
+    finally:
+        conn.close()
     return keys
 
 # --------------------------------------------------------------------------- #
 # store (#105)
 #
 # One SQLite file per host holding the lane roster (#108), the lane secrets
-# (#107) and, later, metrics. Nothing on the run path reads it yet:
-# load_config() / fetch_keys() still go to YAML and `pass` until #109.
+# (#107) and, later, metrics. It is the only configuration: load_config()
+# reads the roster from it and fetch_keys() decrypts from it (#109).
 #
 # Encryption is column-level: secrets.ciphertext is AES-256-GCM, everything else
 # is plain SQLite so `sqlite3` can still query it. SQLCipher was rejected -- it
@@ -539,6 +571,8 @@ def fetch_keys(lanes: list[dict]) -> dict[str, str]:
 # --------------------------------------------------------------------------- #
 DATA_DIR = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share") / "flatline-roundtable"
 DEFAULT_DB = DATA_DIR / "roundtable.db"
+# The name callers already use (skill/toolpanel.py) for "the config a run reads".
+DEFAULT_CONFIG = DEFAULT_DB
 DB_KEY_ENTRY = "flatline-roundtable/db-key"
 # Tests and CI have no gpg-agent. This names a FILE holding the key, never the
 # key itself: an env var carrying the value would leak into every child process
@@ -621,8 +655,8 @@ def _now() -> str:
 
 
 def _aesgcm():
-    # Imported here, not at the top: nothing on the run path needs it until #109,
-    # and a host without it must still be able to run a panel.
+    # Imported here, not at the top: a run whose lanes name no secret -- cli and
+    # acp lanes, a local llama.cpp -- must still work on a host without it.
     try:
         from cryptography.hazmat.primitives.ciphers.aead import AESGCM
     except ImportError:
@@ -734,7 +768,10 @@ def open_db(path: Path, create: bool = False) -> sqlite3.Connection:
         # -shm the database file's mode, so this one call covers all three.
         os.close(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
     _check_private(path, "store")
-    conn = sqlite3.connect(path, isolation_level=None)
+    # timeout= installs the busy handler before the first statement; the PRAGMA
+    # below comes too late to cover `journal_mode=WAL`, which takes a lock and
+    # races when `--each -j N` children open the store together.
+    conn = sqlite3.connect(path, isolation_level=None, timeout=30)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA foreign_keys=ON")
@@ -1099,7 +1136,7 @@ def cmd_secrets_rekey(a) -> int:
 # record will hang on (#89) -- so renaming, parking or annotating a lane does
 # not reset its history. store_roster() puts the pieces back together in the
 # shape yaml.safe_load() returns, so validate_config() is the one rule set for
-# both sources. Nothing on the run path reads any of this until #109.
+# both sources, and load_config() is what a run reads (#109).
 # --------------------------------------------------------------------------- #
 LANE_COLUMNS = {
     "name": "roundtable lanes rename OLD NEW",
@@ -1728,26 +1765,26 @@ def yaml_lane_comments(text: str, n: int) -> list[list[str]] | None:
     return notes
 
 
-def yaml_to_roster(path: Path) -> dict:
-    """A YAML config as a roster document db import accepts.
+def roster_from_cfg(raw: dict, where: str, text: str | None = None) -> dict:
+    """A YAML-shaped config dict as a roster document `db import` accepts.
 
-    load_config() runs first, so a config a run would refuse -- the YAML 1.1
-    `Off` lane name (#29), a cli lane with no prompt -- is refused here with
-    the same message, before anything is written.
+    validate_config() runs first, so a config a run would refuse -- the YAML
+    1.1 `Off` lane name (#29), a cli lane with no prompt -- is refused with the
+    same message before anything is written. With the YAML `text`, the lanes'
+    comments become their notes.
     """
-    text = path.read_text()
-    load_config(path)
-    raw = yaml.safe_load(text)
+    validate_config(dict(raw), where)
     defaults = raw.get("defaults") or {}
     globals_ = {k: v for k, v in raw.items() if k not in ("lanes", "defaults")}
     for k in sorted(set(globals_) - set(GLOBAL_KEYS)):
         print(f"  note: top-level {k!r} is not a setting roundtable reads — not imported",
               file=sys.stderr)
         globals_.pop(k)
-    comments = yaml_lane_comments(text, len(raw["lanes"]))
+    comments = yaml_lane_comments(text, len(raw["lanes"])) if text is not None else None
     if comments is None:
-        print("  note: could not line comments up with lanes — only `notes:` values are kept",
-              file=sys.stderr)
+        if text is not None:
+            print("  note: could not line comments up with lanes — only `notes:` values are kept",
+                  file=sys.stderr)
         comments = [[] for _ in raw["lanes"]]
     lanes = []
     for l, extra in zip(raw["lanes"], comments):
@@ -1769,14 +1806,42 @@ def yaml_to_roster(path: Path) -> dict:
     try:
         _canon([globals_, defaults])
     except TypeError as e:
-        die(f"{path}: a default or global is not plain data ({e}) — quote it")
+        die(f"{where}: a default or global is not plain data ({e}) — quote it")
     return {"format": ROSTER_FORMAT, "format_version": 1, "globals": globals_,
             "defaults": defaults, "lanes": lanes}
 
 
+def yaml_to_roster(path: Path) -> dict:
+    raw, text = read_yaml_config(path)
+    return roster_from_cfg(raw, str(path), text)
+
+
+def read_pass_entries(entries: list[str]) -> dict[str, str]:
+    """Each entry's value from `pass`, for --pull-secrets: the retired run-path
+    reader, kept for the one-time move. Sequential, one `pass show` at a time,
+    for the same gpg-agent reason fetch_keys() resolves before fan-out."""
+    if not entries:
+        return {}
+    if not shutil.which("pass"):
+        die("--pull-secrets reads `pass`, which is not installed")
+    out: dict[str, str] = {}
+    for entry in sorted(entries):
+        try:
+            p = subprocess.run(["pass", "show", entry], capture_output=True, text=True, timeout=30)
+        except subprocess.TimeoutExpired:
+            die(f"`pass show {entry}` timed out — is gpg-agent waiting on a passphrase?")
+        if p.returncode != 0:
+            die(f"no pass entry {entry!r} — nothing imported")
+        # pass returns the whole file; the secret is the first line. Storing the
+        # blob would put trailing metadata into an Authorization header.
+        first = p.stdout.splitlines()[0].strip() if p.stdout.strip() else ""
+        if not first:
+            die(f"pass entry {entry!r} is empty — nothing imported")
+        out[entry] = first
+    return out
+
+
 def cmd_import_yaml(a) -> int:
-    if not a.path.exists():
-        die(f"no YAML at {a.path}")
     doc = yaml_to_roster(a.path)
     _check_roster_doc(doc, str(a.path))
     entries = sorted({l["key_entry"] for l in doc["lanes"] if l["key_entry"]}
@@ -1792,10 +1857,9 @@ def cmd_import_yaml(a) -> int:
     if a.pull_secrets:
         conn, key = open_store(a.config)
         have = {r[0] for r in conn.execute("SELECT name FROM secrets")}
-        # Every value is read before anything is written, through the same
-        # one-pass-per-entry path a run uses, so a locked gpg-agent fails the
-        # import cleanly instead of half-way through.
-        pulled = fetch_keys([{"key_entry": e} for e in entries if e not in have])
+        # Every value is read before anything is written, so a locked
+        # gpg-agent fails the import cleanly instead of half-way through.
+        pulled = read_pass_entries([e for e in entries if e not in have])
     else:
         conn, pulled = open_roster(a.config), {}
     vendor = {}
@@ -1947,9 +2011,7 @@ def admin_main(argv: list[str]) -> int:
     # before discovering it was pointed at the wrong file.
     if a.config.suffix.lower() in (".yaml", ".yml"):
         die(f"{a.config} is a YAML file; store commands take the database path.\n"
-            f"  (YAML still drives runs until #109 — these commands only touch the store.)"
-            + ("\n  To move a YAML config into the store:  roundtable import-yaml PATH"
-               if a.group != "import-yaml" else ""))
+            f"  To move a YAML config into the store:  roundtable import-yaml PATH")
     return a.fn(a)
 
 
@@ -3401,7 +3463,7 @@ def main() -> int:
     # answer to "what is configured".
     if not lanes and not a.list:
         die(f"{a.config} has lanes, but none are active — "
-            f"set active: true on at least one")
+            f"enable one with:  roundtable lanes enable NAME")
     if a.lanes:
         want = {n.strip().lower() for n in a.lanes.split(",")}
         lanes = [l for l in lanes if l["name"].lower() in want]
