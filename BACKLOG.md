@@ -21,8 +21,8 @@ and vice versa.
       `db export|import`, `import-yaml` ([#108](https://github.com/CryptoJones/FlatlineRoundtable/issues/108)) — shipped in PR #123
 - [x] Run from the store: `load_config` reads the DB, `fetch_keys` reads secrets,
       YAML retired ([#109](https://github.com/CryptoJones/FlatlineRoundtable/issues/109)) — shipped in PR #124
-- [ ] `db backup|restore` and the telesto restic job ([#110](https://github.com/CryptoJones/FlatlineRoundtable/issues/110)) — on feat/sqlite-store-backup
-- [ ] Fleet rollout notes and the Python 3.11 floor ([#111](https://github.com/CryptoJones/FlatlineRoundtable/issues/111))
+- [x] `db backup|restore` and the telesto restic job ([#110](https://github.com/CryptoJones/FlatlineRoundtable/issues/110)) — shipped in PR #125
+- [ ] Fleet rollout notes and the Python 3.11 floor ([#111](https://github.com/CryptoJones/FlatlineRoundtable/issues/111)) — on docs/sqlite-store-fleet-rollout
 
 ### Epic: run the roundtable from inside Orca — local web UI, no fork ([#115](https://github.com/CryptoJones/FlatlineRoundtable/issues/115)) — DONE 2026-10-03
 

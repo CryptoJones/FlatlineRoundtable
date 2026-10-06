@@ -155,6 +155,52 @@ roundtable secrets check --config /tmp/drill/roundtable.db
 roundtable --config /tmp/drill/roundtable.db --list
 ```
 
+## Fleet
+
+Each host has its own store and its own DB key. makemake is the system of
+record: its roster is exported and imported elsewhere, and each host sets its
+own secrets under the same names (epic #105, decisions 2 and 6). Nothing is
+shared live, so a host that is down or behind never blocks another.
+
+On makemake, after any roster change worth sharing:
+
+```sh
+roundtable db export --out ~/roster.json            # 0600, never holds a secret value
+scp ~/roster.json pluto:roster.json
+```
+
+On the other host (pluto shown; its default `python3` is 3.9, with 3.11 beside it):
+
+```sh
+git -C ~/source/repos/FlatlineRoundtable pull --ff-only
+python3.11 -m pip install --user cryptography
+cd ~/source/repos/FlatlineRoundtable && PYTHON=python3.11 ./install.sh
+roundtable db init                                   # this host's own DB key, in its pass
+roundtable db import ~/roster.json --replace
+# Secrets: same names as makemake, this host's values. pluto has one shared
+# OpenRouter key, so every openrouter/agent/* name gets that one value.
+for n in $(roundtable lanes list | cut -f7 | sed -n 's/^key=//p' | grep '^openrouter/agent/' | sort -u); do
+    pass show openrouter/api-key | roundtable secrets set "$n" --stdin
+done
+pass show nvidia/api-key | roundtable secrets set nvidia/api-key --stdin
+roundtable secrets check                             # every name: present
+roundtable --list
+```
+
+`PYTHON=python3.11 ./install.sh` installs `roundtable` as a two-line wrapper
+that execs that interpreter, so the host's default `python3` is left alone.
+
+A host can keep its own value for a host-specific setting, such as a CLI path
+or a wrapper. Set it with `lanes edit` after the import, with a `--reason`.
+The next `db import --replace` from makemake puts makemake's value back, so
+re-apply it after each import. On pluto that is GLaDOS, which reads its brief
+through `~/.local/bin/grok-stdin`, because Linux caps one argument at 128 KB:
+
+```sh
+roundtable lanes edit GLaDOS --set command=/home/akclark/.local/bin/grok-stdin --set stdin=true \
+    --set 'args=[...pluto args...]' --reason "pluto: Linux argv limit"
+```
+
 ## Cost
 
 **`harness` decides cost, not `model`.**

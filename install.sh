@@ -10,6 +10,12 @@ TARGET="${HOME}/.claude/skills/flatline-roundtable"
 BIN_DIR="${HOME}/.local/bin"
 BIN_LINK="${BIN_DIR}/roundtable"
 STORE="${XDG_DATA_HOME:-${HOME}/.local/share}/flatline-roundtable/roundtable.db"
+# PYTHON=python3.11 ./install.sh  for a host whose default python3 is too old
+# (pluto: 3.9 by default, 3.11 beside it). roundtable is then installed as a
+# two-line wrapper that execs that interpreter, rather than a symlink that
+# would run under the old default.
+PYTHON="${PYTHON:-python3}"
+WRAPPER_MARK="# flatline-roundtable install.sh wrapper"
 OLD_YAML="${HOME}/.config/flatline-roundtable/FlatlineRoundtable.yaml"
 
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
@@ -17,7 +23,7 @@ log() { printf '%s\n' "$*"; }
 
 uninstall() {
     for link in "${TARGET}" "${BIN_LINK}"; do
-        if [[ -L "${link}" ]]; then
+        if [[ -L "${link}" ]] || { [[ -f "${link}" ]] && grep -qF "${WRAPPER_MARK}" "${link}"; }; then
             rm "${link}"; log "Removed ${link}"
         elif [[ -e "${link}" ]]; then
             # Never delete something we did not create.
@@ -35,10 +41,11 @@ uninstall() {
 [[ -x "${SCRIPT_DIR}/roundtable" ]] || die "Missing or non-executable ${SCRIPT_DIR}/roundtable."
 # The floor is 3.11 (the store code and CI assume it). pluto's default python3
 # is 3.9 with 3.11 installed beside it, so name the fix rather than just failing.
-python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)' 2>/dev/null || \
-    die "Python 3.11+ required; python3 is $(python3 -V 2>&1). Put python3.11 first on PATH."
-python3 -c 'import cryptography' 2>/dev/null || \
-    die "\`cryptography\` not installed — python3 -m pip install --user cryptography (the store needs it)"
+command -v "${PYTHON}" >/dev/null || die "${PYTHON} not found"
+"${PYTHON}" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)' 2>/dev/null || \
+    die "Python 3.11+ required; ${PYTHON} is $("${PYTHON}" -V 2>&1). Rerun with PYTHON=python3.11 ./install.sh"
+"${PYTHON}" -c 'import cryptography' 2>/dev/null || \
+    die "\`cryptography\` not installed — ${PYTHON} -m pip install --user cryptography (the store needs it)"
 
 # `pass` holds the store's DB key, which unlocks every lane secret. This is a
 # warning rather than a hard failure because a roster of only `cli` / `acp`
@@ -87,7 +94,16 @@ check_pass
 
 mkdir -p "${HOME}/.claude/skills" "${BIN_DIR}"
 ln -sfn "${SKILL_SRC}" "${TARGET}";              log "Skill  -> ${TARGET}"
-ln -sfn "${SCRIPT_DIR}/roundtable" "${BIN_LINK}"; log "Binary -> ${BIN_LINK}"
+if [[ "${PYTHON}" == python3 ]]; then
+    ln -sfn "${SCRIPT_DIR}/roundtable" "${BIN_LINK}"; log "Binary -> ${BIN_LINK}"
+else
+    [[ -e "${BIN_LINK}" && ! -L "${BIN_LINK}" ]] && ! grep -qF "${WRAPPER_MARK}" "${BIN_LINK}" && \
+        die "${BIN_LINK} exists and is not ours — refusing to overwrite it."
+    rm -f "${BIN_LINK}"
+    printf '#!/bin/sh\n%s\nexec '"'"'%s'"'"' '"'"'%s'"'"' "$@"\n' "${WRAPPER_MARK}" \
+        "$(command -v "${PYTHON}")" "${SCRIPT_DIR}/roundtable" > "${BIN_LINK}"
+    chmod 755 "${BIN_LINK}"; log "Binary -> ${BIN_LINK} (wrapper: $(command -v "${PYTHON}"))"
+fi
 
 if [[ -f "${STORE}" ]]; then
     log "Store found at ${STORE} — left untouched."
