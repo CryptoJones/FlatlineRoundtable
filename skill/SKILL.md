@@ -99,7 +99,7 @@ cut" beats "what do you think", which returns nine summaries.
 For a **code review of a checked-out repo**, CJ wants lanes to have read-only tool
 access so they can verify claims instead of reasoning from a pasted diff. `roundtable`
 itself stays tool-less by charter (its AGENTS.md: "not an agent framework"), so this
-runs through a separate driver that reuses its config, `pass` keys and env scrubbing:
+runs through a separate driver that reuses its store, secrets and env scrubbing:
 
 ```bash
 D=~/.claude/skills/flatline-roundtable/toolpanel.py
@@ -145,9 +145,9 @@ Rules:
 
 ### Lane settings (CJ, 2026-09-27)
 
-The settings live in `~/.config/flatline-roundtable/FlatlineRoundtable.yaml`. The pre-change copy
-is `FlatlineRoundtable.yaml.bak-lanes-20260927`. Each lane's config carries a comment with the
-reason.
+The settings live in the store, `~/.local/share/flatline-roundtable/roundtable.db`
+(`roundtable lanes show NAME`). Each lane's `notes` carry the reason, and `roundtable lanes
+history NAME` shows every change since the YAML import.
 
 | Lane | Model / route | Setting | Why | Status |
 |---|---|---|---|---|
@@ -189,7 +189,7 @@ vibe.
 
 **A weak lane still gets counted.** Treat a lone dissent from a lane with known
 defects as suspect before treating it as insight. Record defects in that lane's
-`notes` in the config so the next reader inherits the warning.
+`notes` (`roundtable lanes edit NAME --notes "..."`) so the next reader inherits the warning.
 
 **Watch for confident fabrication.** `http` and `acp` lanes have not seen your
 codebase (a `cli` lane may have — check its answer for what it says it did). One

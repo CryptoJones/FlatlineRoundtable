@@ -17,10 +17,10 @@ and vice versa.
       `rt.fetch_keys` ([#106](https://github.com/CryptoJones/FlatlineRoundtable/issues/106)) — shipped in PR #113
 - [x] Encrypted store: `db init|migrate|doctor` and
       `secrets set|check|list|rotate|rm|rekey` ([#107](https://github.com/CryptoJones/FlatlineRoundtable/issues/107)) — shipped in PR #114
-- [ ] Lane config in the store: `lanes`, `defaults`, `globals`, `lane_versions`,
-      `db export|import`, `import-yaml` ([#108](https://github.com/CryptoJones/FlatlineRoundtable/issues/108)) — on feat/sqlite-store-lane-config
+- [x] Lane config in the store: `lanes`, `defaults`, `globals`, `lane_versions`,
+      `db export|import`, `import-yaml` ([#108](https://github.com/CryptoJones/FlatlineRoundtable/issues/108)) — shipped in PR #123
 - [ ] Run from the store: `load_config` reads the DB, `fetch_keys` reads secrets,
-      YAML retired ([#109](https://github.com/CryptoJones/FlatlineRoundtable/issues/109))
+      YAML retired ([#109](https://github.com/CryptoJones/FlatlineRoundtable/issues/109)) — on feat/sqlite-store-run-from-store
 - [ ] `db backup|restore` and the telesto restic job ([#110](https://github.com/CryptoJones/FlatlineRoundtable/issues/110))
 - [ ] Fleet rollout notes and the Python 3.11 floor ([#111](https://github.com/CryptoJones/FlatlineRoundtable/issues/111))
 
@@ -162,16 +162,17 @@ stub.
 - [ ] **Orphan kill:** point a `cli` lane at a hanging command with a short
       timeout; confirm it fails cleanly and `pgrep` finds no survivor.
       *Automated:* `test_hung_lane_is_killed_and_leaves_no_orphan`.
-- [ ] **Missing key:** point a lane at a nonexistent `pass` entry; confirm it
-      fails loudly naming the entry, and never calls unauthenticated.
-      *Automated:* `test_missing_pass_entry_aborts_the_run`,
-      `test_absent_pass_binary_aborts_the_run`.
+- [ ] **Missing key:** point a lane at a secret the store does not hold; confirm
+      it fails loudly naming the secret, and never calls unauthenticated.
+      *Automated:* `test_missing_secret_aborts_the_run`,
+      `test_no_db_key_and_no_pass_aborts_the_run`,
+      `test_a_store_secret_reaches_the_authorization_header`.
 - [ ] **No key in argv:** during a run, `ps auxww` shows no key. *(human — reads
       the live process table; keys are held in memory and set as headers only.)*
 - [ ] **No key in output:** transcript and `--json` contain no `Authorization`
       value. *Partly automated:* `test_fixtures_carry_no_credentials` scans the
       golden fixtures; confirm by hand against a real transcript after a run.
-- [ ] `git check-ignore -v FlatlineRoundtable.yaml` confirms the real config
+- [ ] `git check-ignore -v roundtable.db roundtable.db-wal` confirms a store
       cannot be committed; `git status --porcelain` is clean after a run. *(human)*
 - [ ] **Store secrets never in plaintext:** `secrets set X --stdin`, then the
       `.db`, `-wal` and `-shm` bytes do not contain the value; a positional value

@@ -53,15 +53,15 @@ None of that is possible here:
 
 ## Install
 
-Requires Python 3 with PyYAML, and [`pass`](https://www.passwordstore.org/) if
-any lane needs an API key.
+Requires Python 3.11 or newer with the `cryptography` package, and
+[`pass`](https://www.passwordstore.org/), which holds the store's DB key.
 
 ```console
 $ git clone https://github.com/CryptoJones/FlatlineRoundtable
 $ cd FlatlineRoundtable
-$ mkdir -p ~/.config/flatline-roundtable
-$ cp FlatlineRoundtable.yaml.example ~/.config/flatline-roundtable/FlatlineRoundtable.yaml
-$ $EDITOR ~/.config/flatline-roundtable/FlatlineRoundtable.yaml
+$ python3 -m pip install --user cryptography
+$ ./roundtable db init                                # the store, and its key in pass
+$ ./roundtable db import examples/roster.example.json # or lanes add, or import-yaml
 $ ./roundtable --list        # shows the roster; makes no network calls
 ```
 
@@ -69,28 +69,30 @@ Optionally `./install.sh` to expose it as a Claude Code skill.
 
 ## Secrets
 
-**No key ever appears in a config file, in this repo, or in a process list.**
+**No key ever appears in plaintext on disk, in this repo, or in a process list.**
 
-- A lane names a `pass` entry (`key_entry: openrouter/agent/skeptic`), never a
-  key.
-- Keys are read once, before fan-out, and held in memory only. Never in `argv`,
-  which is world-readable via `ps`.
+- A lane names a secret (`key_entry: openrouter/agent/skeptic`), never a key.
+- Secrets live in the store, AES-256-GCM-encrypted. The DB key that unlocks them
+  lives in the `pass` entry `flatline-roundtable/db-key`, so the store file alone
+  gives up nothing.
+- Keys are decrypted once, before fan-out, and held in memory only. Never in
+  `argv`, which is world-readable via `ps`.
 - Keys never reach the transcript or `--json` output.
-- A missing entry fails that lane loudly and names the fix. It never silently
+- A missing secret fails the run loudly and names the fix. It never silently
   falls back to an unauthenticated call.
-- Your real config lives at `~/.config/flatline-roundtable/`, outside the repo,
-  because `.gitignore` is not a security boundary — `git add -f`, stashes, and
-  editor backups all defeat it.
 
-**The encrypted store ([#105](https://github.com/CryptoJones/FlatlineRoundtable/issues/105)): admin commands available now, runs switch over in #109.**
+**The store ([#105](https://github.com/CryptoJones/FlatlineRoundtable/issues/105)) is the only configuration.**
 `roundtable db init` creates `~/.local/share/flatline-roundtable/roundtable.db`
-(`0600`, `XDG_DATA_HOME` honoured) and a 32-byte DB key in the `pass` entry
-`flatline-roundtable/db-key`. `roundtable secrets set NAME --stdin` stores a
-value AES-256-GCM-encrypted under that key. A value typed on the command line is
-refused. `secrets check` prints only presence, length and key id. Runs do not
-read the store yet; until #109 lands they still use YAML and `pass`.
+(`0600`, `XDG_DATA_HOME` honoured) and a 32-byte DB key in `pass`. Runs read
+their lanes and secrets from it; `--config` names another store. One `pass show`
+per process, for the DB key, replaces one per lane secret.
+`roundtable secrets set NAME --stdin` stores a value encrypted under the key. A
+value typed on the command line is refused. `secrets check` prints only
+presence, length and key id.
 
-The store also holds the lane roster (#108). Move a YAML config in once:
+YAML is retired (#109): a `.yaml` `--config` is refused with the command that
+moves it in. Move an old YAML config in once, with PyYAML installed for that
+one command only:
 
 ```sh
 roundtable import-yaml ~/.config/flatline-roundtable/FlatlineRoundtable.yaml --dry-run
@@ -160,7 +162,7 @@ roundtable --list --json                # roster as JSON, for tools; no secret r
 roundtable --each --run-id ID "..."     # tag every transcript of this run with ID
 roundtable --synthesize latest:12        # --diff readers over a finished run; no lane re-asked
 roundtable --each --revise latest-run    # round 2 over the newest run, found by run_id
-roundtable --config PATH
+roundtable --config DB             # another store (default ~/.local/share/flatline-roundtable/roundtable.db)
 roundtable --max-spend 0.50        # refuses BEFORE dispatch if the estimate exceeds it
 roundtable --panel --diff          # report only where the lanes disagree (not with --each)
 roundtable --no-transcript
@@ -206,10 +208,14 @@ declare the same `lineage:`. It is never fatal — a deliberate duplicate is a
 legitimate thing to want — but it must not be silent, because it is invisible in
 the answers themselves and it falsifies the one claim the tool makes.
 
-Two config files ship with the repo. `FlatlineRoundtable.yaml.example` is the
-annotated template — every option, with the reasoning for each. `examples/full-roster.yaml`
-is a real thirteen-lane roster, kept because a tuned config is mostly *numbers
-you had to measure*, and those are worth reading before you pick your own.
+Two rosters ship with the repo, as `db import` files.
+`examples/roster.example.json` is a starting roster with one lane of each kind.
+`examples/full-roster.json` is a real thirteen-lane roster, kept because a tuned
+config is mostly *numbers you had to measure*, and those are worth reading
+before you pick your own. The old annotated YAML template, with the reasoning
+for every option, is kept as
+[`tests/fixtures/legacy-example.yaml`](tests/fixtures/legacy-example.yaml); each
+option it documents is a `--set` key now.
 
 Every run writes a transcript to
 `~/.local/share/flatline-roundtable/transcripts/`, because answers that exist
