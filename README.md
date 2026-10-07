@@ -65,7 +65,9 @@ $ ./roundtable db import examples/roster.example.json # or lanes add, or import-
 $ ./roundtable --list        # shows the roster; makes no network calls
 ```
 
-Optionally `./install.sh` to expose it as a Claude Code skill.
+Optionally `./install.sh` to expose it as a Claude Code skill and put
+`roundtable` on PATH. `./install.sh --init` also runs `roundtable db init` when
+there is no store yet; it never touches an existing one.
 
 ## Secrets
 

@@ -183,6 +183,9 @@ stub.
       `ps auxww` during `db init` shows no key (it goes to `pass insert` on stdin).
 - [ ] `./install.sh` then `./install.sh --uninstall` round-trips, and refuses to
       delete anything that is not a symlink. *(human — touches `$HOME`, no test)*
+- [ ] `./install.sh --init` with no store creates one (`db doctor` passes), and
+      with a store present leaves it byte-identical. *(CI covers both in a
+      throwaway HOME)*
 - [ ] **Restore drill:** `restic restore latest` from telesto → `db restore` into
       a scratch `--config` → `db doctor` → `secrets check` → `--list`, and the
       scratch store's `db export` equals the live one. *(human — needs telesto and

@@ -2,6 +2,11 @@
 # Expose FlatlineRoundtable as a Claude Code skill, and put `roundtable` on PATH.
 #
 # Symlinks rather than copies, so a `git pull` updates the installed skill.
+#
+#   ./install.sh               install; print the steps if there is no store yet
+#   ./install.sh --init        install, and run `roundtable db init` if there is
+#                              no store (may prompt for your gpg passphrase)
+#   ./install.sh --uninstall   remove the links; the store is left alone
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
@@ -34,8 +39,16 @@ uninstall() {
     exit 0
 }
 
-[[ "${1:-}" == "--uninstall" ]] && uninstall
-[[ -n "${1:-}" ]] && die "Unknown argument: ${1}. Usage: ./install.sh [--uninstall]"
+# --init is opt-in: `db init` may create or unlock the DB key in pass, which can
+# mean a pinentry prompt, and a plain install must never block on one.
+[[ $# -le 1 ]] || die "One argument at most. Usage: ./install.sh [--init | --uninstall]"
+INIT=0
+case "${1:-}" in
+    "")          ;;
+    --uninstall) uninstall ;;
+    --init)      INIT=1 ;;
+    *)           die "Unknown argument: ${1}. Usage: ./install.sh [--init | --uninstall]" ;;
+esac
 
 [[ -f "${SKILL_SRC}/SKILL.md" ]]  || die "Missing ${SKILL_SRC}/SKILL.md — repo is incomplete."
 [[ -x "${SCRIPT_DIR}/roundtable" ]] || die "Missing or non-executable ${SCRIPT_DIR}/roundtable."
@@ -97,6 +110,58 @@ check_pass() {
 }
 check_pass
 
+# --init: run `roundtable db init`, and on failure say exactly what was tried and
+# what usually causes it. roundtable's own error is printed above ours as-is.
+init_store() {
+    local key_src cmd rc
+    if [[ -n "${ROUNDTABLE_DB_KEY_FILE:-}" ]]; then
+        key_src="key file \$ROUNDTABLE_DB_KEY_FILE=${ROUNDTABLE_DB_KEY_FILE}"
+    else
+        key_src="pass entry (created, or reused if it already exists)"
+        # Fail before db init rather than inside it: without pass there is
+        # nowhere to keep the DB key, and the store would be unreadable.
+        if ! command -v pass >/dev/null 2>&1; then
+            printf 'ERROR: ./install.sh --init cannot create the store.\n' >&2
+            printf '  Store path : %s\n' "${STORE}" >&2
+            printf '  Problem    : `pass` is not installed, and ROUNDTABLE_DB_KEY_FILE is not set,\n' >&2
+            printf '               so there is nowhere to keep the DB key that encrypts lane secrets.\n' >&2
+            printf '  Fix        : install pass and gnupg, run `pass init <gpg-key-id>`, then rerun\n' >&2
+            printf '               ./install.sh --init  (or set ROUNDTABLE_DB_KEY_FILE for a file key).\n' >&2
+            exit 1
+        fi
+        if ! pass ls >/dev/null 2>&1; then
+            printf 'ERROR: ./install.sh --init cannot create the store.\n' >&2
+            printf '  Store path : %s\n' "${STORE}" >&2
+            printf '  Problem    : `pass` is installed but `pass ls` failed — its store is not\n' >&2
+            printf '               initialised, or gpg cannot reach it.\n' >&2
+            printf '  Fix        : pass init <gpg-key-id>, then rerun ./install.sh --init\n' >&2
+            exit 1
+        fi
+    fi
+    cmd=("${PYTHON}" "${SCRIPT_DIR}/roundtable" db init)
+    log "No store yet — creating it."
+    log "  Store path : ${STORE}"
+    log "  DB key     : ${key_src}"
+    log "  Running    : ${cmd[*]}"
+    rc=0
+    "${cmd[@]}" || rc=$?
+    if (( rc != 0 )); then
+        printf '\nERROR: roundtable db init failed (exit %s). Its own message is above.\n' "${rc}" >&2
+        printf '  Command    : %s\n' "${cmd[*]}" >&2
+        printf '  Python     : %s (%s)\n' "$(command -v "${PYTHON}")" "$("${PYTHON}" -V 2>&1)" >&2
+        printf '  Store path : %s\n' "${STORE}" >&2
+        printf '  DB key     : %s\n' "${key_src}" >&2
+        printf '  Common causes:\n' >&2
+        printf '    - gpg-agent is locked or pinentry could not prompt (no tty): run\n' >&2
+        printf '      `pass show <any entry>` once in this terminal to unlock it, then retry.\n' >&2
+        printf '    - the store directory is not writable: check %s\n' "$(dirname -- "${STORE}")" >&2
+        printf '    - a half-created store was left behind: inspect it with `roundtable db doctor`\n' >&2
+        printf '      before deleting anything; never delete the pass entry holding the DB key.\n' >&2
+        printf '  Rerun ./install.sh --init once fixed; it never touches a store that exists.\n' >&2
+        exit "${rc}"
+    fi
+}
+
 mkdir -p "${HOME}/.claude/skills" "${BIN_DIR}"
 ln -sfn "${SKILL_SRC}" "${TARGET}";              log "Skill  -> ${TARGET}"
 if [[ "${PYTHON}" == python3 ]]; then
@@ -114,8 +179,15 @@ if [[ -f "${STORE}" ]]; then
     log "Store found at ${STORE} — left untouched."
 else
     log ""
-    log "No store yet. Create it, then add lanes:"
-    log "  roundtable db init"
+    if (( INIT )); then
+        # Only reached with no store; db init also refuses an existing one.
+        init_store
+        log ""
+        log "Store created. It holds no lanes yet; add them:"
+    else
+        log "No store yet. Create it (or rerun with ./install.sh --init), then add lanes:"
+        log "  roundtable db init"
+    fi
     if [[ -f "${OLD_YAML}" ]]; then
         log "  roundtable import-yaml ${OLD_YAML} --dry-run      # needs PyYAML, once"
         log "  roundtable import-yaml ${OLD_YAML} --pull-secrets"
