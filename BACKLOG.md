@@ -84,9 +84,13 @@ The UI lives in its own private repo,
       TLS bypass that also weakens the OpenRouter lanes
       ([#78](https://github.com/CryptoJones/FlatlineRoundtable/issues/78)) — fixed on feat/per-lane-ca-bundle (v1.2.0):
       `ca_bundle` and a per-lane-only `insecure`
-- [ ] Report per-lane `cost` and run-level spend in `--json` (and under `--diff`) —
+- [x] Report per-lane `cost` and run-level spend in `--json` (and under `--diff`) —
       the number cron/CI callers need is computed but not surfaced machine-readably
-      ([#79](https://github.com/CryptoJones/FlatlineRoundtable/issues/79))
+      ([#79](https://github.com/CryptoJones/FlatlineRoundtable/issues/79)) — fixed on feat/json-spend (v1.3.0);
+      plain `--json` stays a list, see #131
+- [ ] Plain `--json` emits an object with `results` + `spend` — a breaking
+      shape change held for 2.0; #79 could not add a top-level key to a bare list
+      ([#131](https://github.com/CryptoJones/FlatlineRoundtable/issues/131))
 - [x] Discussion mode: `--discuss` lets lanes share one context and take turns,
       one lane in flight at a time — the lightweight stand-in for a Buzz-style
       conversation, no resident runtimes or bus
