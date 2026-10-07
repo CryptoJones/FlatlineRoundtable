@@ -65,7 +65,9 @@ $ ./roundtable db import examples/roster.example.json # or lanes add, or import-
 $ ./roundtable --list        # shows the roster; makes no network calls
 ```
 
-Optionally `./install.sh` to expose it as a Claude Code skill.
+Optionally `./install.sh` to expose it as a Claude Code skill and put
+`roundtable` on PATH. `./install.sh --init` also runs `roundtable db init` when
+there is no store yet; it never touches an existing one.
 
 ## Secrets
 
@@ -247,6 +249,7 @@ roundtable --lanes Skeptic,Chair "..."  # a subset
 roundtable --list                       # roster + route; no network calls
 roundtable --json                       # structured output
 roundtable --list --json                # roster as JSON, for tools; no secret refs
+roundtable --version                    # semantic version of this roundtable
 roundtable --each --run-id ID "..."     # tag every transcript of this run with ID
 roundtable --synthesize latest:12        # --diff readers over a finished run; no lane re-asked
 roundtable --each --revise latest-run    # round 2 over the newest run, found by run_id
@@ -327,7 +330,10 @@ roundtable --lanes Chair --revise ~/.local/share/.../20260901-*.json
 ```
 
 `--each` writes one transcript per lane, which is why `--revise` takes
-`latest:N` and comma-separated paths and merges them; it refuses to mix
+`latest:N` and comma-separated paths and merges them. N counts lanes, not
+files: `latest:12` is the newest transcripts that together cover 12 distinct
+lanes, so it names a 12-lane `--each` run (12 files) and a 12-lane `--panel`
+round (one file) alike, and a retried lane counts once. It refuses to mix
 transcripts whose briefs differ, because that is only ever an accident. The
 report ends with who held and who moved, under a banner that says the thing
 that matters:

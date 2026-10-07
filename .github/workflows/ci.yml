@@ -67,6 +67,26 @@ jobs:
           ALL_PROXY=http://127.0.0.1:9 \
           ./roundtable --list
 
+      # --init in a throwaway HOME: creates a store when there is none, leaves an
+      # existing one byte-identical, and fails loudly (non-zero, with the cause)
+      # when it cannot create one.
+      - name: 'install.sh --init: create, leave alone, explain failure'
+        run: |
+          export HOME="$RUNNER_TEMP/home" XDG_DATA_HOME="$RUNNER_TEMP/init-data"
+          export ROUNDTABLE_DB_KEY_FILE="$RUNNER_TEMP/init.key"
+          ./install.sh --init
+          ./roundtable db doctor
+          before=$(sha256sum "$XDG_DATA_HOME/flatline-roundtable/roundtable.db")
+          ./install.sh --init | grep -q "left untouched"
+          test "$before" = "$(sha256sum "$XDG_DATA_HOME/flatline-roundtable/roundtable.db")"
+          mkdir -p "$RUNNER_TEMP/ro" && chmod 500 "$RUNNER_TEMP/ro"
+          if XDG_DATA_HOME="$RUNNER_TEMP/ro" ROUNDTABLE_DB_KEY_FILE="$RUNNER_TEMP/ro.key" \
+                ./install.sh --init 2> init-err.txt; then
+            echo "--init succeeded on an unwritable store dir"; exit 1
+          fi
+          grep -q "roundtable db init failed (exit" init-err.txt
+          grep -q "Store path" init-err.txt
+
       - name: 'A YAML --config is refused with the import-yaml pointer'
         run: |
           # `! cmd` never fails a step under bash -e, so test the status explicitly.

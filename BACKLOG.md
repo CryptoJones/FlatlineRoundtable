@@ -66,9 +66,9 @@ The UI lives in its own private repo,
 - [x] `--diff` is silently dropped under `--each` — the flag isn't forwarded to
       children, so synthesis no-ops with exit 0 on the recommended invocation
       ([#74](https://github.com/CryptoJones/FlatlineRoundtable/issues/74)) — fixed on fix/open-issues-batch
-- [ ] `--revise latest:N` counts files, not lanes — wrong for a `--panel` round,
+- [x] `--revise latest:N` counts files, not lanes — wrong for a `--panel` round,
       and misleading after a clobber; docs say "lane count"
-      ([#75](https://github.com/CryptoJones/FlatlineRoundtable/issues/75))
+      ([#75](https://github.com/CryptoJones/FlatlineRoundtable/issues/75)) — fixed on fix/revise-latest-n-counts-lanes (v1.1.0)
 - [x] `--revise latest:<non-int>` throws a raw `ValueError` traceback instead of
       the clean, actionable error every other bad input gives
       ([#76](https://github.com/CryptoJones/FlatlineRoundtable/issues/76)) — fixed on fix/open-issues-batch
@@ -183,6 +183,9 @@ stub.
       `ps auxww` during `db init` shows no key (it goes to `pass insert` on stdin).
 - [ ] `./install.sh` then `./install.sh --uninstall` round-trips, and refuses to
       delete anything that is not a symlink. *(human — touches `$HOME`, no test)*
+- [ ] `./install.sh --init` with no store creates one (`db doctor` passes), and
+      with a store present leaves it byte-identical. *(CI covers both in a
+      throwaway HOME)*
 - [ ] **Restore drill:** `restic restore latest` from telesto → `db restore` into
       a scratch `--config` → `db doctor` → `secrets check` → `--list`, and the
       scratch store's `db export` equals the live one. *(human — needs telesto and

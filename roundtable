@@ -22,6 +22,7 @@ Usage:
     roundtable --lanes Auditor,Builder "the brief"
     roundtable --list
     roundtable --list --json               roster as JSON for tools (no secret refs)
+    roundtable --version
     roundtable --json > answers.json
     roundtable --each --run-id ID "..."    tag every transcript of this run with ID
     roundtable --each --revise latest-run  round 2 over the newest run, found by
@@ -92,6 +93,10 @@ import urllib.parse
 import urllib.request
 import uuid
 from pathlib import Path
+
+# Semantic version. Bump it in the PR that changes behaviour: patch for a fix,
+# minor for a new flag or mode, major for a change that breaks a caller.
+__version__ = "1.1.0"
 
 TRANSCRIPT_DIR = Path.home() / ".local" / "share" / "flatline-roundtable" / "transcripts"
 RUN_ID_RE = re.compile(r"[A-Za-z0-9_-][A-Za-z0-9._-]{0,63}")
@@ -3028,8 +3033,8 @@ def transcript_time(p: Path) -> float:
 def latest_run_paths(flag: str) -> list[Path]:
     """`latest-run`: every transcript of the most recent round (#80).
 
-    `latest:N` counts files, so it is right only when N happens to equal the
-    run's lane count, and it reaches past the run boundary otherwise -- the
+    `latest:N` counts lanes (#75), so it is right only when N happens to equal
+    the run's lane count, and it reaches past the run boundary otherwise -- the
     brief and round guards in load_transcripts exist to catch exactly that.
     A round now has an identity (run_id, #116), so this resolves it directly:
     the newest lane transcript names the run, and every transcript carrying the
@@ -3072,6 +3077,41 @@ def latest_run_paths(flag: str) -> list[Path]:
     return found
 
 
+def latest_lane_paths(flag: str, spec: str, n: int) -> list[Path]:
+    """`latest:N`: the newest transcripts that together cover N distinct lanes (#75).
+
+    N used to count files. That matched the docs ("N = the run's lane count")
+    only for `--each`, which writes one file per lane: a `--panel` round is ONE
+    file holding every lane, so `latest:12` refused a 12-lane panel round, and
+    a lane retried in its own file was counted twice. Counting lanes makes N
+    mean the same thing for both modes. Synthesis transcripts (#118) carry no
+    lanes and are skipped; unreadable files are left for an explicit path to
+    report.
+    """
+    files = sorted(TRANSCRIPT_DIR.glob("*.json"), key=lambda p: p.name, reverse=True)
+    picked: list[Path] = []
+    lanes: set[str] = set()
+    for p in files:
+        try:
+            d = json.loads(p.read_text())
+        except (OSError, ValueError):
+            continue
+        if not isinstance(d, dict) or not isinstance(d.get("results"), list) \
+                or d.get("mode") == "synthesis":
+            continue
+        got = {r["lane"] for r in d["results"] if isinstance(r, dict) and r.get("lane")}
+        if not got:
+            continue
+        picked.append(p)
+        lanes |= got
+        if len(lanes) >= n:
+            return picked
+    die(f"{flag} {spec}: N counts lanes, and the transcripts in {TRANSCRIPT_DIR} cover "
+        f"only {len(lanes)} distinct lane(s) across {len(picked)} file(s).\n"
+        "  A --panel round is one file holding every lane; an --each round is one file "
+        "per lane.\n  Use latest-run for the newest whole run, or name the files.")
+
+
 def load_transcripts(arg: str, flag: str = "--revise") -> tuple[list[Path], dict]:
     """Resolve --revise's (or --synthesize's) argument into one merged prior round.
 
@@ -3080,7 +3120,8 @@ def load_transcripts(arg: str, flag: str = "--revise") -> tuple[list[Path], dict
     multi-file forms exist because `--each` — the recommended way to run a
     panel — writes ONE TRANSCRIPT PER LANE by design, so "the previous round"
     of a 12-lane run is 12 files, and `latest:12` is how you name them without
-    listing them.
+    listing them. N counts lanes, not files (#75), so `latest:12` also names a
+    12-lane `--panel` round, which is one file.
 
     Briefs must match across the files: mixing transcripts of different
     questions is only ever an accident (a `latest:N` that reached past the run
@@ -3102,11 +3143,7 @@ def load_transcripts(arg: str, flag: str = "--revise") -> tuple[list[Path], dict
             n_str = spec.split(":", 1)[1] if ":" in spec else "1"
             if not n_str.isdecimal() or int(n_str) < 1:
                 die(f"{flag} latest:N needs a positive integer (e.g. latest:12)")
-            n = int(n_str)
-            cands = sorted(TRANSCRIPT_DIR.glob("*.json"))
-            if len(cands) < n:
-                die(f"{flag} {spec}: only {len(cands)} transcript(s) in {TRANSCRIPT_DIR}")
-            paths.extend(cands[-n:])
+            paths.extend(latest_lane_paths(flag, spec, int(n_str)))
         else:
             paths.append(Path(spec).expanduser())
     # Dedupe, then chronological order: transcript names begin with a timestamp
@@ -3538,6 +3575,7 @@ def main() -> int:
                     help="with --each, run up to N lanes at once (default 1). "
                          "Per-lane and per-vendor caps still apply.")
     ap.add_argument("--panel", action="store_true")
+    ap.add_argument("--version", action="version", version=f"roundtable {__version__}")
     ap.add_argument("--list", action="store_true")
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--max-spend", type=float)

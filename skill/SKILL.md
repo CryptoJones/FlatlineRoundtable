@@ -201,7 +201,8 @@ number that does not exist. Verify any concrete claim before repeating it.
 
 ## The optional second round — `--revise`
 
-`roundtable --each --revise latest:N` (N = the prior run's lane count) reruns
+`roundtable --each --revise latest:N` (N = the prior run's lane count; it
+counts lanes, not files, so it works for `--panel` rounds too) reruns
 the panel with every lane shown the locked round-1 answers, its own marked
 `YOURS`, peers anonymised as PANELIST letters. Lanes open with `HOLD` or
 `REVISE`; the report tallies who moved.

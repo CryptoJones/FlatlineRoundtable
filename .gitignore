@@ -5,6 +5,8 @@
 *.db
 *.db-wal
 *.db-shm
+# db restore keeps the replaced store as <name>.db.pre-restore-<stamp>.
+*.db.pre-restore-*
 backups/
 # The retired YAML config, if an old copy is dropped here before import-yaml.
 FlatlineRoundtable.yaml
@@ -15,4 +17,6 @@ transcripts/
 *.bak.*
 *~
 .DS_Store
+# Playwright MCP session dumps (page snapshots, console logs, downloads).
+.playwright-mcp/
 __pycache__/
