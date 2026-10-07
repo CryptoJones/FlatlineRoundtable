@@ -2359,6 +2359,13 @@ class TestEndToEnd(unittest.TestCase):
             capture_output=True, text=True, timeout=90, env=env,
         )
 
+    def test_version_prints_semver_without_touching_the_store(self):
+        r = subprocess.run([sys.executable, str(ROOT / "roundtable"), "--version"],
+                           capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertRegex(r.stdout.strip(), r"^roundtable \d+\.\d+\.\d+$")
+        self.assertEqual(r.stdout.strip(), f"roundtable {rt.__version__}")
+
     def test_a_yaml_config_is_refused_with_the_import_yaml_pointer(self):
         d = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, d, True)
@@ -2596,6 +2603,45 @@ class TestRevisionRound(unittest.TestCase):
         self.assertEqual(len(paths), 2)
         self.assertEqual({r["lane"] for r in merged["results"]}, {"A", "B"})
 
+    def test_latest_n_counts_lanes_in_a_panel_transcript(self):
+        """#75: a --panel round is one file holding every lane. latest:3 used to
+        refuse it with "only 1 transcript(s)" though all three lanes were there."""
+        self._transcript("20260901-000001.json", "older", [self._r("Z", "z")])
+        self._transcript("20260901-000002.json", "q",
+                         [self._r("A", "a"), self._r("B", "b"), self._r("C", "c")])
+        paths, merged = rt.load_transcripts("latest:3")
+        self.assertEqual([p.name for p in paths], ["20260901-000002.json"])
+        self.assertEqual({r["lane"] for r in merged["results"]}, {"A", "B", "C"})
+
+    def test_latest_n_counts_a_retried_lane_once(self):
+        """A lane retried in its own file is one lane, not two: latest:2 reaches
+        back to the second lane instead of stopping at the retry."""
+        self._transcript("20260901-000001.json", "q", [self._r("B", "b")])
+        self._transcript("20260901-000002.json", "q",
+                         [{"lane": "A", "answer": None, "error": "timeout"}])
+        self._transcript("20260901-000003.json", "q", [self._r("A", "a")])
+        paths, merged = rt.load_transcripts("latest:2")
+        self.assertEqual(len(paths), 3)
+        self.assertEqual({r["lane"]: r["answer"] for r in merged["results"]},
+                         {"A": "a", "B": "b"})
+
+    def test_latest_n_skips_synthesis_transcripts(self):
+        self._transcript("20260901-000001.json", "q", [self._r("A", "a")])
+        self._transcript("20260901-000002.json", "q", [self._r("B", "b")])
+        self._transcript("20260901-000003-synthesis-1.json", "q", [], mode="synthesis")
+        paths, _ = rt.load_transcripts("latest:2")
+        self.assertEqual([p.name for p in paths],
+                         ["20260901-000001.json", "20260901-000002.json"])
+
+    def test_latest_n_too_few_lanes_names_lanes_not_files(self):
+        self._transcript("20260901-000001.json", "q",
+                         [self._r("A", "a"), self._r("B", "b")])
+        with self.assertRaises(SystemExit) as e:
+            rt.load_transcripts("latest:3")
+        msg = str(e.exception.code)
+        self.assertIn("cover only 2 distinct lane(s) across 1 file(s)", msg)
+        self.assertIn("latest-run", msg)
+
     def test_mixed_briefs_are_refused(self):
         """A latest:N that reaches past the run boundary must fail loudly, not
         hand every lane a packet half about the wrong question."""
@@ -2605,10 +2651,10 @@ class TestRevisionRound(unittest.TestCase):
             rt.load_transcripts("latest:2")
 
     def test_an_answer_never_loses_to_a_later_failure(self):
-        self._transcript("20260901-000001.json", "q", [self._r("A", "kept")])
-        self._transcript("20260901-000002.json", "q",
-                         [{"lane": "A", "answer": None, "error": "timeout"}])
-        _, merged = rt.load_transcripts("latest:2")
+        a = self._transcript("20260901-000001.json", "q", [self._r("A", "kept")])
+        b = self._transcript("20260901-000002.json", "q",
+                             [{"lane": "A", "answer": None, "error": "timeout"}])
+        _, merged = rt.load_transcripts(f"{a},{b}")
         self.assertEqual(merged["results"][0]["answer"], "kept")
 
     def test_mixed_rounds_are_refused(self):

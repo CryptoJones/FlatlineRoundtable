@@ -66,9 +66,9 @@ The UI lives in its own private repo,
 - [x] `--diff` is silently dropped under `--each` — the flag isn't forwarded to
       children, so synthesis no-ops with exit 0 on the recommended invocation
       ([#74](https://github.com/CryptoJones/FlatlineRoundtable/issues/74)) — fixed on fix/open-issues-batch
-- [ ] `--revise latest:N` counts files, not lanes — wrong for a `--panel` round,
+- [x] `--revise latest:N` counts files, not lanes — wrong for a `--panel` round,
       and misleading after a clobber; docs say "lane count"
-      ([#75](https://github.com/CryptoJones/FlatlineRoundtable/issues/75))
+      ([#75](https://github.com/CryptoJones/FlatlineRoundtable/issues/75)) — fixed on fix/revise-latest-n-counts-lanes (v1.1.0)
 - [x] `--revise latest:<non-int>` throws a raw `ValueError` traceback instead of
       the clean, actionable error every other bad input gives
       ([#76](https://github.com/CryptoJones/FlatlineRoundtable/issues/76)) — fixed on fix/open-issues-batch
