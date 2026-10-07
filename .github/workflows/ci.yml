@@ -30,8 +30,17 @@ jobs:
       - name: Install dependencies
         run: python3 -m pip install --quiet cryptography
 
+      # A ResourceWarning raised in a finalizer is printed, never raised, so
+      # `-W error::ResourceWarning` cannot fail the step. Show every one and grep
+      # for it instead: a leaked pipe, socket or sqlite handle fails CI (#90).
       - name: Test suite (no PyYAML -- what a run has)
-        run: python3 -m unittest discover -s tests -v
+        run: |
+          set -o pipefail
+          python3 -W always::ResourceWarning -m unittest discover -s tests -v 2>&1 | tee test.log
+          if grep -n ResourceWarning test.log; then
+            echo "::error::leaked resource -- rerun with PYTHONTRACEMALLOC=10 to see where it was opened"
+            exit 1
+          fi
 
       # The import-yaml tests skip without PyYAML, so run the suite once more
       # with it, on one version, to keep the migration path covered.

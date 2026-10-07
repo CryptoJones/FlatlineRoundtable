@@ -96,7 +96,7 @@ from pathlib import Path
 
 # Semantic version. Bump it in the PR that changes behaviour: patch for a fix,
 # minor for a new flag or mode, major for a change that breaks a caller.
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 
 TRANSCRIPT_DIR = Path.home() / ".local" / "share" / "flatline-roundtable" / "transcripts"
 RUN_ID_RE = re.compile(r"[A-Za-z0-9_-][A-Za-z0-9._-]{0,63}")
@@ -859,8 +859,14 @@ def verify_db_key(conn: sqlite3.Connection, key: bytes) -> None:
 def open_store(path: Path) -> tuple[sqlite3.Connection, bytes]:
     """An initialised, migrated store plus its verified key."""
     conn = open_roster(path)
-    key = load_db_key()
-    verify_db_key(conn, key)
+    try:
+        key = load_db_key()
+        verify_db_key(conn, key)
+    except BaseException:
+        # die() is a SystemExit; without this the caller never gets the
+        # connection to close, and a bad or missing key leaks it (#90).
+        conn.close()
+        raise
     return conn, key
 
 
@@ -2372,6 +2378,14 @@ def http_lane(lane: dict, prompt: str, key: str | None, retries: int) -> dict:
         except urllib.error.HTTPError as e:
             retry_after = e.headers.get("Retry-After") if e.headers else None
             transient = e.code >= 500 or e.code == 429
+            # urllib builds the HTTPError around the open response, so it holds a
+            # socket until closed. Nothing outside this handler can close it, and
+            # a 13-lane panel retrying 429s would leak one fd per attempt (#90).
+            # Read the body for the message first, then close on every path.
+            try:
+                err_body = b"" if transient and attempt < retries else e.read()[:200]
+            finally:
+                e.close()
             if transient and attempt < retries:
                 attempt += 1
                 # Honour Retry-After rather than hammering a rate-limited vendor.
@@ -2379,7 +2393,7 @@ def http_lane(lane: dict, prompt: str, key: str | None, retries: int) -> dict:
                 time.sleep(min(wait, RETRY_AFTER_CAP) if wait is not None
                            else RETRY_BACKOFF * attempt)
                 continue
-            raise RuntimeError(f"HTTP {e.code}: {e.read()[:200].decode(errors='replace')}") from None
+            raise RuntimeError(f"HTTP {e.code}: {err_body.decode(errors='replace')}") from None
         except urllib.error.URLError as e:
             if attempt < retries:
                 attempt += 1
@@ -2434,15 +2448,18 @@ def cli_lane(lane: dict, prompt: str) -> dict:
         env=env,
         start_new_session=True,
     )
-    try:
-        out, err = proc.communicate(stdin_text, timeout=lane.get("timeout", 300))
-    except subprocess.TimeoutExpired:
+    # `with` closes the pipes on every exit path. communicate() closes them on
+    # success, but not when it times out, so the kill path leaked them (#90).
+    with proc:
         try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            pass
-        proc.wait(timeout=10)
-        raise RuntimeError(f"timed out after {lane.get('timeout', 300)}s (process group killed)") from None
+            out, err = proc.communicate(stdin_text, timeout=lane.get("timeout", 300))
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+            proc.wait(timeout=10)
+            raise RuntimeError(f"timed out after {lane.get('timeout', 300)}s (process group killed)") from None
 
     if proc.returncode != 0:
         raise RuntimeError(f"{lane['command']} exit {proc.returncode}: {err.strip()[:200]}")
@@ -2650,6 +2667,14 @@ def acp_lane(lane: dict, prompt: str) -> dict:
             proc.wait(timeout=10)
         except (subprocess.TimeoutExpired, OSError):
             pass
+        # The pipes outlive the process unless closed here: one leaked pair per
+        # acp lane (#90). The reader thread may still hold stdout; closing it
+        # under the thread ends its loop, which it already tolerates.
+        for f in (proc.stdin, proc.stdout):
+            try:
+                f.close()
+            except (OSError, ValueError):
+                pass
         shutil.rmtree(workdir, ignore_errors=True)
 
 

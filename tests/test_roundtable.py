@@ -1513,6 +1513,7 @@ class TestStore(StoreCase):
             self.assertEqual(r.returncode, 0, r.stderr)
             self.assertIn("already current", r.stdout)
         conn = sqlite3.connect(self.db)
+        self.addCleanup(conn.close)
         self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], v1)
         self.assertEqual(v1, rt.SCHEMA_VERSION)
 
@@ -1527,12 +1528,17 @@ class TestStore(StoreCase):
         self.db.parent.mkdir(parents=True, mode=0o700)
         os.close(os.open(self.db, os.O_WRONLY | os.O_CREAT, 0o600))
         holder = rt.open_db(self.db)
+        self.addCleanup(holder.close)
         holder.execute("BEGIN IMMEDIATE")
         errors = []
 
         def racer():
             try:
-                rt.migrate(rt.open_db(self.db))
+                conn = rt.open_db(self.db)
+                try:
+                    rt.migrate(conn)
+                finally:
+                    conn.close()
             except BaseException as e:   # noqa: BLE001 -- surfaced below
                 errors.append(e)
 
@@ -1638,6 +1644,7 @@ class TestStore(StoreCase):
         """Unit-level: a wrong key must never reach a SELECT on secrets."""
         self.init()
         conn = rt.open_db(self.db)
+        self.addCleanup(conn.close)
         seen = []
         conn.set_trace_callback(seen.append)
         with self.assertRaises(SystemExit):
