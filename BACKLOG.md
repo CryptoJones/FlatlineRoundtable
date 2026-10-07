@@ -72,10 +72,11 @@ The UI lives in its own private repo,
 - [x] `--revise latest:<non-int>` throws a raw `ValueError` traceback instead of
       the clean, actionable error every other bad input gives
       ([#76](https://github.com/CryptoJones/FlatlineRoundtable/issues/76)) — fixed on fix/open-issues-batch
-- [ ] Lane harnesses leak file descriptors — `acp_lane` / `cli_lane` Popen pipes
+- [x] Lane harnesses leak file descriptors — `acp_lane` / `cli_lane` Popen pipes
       and `http_lane`'s retried `HTTPError` are never closed (28 `ResourceWarning`s,
       all inside `roundtable`, none in the stub; found doing #86)
-      ([#90](https://github.com/CryptoJones/FlatlineRoundtable/issues/90))
+      ([#90](https://github.com/CryptoJones/FlatlineRoundtable/issues/90)) — fixed on fix/lane-fd-leaks (v1.1.1); CI now
+      fails on any `ResourceWarning`
 - [x] Env scrub has no test on the `acp` harness — `child_env()` is shared by
       `cli` and `acp`, but only `cli` asserts a key stays out; drift reopens #22
       ([#77](https://github.com/CryptoJones/FlatlineRoundtable/issues/77)) — fixed on fix/open-issues-batch
