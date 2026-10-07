@@ -80,9 +80,10 @@ The UI lives in its own private repo,
 - [x] Env scrub has no test on the `acp` harness — `child_env()` is shared by
       `cli` and `acp`, but only `cli` asserts a key stays out; drift reopens #22
       ([#77](https://github.com/CryptoJones/FlatlineRoundtable/issues/77)) — fixed on fix/open-issues-batch
-- [ ] No per-lane CA bundle — a self-hosted/private-CA endpoint forces a global
+- [x] No per-lane CA bundle — a self-hosted/private-CA endpoint forces a global
       TLS bypass that also weakens the OpenRouter lanes
-      ([#78](https://github.com/CryptoJones/FlatlineRoundtable/issues/78))
+      ([#78](https://github.com/CryptoJones/FlatlineRoundtable/issues/78)) — fixed on feat/per-lane-ca-bundle (v1.2.0):
+      `ca_bundle` and a per-lane-only `insecure`
 - [ ] Report per-lane `cost` and run-level spend in `--json` (and under `--diff`) —
       the number cron/CI callers need is computed but not surfaced machine-readably
       ([#79](https://github.com/CryptoJones/FlatlineRoundtable/issues/79))
