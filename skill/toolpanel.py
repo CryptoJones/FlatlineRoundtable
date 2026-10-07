@@ -91,11 +91,12 @@ def post(lane, key, body):
     headers = {"Content-Type": "application/json"}
     if key:
         headers["Authorization"] = f"Bearer {key}"
+    ctx = rt.tls_context(lane)   # the lane's ca_bundle / insecure, as a run uses (#78)
     attempts = 6
     for attempt in range(attempts):
         try:
             req = urllib.request.Request(url, data=json.dumps(body).encode(), headers=headers)
-            with urllib.request.urlopen(req, timeout=lane.get("timeout", 300)) as r:
+            with urllib.request.urlopen(req, timeout=lane.get("timeout", 300), context=ctx) as r:
                 data = json.load(r)
             if "error" in data:
                 raise RuntimeError(str(data["error"])[:300])

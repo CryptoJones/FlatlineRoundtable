@@ -308,6 +308,19 @@ for every option, is kept as
 [`tests/fixtures/legacy-example.yaml`](tests/fixtures/legacy-example.yaml); each
 option it documents is a `--set` key now.
 
+An `http` lane behind a private or corporate CA names that CA's bundle:
+
+```sh
+roundtable lanes edit Local --set ca_bundle=~/certs/internal-ca.pem
+```
+
+The bundle replaces the system roots for that lane only, so the private CA cannot
+vouch for any other host and no other lane changes. For a dev endpoint with a
+self-signed cert, `--set insecure=true` turns verification off for that one lane
+and prints a warning on every call. `insecure` cannot be a default, and a lane
+cannot set both. Do not use `PYTHONHTTPSVERIFY=0`, which turns verification off
+for every lane, OpenRouter included.
+
 Every run writes a transcript to
 `~/.local/share/flatline-roundtable/transcripts/`, because answers that exist
 only in a terminal scrollback are answers waiting to be lost.

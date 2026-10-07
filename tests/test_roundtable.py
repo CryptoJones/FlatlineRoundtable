@@ -206,6 +206,75 @@ class StubServer:
         self.srv.server_close()   # else the socket leaks a ResourceWarning per test
 
 
+def make_ca_and_cert(d: Path) -> tuple[Path, Path, Path]:
+    """A throwaway CA and a 127.0.0.1 server cert it signed: ca.pem, cert.pem,
+    key.pem under d. Stands in for a private-CA endpoint (#78)."""
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import NameOID
+    import datetime as dt
+    import ipaddress
+
+    now = dt.datetime.now(dt.timezone.utc)
+
+    def name(cn):
+        return x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, cn)])
+
+    ca_key = ec.generate_private_key(ec.SECP256R1())
+    ca = (x509.CertificateBuilder().subject_name(name("roundtable test CA"))
+          .issuer_name(name("roundtable test CA")).public_key(ca_key.public_key())
+          .serial_number(x509.random_serial_number())
+          .not_valid_before(now - dt.timedelta(minutes=5))
+          .not_valid_after(now + dt.timedelta(days=1))
+          .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+          .add_extension(x509.KeyUsage(digital_signature=True, key_cert_sign=True,
+                                       crl_sign=True, content_commitment=False,
+                                       key_encipherment=False, data_encipherment=False,
+                                       key_agreement=False, encipher_only=False,
+                                       decipher_only=False), critical=True)
+          .add_extension(x509.SubjectKeyIdentifier.from_public_key(ca_key.public_key()),
+                         critical=False)
+          .sign(ca_key, hashes.SHA256()))
+    key = ec.generate_private_key(ec.SECP256R1())
+    cert = (x509.CertificateBuilder().subject_name(name("127.0.0.1"))
+            .issuer_name(ca.subject).public_key(key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(now - dt.timedelta(minutes=5))
+            .not_valid_after(now + dt.timedelta(days=1))
+            .add_extension(x509.SubjectAlternativeName(
+                [x509.IPAddress(ipaddress.ip_address("127.0.0.1"))]), critical=False)
+            .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+            .add_extension(x509.ExtendedKeyUsage([x509.oid.ExtendedKeyUsageOID.SERVER_AUTH]),
+                           critical=False)
+            .add_extension(x509.AuthorityKeyIdentifier.from_issuer_public_key(
+                ca_key.public_key()), critical=False)
+            .sign(ca_key, hashes.SHA256()))
+    pem = serialization.Encoding.PEM
+    paths = d / "ca.pem", d / "cert.pem", d / "key.pem"
+    paths[0].write_bytes(ca.public_bytes(pem))
+    paths[1].write_bytes(cert.public_bytes(pem))
+    paths[2].write_bytes(key.private_bytes(pem, serialization.PrivateFormat.PKCS8,
+                                           serialization.NoEncryption()))
+    return paths
+
+
+class TLSStubServer(StubServer):
+    """StubServer behind TLS, with a cert from make_ca_and_cert()."""
+
+    def __init__(self, cert: Path, key: Path):
+        self.cert, self.key = cert, key
+
+    def __enter__(self):
+        import ssl
+        super().__enter__()
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(self.cert, self.key)
+        self.srv.socket = ctx.wrap_socket(self.srv.socket, server_side=True)
+        self.url = self.url.replace("http://", "https://")
+        return self
+
+
 PRINTF_ANSI = "printf '\\033[32mgreen\\033[0m answer\\n'\n"
 PRINTF_EMOJI = "printf '\\xf0\\x9f\\x95\\x90 the answer\\n'\n"
 PRINTF_BANNER = "printf '>> updating\\nreal answer\\n'\n"
@@ -218,6 +287,57 @@ def write_exe(path: Path, body: str) -> Path:
 
 
 # --------------------------------------------------------------------------- #
+class TestPerLaneTLS(unittest.TestCase):
+    """#78: a private-CA endpoint is reachable without weakening any other lane."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.dir = Path(tempfile.mkdtemp())
+        cls.ca, cls.cert, cls.key = make_ca_and_cert(cls.dir)
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.dir, True)
+
+    def lane(self, url, **kw):
+        return {"name": "Private", "model": "ok", "base_url": url, "timeout": 10, **kw}
+
+    def test_without_a_bundle_the_private_ca_is_refused(self):
+        with TLSStubServer(self.cert, self.key) as s:
+            with self.assertRaises(RuntimeError) as e:
+                rt.http_lane(self.lane(s.url), "hi", None, 0)
+        self.assertIn("CERTIFICATE_VERIFY_FAILED", str(e.exception))
+
+    def test_ca_bundle_reaches_the_private_endpoint(self):
+        with TLSStubServer(self.cert, self.key) as s:
+            out = rt.http_lane(self.lane(s.url, ca_bundle=str(self.ca)), "hi", None, 0)
+        self.assertTrue(out["answer"])
+
+    def test_ca_bundle_replaces_the_system_roots_for_that_lane(self):
+        """A private CA must not also vouch for public hosts, so the bundle is
+        the lane's whole trust store, not an addition to it."""
+        ctx = rt.tls_context({"ca_bundle": str(self.ca)})
+        self.assertEqual(len(ctx.get_ca_certs()), 1)
+
+    def test_a_missing_bundle_names_the_path(self):
+        with self.assertRaises(RuntimeError) as e:
+            rt.http_lane(self.lane("https://127.0.0.1:9/v1",
+                                   ca_bundle=str(self.dir / "nope.pem")), "hi", None, 0)
+        self.assertIn("nope.pem", str(e.exception))
+
+    def test_insecure_connects_and_says_so(self):
+        import contextlib
+        import io
+        err = io.StringIO()
+        with TLSStubServer(self.cert, self.key) as s, contextlib.redirect_stderr(err):
+            out = rt.http_lane(self.lane(s.url, insecure=True), "hi", None, 0)
+        self.assertTrue(out["answer"])
+        self.assertIn("Private: TLS verification is OFF", err.getvalue())
+
+    def test_no_tls_key_means_urllib_default(self):
+        self.assertIsNone(rt.tls_context({"name": "A"}))
+
+
 class TestConfigValidation(unittest.TestCase):
     """Bad config must be rejected up front, not discovered mid-run."""
 
@@ -313,6 +433,41 @@ class TestConfigValidation(unittest.TestCase):
               "extra_body": {"model": "something-else"}}],
             "extra_body may not set",
         )
+
+    def test_tls_keys_are_checked(self):
+        """#78: ca_bundle and insecure are validated before any lane runs."""
+        http = {"harness": "http", "model": "m", "base_url": "https://x/v1"}
+        cli = {"harness": "cli", "command": "x", "args": ["{prompt}"]}
+        for lane, needle in (
+            ({**http, "ca_bundle": 3}, "ca_bundle must be a path"),
+            ({**http, "ca_bundle": ""}, "ca_bundle must be a path"),
+            ({**http, "insecure": "yes"}, "insecure must be true or false"),
+            ({**http, "insecure": True, "ca_bundle": "/ca.pem"}, "not both"),
+            ({**cli, "ca_bundle": "/ca.pem"}, "applies to http lanes only"),
+            ({**cli, "insecure": False}, "applies to http lanes only"),
+        ):
+            with self.subTest(lane=lane):
+                with self.assertRaises(SystemExit) as e:
+                    rt.validate_config({"lanes": [{"name": "A", **lane}]}, "test")
+                self.assertIn(needle, str(e.exception))
+
+    def test_insecure_can_never_be_a_default(self):
+        """It would quietly turn verification off for every lane (#78)."""
+        with self.assertRaises(SystemExit) as e:
+            rt.validate_config(
+                {"defaults": {"insecure": True},
+                 "lanes": [{"name": "A", "harness": "http", "model": "m",
+                            "base_url": "https://x/v1"}]}, "test")
+        self.assertIn("insecure may not be a default", str(e.exception))
+
+    def test_a_default_ca_bundle_skips_cli_lanes(self):
+        cfg = rt.validate_config(
+            {"defaults": {"ca_bundle": "/ca.pem"},
+             "lanes": [{"name": "A", "harness": "cli", "command": "x",
+                        "args": ["{prompt}"]},
+                       {"name": "B", "harness": "http", "model": "m",
+                        "base_url": "https://x/v1"}]}, "test")
+        self.assertEqual(cfg["lanes"][1]["ca_bundle"], "/ca.pem")
 
     def test_cli_lane_must_actually_deliver_the_prompt(self):
         """#20: args non-empty was the only check, so a lane could send nothing.

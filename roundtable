@@ -83,6 +83,7 @@ import shutil
 import signal
 import socket
 import sqlite3
+import ssl
 import subprocess
 import tempfile
 import sys
@@ -96,7 +97,7 @@ from pathlib import Path
 
 # Semantic version. Bump it in the PR that changes behaviour: patch for a fix,
 # minor for a new flag or mode, major for a change that breaks a caller.
-__version__ = "1.1.1"
+__version__ = "1.2.0"
 
 TRANSCRIPT_DIR = Path.home() / ".local" / "share" / "flatline-roundtable" / "transcripts"
 RUN_ID_RE = re.compile(r"[A-Za-z0-9_-][A-Za-z0-9._-]{0,63}")
@@ -452,6 +453,11 @@ def validate_config(cfg: dict, where: str) -> dict:
         die(f"{where} defines no lanes")
 
     defaults = cfg.get("defaults") or {}
+    # Turning verification off has to be a per-lane decision someone typed. As a
+    # default it would quietly cover every lane, OpenRouter included -- the
+    # global bypass #78 exists to make unnecessary.
+    if "insecure" in defaults:
+        die("insecure may not be a default — set it on the one lane that needs it")
     seen: set[str] = set()
     lanes = []
     for i, raw in enumerate(cfg["lanes"]):
@@ -515,6 +521,21 @@ def validate_config(cfg: dict, where: str) -> dict:
         bad = EXTRA_BODY_DENY & set((lane.get("extra_body") or {}).keys())
         if bad:
             die(f"{name}: extra_body may not set {', '.join(sorted(bad))}")
+
+        # TLS (#78). A default ca_bundle is fine -- a cli/acp lane simply has no
+        # TLS to apply it to -- but naming one on the lane itself is a no-op the
+        # operator meant to do something, so it fails.
+        if harness != "http":
+            for k in ("ca_bundle", "insecure"):
+                if k in raw:
+                    die(f"{name}: {k} applies to http lanes only")
+        if lane.get("ca_bundle") is not None and (
+                not isinstance(lane["ca_bundle"], str) or not lane["ca_bundle"]):
+            die(f"{name}: ca_bundle must be a path to a PEM file")
+        if lane.get("insecure") is not None and not isinstance(lane["insecure"], bool):
+            die(f"{name}: insecure must be true or false, got {lane['insecure']!r}")
+        if lane.get("insecure") and lane.get("ca_bundle"):
+            die(f"{name}: set ca_bundle or insecure, not both")
         lanes.append(lane)
     cfg["lanes"] = lanes
     return cfg
@@ -2301,6 +2322,31 @@ def parse_retry_after(value: str | None) -> float | None:
     return max(0.0, (when - dt.datetime.now(dt.timezone.utc)).total_seconds())
 
 
+def tls_context(lane: dict) -> ssl.SSLContext | None:
+    """The SSL context for one http lane, or None for urllib's default (#78).
+
+    `ca_bundle` trusts that PEM file *instead of* the system roots, for this lane
+    only: a private CA should not also be able to vouch for OpenRouter.
+    `insecure: true` turns verification off for this lane only, and says so on
+    every call. Neither touches any other lane, which a global
+    PYTHONHTTPSVERIFY=0 would.
+    """
+    if lane.get("insecure"):
+        print(f"warning: {lane.get('name', '?')}: TLS verification is OFF (insecure: true)",
+              file=sys.stderr)
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        return ctx
+    if lane.get("ca_bundle"):
+        path = os.path.expanduser(lane["ca_bundle"])
+        try:
+            return ssl.create_default_context(cafile=path)
+        except (OSError, ssl.SSLError) as e:
+            raise RuntimeError(f"ca_bundle {path}: {e}") from None
+    return None
+
+
 def http_lane(lane: dict, prompt: str, key: str | None, retries: int) -> dict:
     body = {
         "model": lane["model"],
@@ -2319,12 +2365,13 @@ def http_lane(lane: dict, prompt: str, key: str | None, retries: int) -> dict:
     if key:
         # In-process only. Never argv -- argv is world-readable via ps.
         headers["Authorization"] = f"Bearer {key}"
+    ctx = tls_context(lane)
 
     attempt = 0
     while True:
         req = urllib.request.Request(url, data=json.dumps(body).encode(), headers=headers)
         try:
-            with urllib.request.urlopen(req, timeout=lane.get("timeout", 300)) as r:
+            with urllib.request.urlopen(req, timeout=lane.get("timeout", 300), context=ctx) as r:
                 data = json.load(r)
             # A 200 carrying an error body is how an upstream failure arrives when
             # the gateway itself succeeded -- "Upstream error from Nvidia" on a
