@@ -2708,6 +2708,61 @@ class TestEndToEnd(unittest.TestCase):
             self.assertEqual(r.returncode, 0, r.stderr)
             self.assertIsNotNone(s.srv.last_request)
 
+    def test_json_gives_every_lane_a_cost(self):
+        """#79: cost was set only when a lane was priced and returned usage, so a
+        caller summing `--json` could not tell a free lane from an unknown one."""
+        with StubServer() as s:
+            r = self._run([
+                {"name": "Paid", "harness": "http", "model": "m", "vendor": "a",
+                 "base_url": s.url, "price_per_mtok": 1000.0},
+                {"name": "Free", "harness": "http", "model": "vendor/m:free", "vendor": "b",
+                 "base_url": s.url},
+                {"name": "Unknown", "harness": "http", "model": "vendor/not-in-table",
+                 "vendor": "c", "base_url": s.url},
+            ], "--json")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        out = json.loads(r.stdout)
+        self.assertIsInstance(out, list, "the plain --json shape must not change")
+        cost = {x["lane"]: x["cost"] for x in out}
+        # Stub usage: 100 prompt + 200 completion tokens at $1000/Mtok.
+        self.assertAlmostEqual(cost["Paid"], 0.3)
+        self.assertEqual(cost["Free"], 0.0)
+        self.assertIsNone(cost["Unknown"], "an unpriced lane must not read as free")
+
+    def test_diff_json_reports_run_spend(self):
+        """#79: the run-level number the human summary prints, machine-readable,
+        and including what the readers cost."""
+        with StubServer() as s:
+            lanes = [{"name": n, "harness": "http", "model": "m", "vendor": n,
+                      "base_url": s.url, "price_per_mtok": 1000.0} for n in ("A", "B")]
+            r = self._run(lanes, "--diff", "--json", "--max-spend", "50")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            spend = json.loads(r.stdout)["spend"]
+            readers = len(s.srv.requests) - 2
+        self.assertGreaterEqual(readers, 1)
+        lane_total = 0.6
+        self.assertAlmostEqual(spend["actual"], lane_total + 0.3 * readers, places=4)
+        self.assertGreater(spend["estimated_worst_case"], 0)
+        self.assertEqual(spend["budget"], 50)
+        self.assertEqual(spend["unpriced"], [])
+
+    def test_diff_prints_the_spend_line(self):
+        with StubServer() as s:
+            lanes = [{"name": n, "harness": "http", "model": "m", "vendor": n,
+                      "base_url": s.url, "price_per_mtok": 1000.0} for n in ("A", "B")]
+            r = self._run(lanes, "--diff")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("spend: $", r.stdout)
+
+    def test_spend_names_the_lanes_it_could_not_price(self):
+        with StubServer() as s:
+            r = self._run([{"name": n, "harness": "http", "model": m, "vendor": n,
+                            "base_url": s.url}
+                           for n, m in (("A", "vendor/not-in-table"), ("B", "vendor/m:free"))],
+                          "--diff", "--json")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(json.loads(r.stdout)["spend"]["unpriced"], ["A"])
+
     def test_list_makes_no_network_calls(self):
         with StubServer() as s:
             r = self._run([{"name": "A", "harness": "http", "model": "m", "base_url": s.url}],
@@ -3174,6 +3229,22 @@ class TestSynthesizeRun(unittest.TestCase):
         out = json.loads(r.stdout)
         self.assertEqual(out["run_id"], "r2")
         self.assertIsNone(out["error"])
+
+    def test_spend_lands_in_the_transcript_and_synthesize_json(self):
+        """#79: a cron caller reading the transcript or --synthesize --json gets
+        the same spend object as --diff --json."""
+        with StubServer() as s:
+            lanes = self._lanes(s.url, 2, price_per_mtok=1000.0)
+            self.assertEqual(self._run(lanes, "--each", "--run-id", "r79").returncode, 0)
+            rec = json.loads(sorted(self.tdir.glob("*.json"))[0].read_text())
+            self.assertAlmostEqual(rec["spend"]["actual"], 0.3)
+            self.assertAlmostEqual(rec["results"][0]["cost"], 0.3)
+            r = self._run(lanes, "--synthesize", "latest-run", "--json", brief="")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        out = json.loads(r.stdout)
+        self.assertAlmostEqual(out["spend"]["actual"], out["cost"])
+        self.assertAlmostEqual(out["spend"]["actual"], 0.6)
+        self.assertIsNone(out["spend"]["budget"])
 
     def test_refuses_to_start_a_run_alongside(self):
         with StubServer() as s:

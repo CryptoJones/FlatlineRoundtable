@@ -238,6 +238,20 @@ resolved is refused outright rather than estimated at $0 — a guard that
 cannot see a lane cannot bind on it. `cli`/`acp` lanes, `:free` models and an
 explicit `price_per_mtok: 0` are free, not unknown.
 
+What a run spent is machine-readable too. Every `--json` result carries a
+`cost`: dollars when the lane was priced and returned usage, `0.0` when it is
+free, and `null` when it is unknown. Do not read `null` as free. `--diff --json`,
+`--discuss --json`, `--synthesize --json` and every transcript add a `spend`
+object:
+
+```json
+"spend": {"actual": 0.0412, "estimated_worst_case": 0.31, "budget": 0.5, "unpriced": []}
+```
+
+`actual` includes the `--diff` readers. If `unpriced` names any lanes, `actual`
+is a lower bound, not the bill. Plain `--json` stays a bare list of results so
+existing callers keep working. Sum it with `jq 'map(.cost // 0) | add'`.
+
 ## Usage
 
 ```console
