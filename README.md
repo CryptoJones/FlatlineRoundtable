@@ -271,7 +271,58 @@ roundtable --config DB             # another store (default ~/.local/share/flatl
 roundtable --max-spend 0.50        # refuses BEFORE dispatch if the estimate exceeds it
 roundtable --panel --diff          # report only where the lanes disagree (not with --each)
 roundtable --no-transcript
+roundtable --each --dry-run -           # priced pre-flight: per-lane and panel worst-case cost, no dispatch
 roundtable --each --revise latest:12    # optional second round — see below
+```
+
+### `--dry-run` — priced pre-flight, no dispatch
+
+A worst-case panel estimate without running any lane. Same numbers the budget
+gate uses against `--max-spend` / `budget_usd`, so a `--dry-run` verdict is the
+verdict a real dispatch under the same args would face. Issues the
+pre-flight surfaces:
+
+- which lane is the cost driver
+- whether the panel would exceed the budget (`would_exceed_budget`)
+- which lanes it could not price (the `#72` fail-open guard)
+
+Refuses `--dry-run --list` (use `--list` for the offline roster) and
+`--dry-run --synthesize` (synthesis reads a finished run, not a fresh one).
+Inherits `--each --diff`'s refusal (`#74`).
+
+```console
+$ roundtable --each --dry-run -             # the worst-case panel total
+$ roundtable --each --dry-run --json -      # machine shape: estimated_worst_case, would_exceed_budget, per-lane breakdown
+$ roundtable --panel --diff --dry-run -     # readers' cost folded in; readers listed by name
+$ roundtable --discuss --dry-run -          # cost = estimate * (discuss-rounds + 1); --each/--panel refused
+```
+
+`--dry-run` may dial out to load the OpenRouter price table (cached for 24h,
+same as `--max-spend` already does). When it cannot reach the gateway the run
+degrades to config-only prices; unpriced http lanes show up under `unpriced`
+in `--json` and are called out in the human summary so a budget never silently
+binds against an unknown lane.
+
+Machine shape (`--dry-run --json`). `estimated_worst_case` is the same key
+`spend_report` already uses post-run (`#79`), so a UI / caller that reads it
+once does not switch shapes between pre-flight and post-run.
+
+```json
+{
+  "mode": "each",
+  "lanes": [{"name": "A", "model": "openai/gpt-4o-mini", "harness": "http",
+             "vendor": "openrouter", "route": "https://openrouter.ai/api/v1",
+             "prompt_tokens": 1234, "completion_tokens": 2000,
+             "prompt_cost": 0.0012, "completion_cost": 0.0048,
+             "cost": 0.0060, "free": false, "priced": true}],
+  "estimated_worst_case": 0.0720,
+  "synthesis": null,
+  "discuss_passes": null,
+  "budget": 0.5,
+  "would_exceed_budget": false,
+  "unpriced": [],
+  "currency": "USD"
+}
 ```
 
 Every transcript carries a `run_id`. `--each` hands its children one id, so

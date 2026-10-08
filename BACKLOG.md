@@ -112,7 +112,7 @@ The UI lives in its own private repo,
       replaces the fragile `latest:N` file-count heuristic with a real "round"
       ([#80](https://github.com/CryptoJones/FlatlineRoundtable/issues/80)) — run_id in PR #117,
       `latest-run` in PR #122
-- [ ] Add `--dry-run` / `--estimate` — a priced pre-flight that shows per-lane and
+- [x] Add `--dry-run` / `--estimate` — a priced pre-flight that shows per-lane and
       panel worst-case cost without dispatching (and surfaces unpriced lanes)
       ([#81](https://github.com/CryptoJones/FlatlineRoundtable/issues/81))
 - [ ] Transcripts accumulate forever — add bounded, opt-in retention that never

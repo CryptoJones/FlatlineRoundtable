@@ -43,6 +43,14 @@ Usage:
     roundtable --discuss latest:12 --discuss-rounds 3 "focus on the cost claims"
     cat brief.md | roundtable --discuss new -   start cold, no blind round
     roundtable --converse latest:12        the same flag, by its other name
+    roundtable --each --dry-run -          priced pre-flight: per-lane and panel
+                                           worst-case cost without dispatching
+                                           (may dial out to load prices; #81).
+                                           Add --diff and you get the readers
+                                           too; multiply by discuss-rounds+1
+                                           under --discuss. Refuses
+                                           --dry-run --list and
+                                           --dry-run --synthesize.
 
 Store (#105): the only configuration. Runs read lanes and secrets from it;
 YAML is retired, and `import-yaml` moves an old config in once.
@@ -97,7 +105,7 @@ from pathlib import Path
 
 # Semantic version. Bump it in the PR that changes behaviour: patch for a fix,
 # minor for a new flag or mode, major for a change that breaks a caller.
-__version__ = "1.3.0"
+__version__ = "1.4.0"
 
 TRANSCRIPT_DIR = Path.home() / ".local" / "share" / "flatline-roundtable" / "transcripts"
 RUN_ID_RE = re.compile(r"[A-Za-z0-9_-][A-Za-z0-9._-]{0,63}")
@@ -349,6 +357,151 @@ def spend_report(spent: float, estimate: float, budget, lanes: list[dict],
             "estimated_worst_case": round(estimate, 6),
             "budget": budget,
             "unpriced": [l["name"] for l in lanes if not lane_price_known(l, table)]}
+
+
+def cmd_dry_run(a, cfg, lanes, est_prompt, prices, calib, defaults,
+                estimate, brief_on_record) -> int:
+    """Priced pre-flight (issue #81). Exit 0 without dispatching anything.
+
+    `estimate` is whatever `estimate_run` (+ synthesis, *discuss passes) just
+    produced for the budget gate above. The dry-run path uses the same number,
+    so the gate and the human/JSON report never disagree; only the disposition
+    differs (the gate dies, the dry-run reports). `spend_report` already carries
+    the same `estimated_worst_case` key for post-run (#79), so dry-run shares
+    that name rather than a parallel `panel_total` (#131 dry-run / post-run
+    shape compat).
+
+    `--list` was the offline roster view before this existed; it still is. A
+    `--each --diff` refusal (issue #74) inherits from main(): the synthesis
+    step is folded in here as elsewhere, but `--each --diff` is still refused.
+    """
+    retries = int(cfg.get("retries", 1))
+    attempts = 1 + max(0, retries)
+    discuss_factor = (a.discuss_rounds + 1) if a.discuss else 1
+
+    # Per-lane breakdown. `estimate_run` collapses to a total; the dry-run
+    # user wants to see which lane is the driver and whether any are unpriced.
+    per_lane = []
+    for l in lanes:
+        pin, pout = lane_prices(l, prices)
+        priced = lane_price_known(l, prices)
+        in_tok = ((len(est_prompt) + len(l.get("personality") or ""))
+                  / chars_per_token(l.get("model"), calib))
+        out_tok = float(l.get("max_tokens",
+                              defaults.get("max_tokens", 2000)))
+        p_cost = in_tok * pin * attempts
+        c_cost = out_tok * pout
+        cost = p_cost + c_cost
+        # `free` requires being priced at (0, 0). An unknown price that
+        # happens to fall through to (0, 0) is fail-open (#72) — call it
+        # unpriced, not free, so the UI can render it as unknown.
+        free = priced and pin == 0.0 and pout == 0.0
+        # `--discuss` already has each lane speak once per pass and once to
+        # close, so per-lane cost is multiplied here so the JSON sum equals
+        # the panel total. The gate does the same on `estimate` above; here
+        # we mirror it on each entry to keep `sum(lanes[].cost)` honest.
+        per_lane.append({
+            "name": l["name"],
+            "model": l.get("model") or "",
+            "vendor": l.get("vendor") or "",
+            "harness": l["harness"],
+            "route": safe_route(l.get("base_url")) or l.get("command") or "",
+            "prompt_tokens": int(round(in_tok * attempts * discuss_factor)),
+            "completion_tokens": int(round(out_tok * discuss_factor)),
+            "prompt_cost": round(p_cost * discuss_factor, 6),
+            "completion_cost": round(c_cost * discuss_factor, 6),
+            "cost": round(cost * discuss_factor, 6),
+            "free": free,
+            "priced": priced,
+        })
+
+    if a.diff:
+        # Same fold the budget gate applied; kept here so the JSON shape and
+        # human output include the readers and their cost. Synthesis is
+        # priced against the ORIGINAL brief on record, not the focus text in
+        # a revision round — same rule the gate already uses.
+        synth_cost = estimate_synthesis(
+            lanes, brief_on_record, prices, defaults, calib,
+            cfg.get("synthesizer"),
+            int(cfg.get("synthesizers", 2)))
+        readers = [r["name"] for r in pick_synthesizers(
+            lanes, cfg.get("synthesizer"),
+            int(cfg.get("synthesizers", 2)))]
+        # `--discuss` again: the readers participate in the discussion too,
+        # so their cost is folded by the same pass count to keep the total
+        # honest. `--panel --diff` alone (no --discuss) leaves `discuss_factor`
+        # at 1.
+        synthesis = {"cost": round(synth_cost * discuss_factor, 6),
+                     "readers": readers}
+    else:
+        synthesis = None
+
+    passes = (a.discuss_rounds + 1) if a.discuss else None
+    budget = a.max_spend if a.max_spend is not None else cfg.get("budget_usd")
+    unpriced = [l["name"] for l in lanes if not lane_price_known(l, prices)]
+    # `would_exceed_budget` is the same comparison the gate dies on: priced
+    # estimate vs budget. Under unpriced+budget we cannot tell (#72), so
+    # `null` rather than a misleading `false` that would read as "safe".
+    if unpriced and budget is not None:
+        would_exceed = None
+    else:
+        would_exceed = budget is not None and estimate > budget
+
+    if a.json:
+        out = {
+            "mode": ("discuss" if a.discuss else
+                     "revise" if a.revise else
+                     "panel" if a.panel else "each"),
+            "lanes": per_lane,
+            "estimated_worst_case": round(estimate, 6),
+            "synthesis": synthesis,
+            "discuss_passes": passes,
+            "budget": budget,
+            "would_exceed_budget": would_exceed,
+            "unpriced": unpriced,
+            "currency": "USD",
+        }
+        print(json.dumps(out, indent=2, sort_keys=True))
+        return 0
+
+    # Human output. Match the column widths of `roundtable --list` so the two
+    # read side by side; the cost lives in a fourth column to the right.
+    label_map = {"http": "http", "cli": "cli ", "acp": "acp "}
+    print(f"Pre-flight estimate for {len(lanes)} lane(s) — no dispatch.")
+    for r in per_lane:
+        route_h = label_map.get(r["harness"], r["harness"])
+        if not r["priced"]:
+            tag = "unpriced"
+        elif r["free"]:
+            tag = "free"
+        else:
+            tag = f"${r['cost']:.4f}"
+        print(f"  [{route_h:<4}] {r['name']:<18} {str(r['model'] or '-'):<42} {tag}")
+    print(f"\n  panel worst case: ${estimate:.4f}")
+    if synthesis is not None:
+        n = len(synthesis["readers"])
+        s = "reader" if n == 1 else "readers"
+        print(f"  synthesis ({n} {s}): ${synthesis['cost']:.4f}")
+    if passes is not None:
+        print(f"  discuss passes: {passes}")
+    if budget is not None:
+        if would_exceed is None:
+            verdict = "cannot tell — unpriced lanes; budget not yet binding"
+        elif would_exceed:
+            verdict = "would exceed budget — dispatch would refuse"
+        else:
+            verdict = "within budget on dispatch"
+        print(f"  budget ${budget:.2f}: {verdict}")
+    if unpriced:
+        print("\n  unpriced lanes (estimate is a lower bound, not the bill): "
+              + ", ".join(unpriced))
+        print("  set price_per_mtok on the lane or add vendor: openrouter "
+              "so the price table covers it")
+    # `load_pricing` can fail (offline, catalog stale) and return {}. http lanes
+    # without an explicit price then report unpriced.
+    if not prices and any(l["harness"] == "http" for l in lanes):
+        print("\n  prices not loaded (offline?); http lanes are unpriced")
+    return 0
 
 
 def fill_costs(results: list[dict], lanes: list[dict], table: dict) -> None:
@@ -3697,6 +3850,13 @@ def main() -> int:
                          "transcripts (paths, latest, latest:N); no lane is re-asked")
     ap.add_argument("--run-id", metavar="ID",
                     help="tag every transcript of this run with ID (default: generated)")
+    ap.add_argument("--dry-run", "--estimate", dest="dry_run", action="store_true",
+                    help="priced pre-flight: resolve config + lanes, fetch prices, "
+                         "print the per-lane and panel worst-case cost, exit 0. "
+                         "Combines with --each, --panel, --diff, --revise, --discuss. "
+                         "Refuses --list and --synthesize. --json emits a machine shape "
+                         "(#81). May dial out to load prices; --list stays the offline "
+                         "route view.")
     ap.add_argument("-h", "--help", action="store_true")
     a = ap.parse_args()
     if a.help:
@@ -3713,6 +3873,13 @@ def main() -> int:
     if a.synthesize and (a.each or a.panel or a.revise or a.discuss or a.diff):
         die("--synthesize reads a finished run; it does not start one.\n"
             "  Drop --each/--panel/--revise/--discuss/--diff.")
+    if a.dry_run and a.synthesize:
+        die("--dry-run prices a fresh dispatch; --synthesize reads a finished one.\n"
+            "  Drop --synthesize.")
+    if a.dry_run and a.list:
+        die("--dry-run and --list are two different pre-flights; pick one.\n"
+            "  --list         roster + route, no network, no cost\n"
+            "  --dry-run [...] --json   priced worst-case panel cost (may dial out for prices)")
     if a.discuss:
         if a.revise:
             die("--discuss and --revise are two different second rounds; pick one")
@@ -3861,7 +4028,7 @@ def main() -> int:
     # to estimate to $0 and slip past the gate unseen (#72) -- fail-open on the
     # one check whose job is to fail closed. No default rate either: a guessed
     # number reads as authoritative and is wrong for almost every vendor.
-    if budget is not None:
+    if budget is not None and not a.dry_run:
         unpriced = [l for l in lanes if not lane_price_known(l, prices)]
         if unpriced:
             die(
@@ -3894,6 +4061,17 @@ def main() -> int:
     if a.discuss:
         # Each lane speaks once per pass and once to close.
         estimate *= a.discuss_rounds + 1
+    # Dry-run reports the same estimate the gate just computed (the human and
+    # JSON numbers MUST match the gate for the UI to rely on it, #81). Skipping
+    # the gate's `die` below is on purpose: a dry-run exists to *show* a number
+    # that may exceed the budget, not to refuse to compute it. The unpriced
+    # --budget die above is gated by `not a.dry_run` so dry-run under a budget
+    # with an unpriced lane reports instead of refusing — same #72 information
+    # the gate would have died with, minus the failure mode the dry-run exists
+    # to avoid.
+    if a.dry_run:
+        return cmd_dry_run(a, cfg, lanes, est_prompt, prices, calib,
+                           defaults, estimate, brief_on_record)
     if budget is not None and estimate > budget:
         die(
             f"estimated worst case ${estimate:.4f} exceeds budget ${budget:.2f} — refusing to dispatch\n"
