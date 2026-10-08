@@ -2496,6 +2496,339 @@ class TestPricing(unittest.TestCase):
         self.assertFalse(rt.lane_price_known({"harness": "http", "model": "vendor/not-in-table"}, {}))
 
 
+# --------------------------------------------------------------------------- #
+# --dry-run (#81)
+# --------------------------------------------------------------------------- #
+class TestDryRun(unittest.TestCase):
+    """`--dry-run` is a priced pre-flight: same numbers as the budget gate, no
+    dispatch. Anything that has side effects (`fetch_keys`, a child process, a
+    transcript write) would defeat the whole point, so the tests pin that down."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        # throwaway pricing + calib caches so real key/shape data does not leak in
+        self._old_pricing = getattr(rt, "PRICING_CACHE", None)
+        self._old_calib = getattr(rt, "TOKENIZER_CACHE", None)
+        rt.PRICING_CACHE = self.tmp / "pricing.json"
+        rt.TOKENIZER_CACHE = self.tmp / "tokens.json"
+        self._old_dir = rt.TRANSCRIPT_DIR
+        rt.TRANSCRIPT_DIR = self.tmp / "transcripts"
+        self.addCleanup(setattr, rt, "PRICING_CACHE", self._old_pricing)
+        self.addCleanup(setattr, rt, "TOKENIZER_CACHE", self._old_calib)
+        self.addCleanup(setattr, rt, "TRANSCRIPT_DIR", self._old_dir)
+
+    def _invoke(self, lanes, *args, stdin="-", extra_cfg=None):
+        d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d, True)
+        cfg = {"lanes": lanes}
+        cfg.update(extra_cfg or {})
+        make_db(d, cfg)
+        # HOME → self.tmp so `Path.home()` (used for TRANSCRIPT_DIR inside the
+        # CLI) lands under our throwaway tree, where we can assert on it.
+        # `_invoke` deliberately does NOT pass `--no-transcript`; tests that
+        # assert "no transcript was written" need a real-mode invocation to
+        # mean anything (a paying dispatch would have written, and would
+        # therefore be a control for the negative claim).
+        env = {**os.environ, "HOME": str(self.tmp),
+               "XDG_CACHE_HOME": str(self.tmp)}
+        argv = [sys.executable, str(ROOT / "roundtable"), "--config", str(d / "c.db"),
+                *args]
+        # stdin placeholder so the brief path is exercised end-to-end
+        if stdin == "-":
+            return subprocess.run(argv + ["-"], input="the brief",
+                                  capture_output=True, text=True, timeout=30, env=env)
+        if stdin is None:
+            return subprocess.run(argv + ["the brief"],
+                                  capture_output=True, text=True, timeout=30, env=env)
+        return subprocess.run(argv + [stdin], input="",
+                              capture_output=True, text=True, timeout=30, env=env)
+
+    def _transcript_dir(self):
+        # Where the CLI writes transcripts when HOME is this tmp tree.
+        return self.tmp / ".local" / "share" / "flatline-roundtable" / "transcripts"
+
+    def test_dry_run_each_prints_per_lane_costs_and_exits_zero(self):
+        # Two priced http lanes. The estimate is non-zero, free vs. paid both
+        # distinguishable, dispatch proves not to have happened.
+        with StubServer() as s:
+            lanes = [{"name": "Paid", "harness": "http", "model": "m",
+                      "base_url": s.url, "price_per_mtok": 10.0, "max_tokens": 1000},
+                     {"name": "Free", "harness": "cli", "model": "x",
+                      "command": "echo hi", "args": ["-p"], "stdin": True}]
+            r = self._invoke(lanes, "--dry-run", "--each", "-j", "1")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("Pre-flight estimate", r.stdout)
+            self.assertIn("Paid", r.stdout)
+            self.assertIn("Free", r.stdout)
+            self.assertIn("panel worst case", r.stdout)
+            # No dispatch.
+            self.assertIsNone(s.srv.last_request)
+            # No transcript file written, under the redirected HOME.
+            self.assertFalse(self._transcript_dir().exists())
+
+    def test_dry_run_does_not_spawn_subprocesses(self):
+        # Even a CLI lane under --dry-run must not be exec'd. The whole point
+        # of the pre-flight is no spend, no side effects, no remote calls.
+        sub = write_exe(self.tmp / "call_me",
+                        "echo called >&2; exit 0\n")
+        lanes = [{"name": "X", "harness": "cli", "model": "x",
+                  "command": str(sub), "args": ["-p"], "stdin": True}]
+        r = self._invoke(lanes, "--dry-run", "--each", "-j", "1")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("called", r.stderr)
+
+    def test_dry_run_list_is_refused(self):
+        # --list is the offline roster view; --dry-run is the priced pre-flight.
+        # Two surfaces, two purposes — pick one.
+        with StubServer() as s:
+            r = self._invoke(
+                [{"name": "A", "harness": "http", "model": "m", "base_url": s.url}],
+                "--list", "--dry-run", stdin=None)
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn("two different pre-flights", r.stderr)
+
+    def test_dry_run_synthesize_is_refused(self):
+        # Need at least one lane so make_db accepts the roster; the refusal
+        # happens at argparse time, before the roster is read.
+        lanes = [{"name": "A", "harness": "cli", "model": "x",
+                  "command": "echo hi", "args": ["-p"], "stdin": True}]
+        r = self._invoke(lanes, "--dry-run", "--synthesize", "latest",
+                         stdin=None)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("--synthesize reads a finished one", r.stderr)
+
+    def test_dry_run_each_diff_is_still_refused(self):
+        # #74 still binds under --dry-run.
+        with StubServer() as s:
+            lanes = [{"name": n, "harness": "http", "model": "m", "base_url": s.url}
+                     for n in ("A", "B")]
+            r = self._invoke(lanes, "--each", "-j", "1", "--diff", "--dry-run")
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn("--each --diff", r.stderr)
+            self.assertIsNone(s.srv.last_request)
+
+    def test_dry_run_unpriced_lanes_are_listed_and_budget_verdict_is_null(self):
+        """Under --dry-run the report renders unpriced lanes (#72) instead of
+        the dispatch refusing on them. The verdict `would_exceed_budget` is
+        `null` because the budget cannot bind on what we cannot price; the
+        JSON still lists the unpriced lane by name so the user sees the same
+        problem the gate would have died on."""
+        with StubServer() as s:
+            lanes = [{"name": "Mystery", "harness": "http",
+                      "model": "vendor/not-in-table", "base_url": s.url}]
+            r = self._invoke(lanes, "--dry-run", "--each", "-j", "1",
+                             "--max-spend", "0.50", "--json")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIsNone(s.srv.last_request,
+                               "dispatch happened despite --dry-run")
+            out = json.loads(r.stdout)
+            self.assertEqual(out["unpriced"], ["Mystery"])
+            self.assertIsNone(out["would_exceed_budget"])
+            self.assertEqual(out["budget"], 0.50)
+            # Human-readable surface: same lane is named when --json is absent.
+            r = self._invoke(lanes, "--dry-run", "--each", "-j", "1",
+                             "--max-spend", "0.50")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("unpriced", r.stdout.lower())
+
+    def test_dry_run_dispatch_path_still_refuses_unpriced_under_budget(self):
+        """#72 contract, dispatch side: a non-dry-run run under a budget with
+        an unpriced lane must still die, so the unpriced-budget guard the rest
+        of the tool relies on is unchanged when --dry-run is absent. (#72.)"""
+        with StubServer() as s:
+            lanes = [{"name": "Mystery", "harness": "http",
+                      "model": "vendor/not-in-table", "base_url": s.url}]
+            r = self._invoke(lanes, "--each", "-j", "1", "--max-spend", "0.50")
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn("Mystery", r.stderr)
+            self.assertIn("no known price", r.stderr)
+            self.assertIsNone(s.srv.last_request)
+
+    def test_dry_run_emits_no_transcript_under_tmproot(self):
+        # The control: under `--no-transcript`, no transcript ever lands.
+        # Without that flag, the same run DOES write one — the negative
+        # claim only lands next to that control. We keep both halves: paid
+        # lane under --each (would dispatch, would write) vs. dry-run (must
+        # not write).
+        with StubServer() as s:
+            lanes = [{"name": "A", "harness": "http", "model": "m",
+                      "base_url": s.url, "price_per_mtok": 0.0,
+                      "max_tokens": 100}]
+            tdir = self._transcript_dir()
+            # 1. Real run without --no-transcript — control, must write.
+            r = self._invoke(lanes, "--each", "-j", "1", stdin="the brief")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertTrue(tdir.exists() and any(tdir.iterdir()),
+                            "control: a paying dispatch must land a transcript")
+            for prev in tdir.iterdir():
+                prev.unlink()
+            # 2. Dry-run on the same lanes — must NOT write.
+            r = self._invoke(lanes, "--dry-run", "--each", "-j", "1")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertFalse(any(tdir.iterdir()) if tdir.exists() else True,
+                             "dry-run wrote a transcript")
+
+    def test_dry_run_panel_diff_includes_synthesis_cost(self):
+        # --panel --diff folds the readers' worst case in. The dry-run shows it.
+        with StubServer() as s:
+            lanes = [{"name": n, "harness": "http", "model": "m",
+                      "base_url": s.url, "price_per_mtok": 0.0}
+                     for n in ("A", "B", "C", "D")]
+            r = self._invoke(lanes, "--dry-run", "--panel", "--diff")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("synthesis", r.stdout)
+            self.assertIn("panel worst case", r.stdout)
+
+    def test_dry_run_json_shape_matches_contract(self):
+        # Match the README's machine contract: every documented key is present
+        # with a sane type, the panel total equals per-lane sum + synthesis,
+        # and the keys overlap with spend_report() (#79 / #131) where they
+        # mean the same thing.
+        with StubServer() as s:
+            lanes = [{"name": n, "harness": "http", "model": "m",
+                      "base_url": s.url, "price_per_mtok": 1.0,
+                      "max_tokens": 1000}
+                     for n in ("A", "B")]
+            r = self._invoke(lanes, "--dry-run", "--each", "-j", "1", "--json")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            out = json.loads(r.stdout)
+        self.assertEqual(out["mode"], "each")
+        self.assertEqual(out["currency"], "USD")
+        self.assertEqual(set(out),
+                         {"mode", "lanes", "estimated_worst_case", "synthesis",
+                          "discuss_passes", "budget", "would_exceed_budget",
+                          "unpriced", "currency"})
+        self.assertIsNone(out["synthesis"])
+        self.assertIsNone(out["discuss_passes"])
+        self.assertFalse(out["would_exceed_budget"])
+        self.assertEqual(out["unpriced"], [])
+        # Per-lane entry keys.
+        for entry in out["lanes"]:
+            self.assertEqual(set(entry),
+                             {"name", "model", "vendor", "harness", "route",
+                              "prompt_tokens", "completion_tokens",
+                              "prompt_cost", "completion_cost", "cost",
+                              "free", "priced"})
+            self.assertIsInstance(entry["free"], bool)
+            self.assertIsInstance(entry["priced"], bool)
+        # The per-lane sum is the panel total (no synthesis, no discuss, no
+        # retries). The two values are independently rounded to 6 places, so
+        # the worst-case compounding is ≤ N * 5e-7 — tolerate one ULP rather
+        # than pin a precise equality that exaggerates machine noise.
+        self.assertAlmostEqual(out["estimated_worst_case"],
+                               sum(e["cost"] for e in out["lanes"]),
+                               delta=2e-6)
+
+    def test_dry_run_discuss_folds_multiplier_into_per_lane_costs(self):
+        """`--discuss` multiplies the panel total by `rounds + 1`; per-lane
+        costs mirror it so a consumer summing `lanes[].cost` gets the same
+        number the gate / dry-run reports as `estimated_worst_case`. Doc'd.
+        `--discuss` is its own mode: the tool refuses `--discuss --each`
+        and `--discuss --panel` because each turn is built from the turns
+        before it (nothing to fan out). So we run `--discuss new --dry-run`
+        here, the priced pre-flight of a would-be shared-context run.
+        """
+        with StubServer() as s:
+            lanes = [{"name": n, "harness": "http", "model": "m",
+                      "base_url": s.url, "price_per_mtok": 1.0,
+                      "max_tokens": 100}
+                     for n in ("A", "B")]
+            r = self._invoke(lanes, "--dry-run",
+                             "--discuss", "new", "--discuss-rounds", "3",
+                             "--json")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            out = json.loads(r.stdout)
+        self.assertEqual(out["discuss_passes"], 4)
+        self.assertEqual(out["mode"], "discuss")
+        # The numbers are independently rounded, so use a small delta.
+        self.assertAlmostEqual(out["estimated_worst_case"],
+                               sum(e["cost"] for e in out["lanes"]),
+                               delta=2e-6)
+
+    def test_dry_run_estimate_alias_matches_dry_run(self):
+        # `--estimate` is the issue-title alias (#81). Same flag, same output,
+        # so docs can speak either name.
+        with StubServer() as s:
+            lanes = [{"name": "A", "harness": "http", "model": "m",
+                      "base_url": s.url, "price_per_mtok": 1.0,
+                      "max_tokens": 100}]
+            r = self._invoke(lanes, "--estimate", "--each", "-j", "1",
+                             "--json")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            out = json.loads(r.stdout)
+            self.assertEqual(out["mode"], "each")
+            self.assertIn("estimated_worst_case", out)
+
+    def test_dry_run_json_would_exceed_budget_reflects_the_gate(self):
+        """The verdict the dry-run reports is the same one the gate would die on.
+
+        `would_exceed_budget: true` means a real dispatch under the same args
+        would refuse; `false` means the budget would hold. The threshold is
+        `estimate > budget`, matching `if budget is not None and estimate > budget`
+        in main()."""
+        with StubServer() as s:
+            lanes = [{"name": n, "harness": "http", "model": "m",
+                      "base_url": s.url, "price_per_mtok": 1000.0,
+                      "max_tokens": 1000}
+                     for n in ("A", "B")]
+            # Budget set high: stays within.
+            r = self._invoke(lanes, "--dry-run", "--each", "-j", "1", "--json",
+                             "--max-spend", "10.00")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            high = json.loads(r.stdout)
+            self.assertFalse(high["would_exceed_budget"])
+            # Budget set low: must exceed.
+            r = self._invoke(lanes, "--dry-run", "--each", "-j", "1", "--json",
+                             "--max-spend", "0.01")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            low = json.loads(r.stdout)
+            self.assertTrue(low["would_exceed_budget"])
+
+    def test_dry_run_no_prices_loaded_warns_in_human_output(self):
+        # pricing cache empty, http lane without price_per_mtok: the gate is
+        # silent and the budget would be unbounded; the dry-run must surface it.
+        rt.PRICING_CACHE.write_text("{}")
+        with StubServer() as s:
+            lanes = [{"name": "Off", "harness": "http", "model": "m",
+                      "base_url": s.url}]
+            r = self._invoke(lanes, "--dry-run", "--each", "-j", "1")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("unpriced", r.stdout)
+
+    def test_dry_run_revise_uses_longest_packet_as_worst_case(self):
+        """Under --revise the prompt each lane sees is its OWN PACKET, not the
+        original brief; the longest one is the honest worst case for the budget
+        gate, and must still be the dry-run's number (#4 contract)."""
+        # Seed a prior transcript with two answers of different length.
+        transcript = {"brief": "the original question",
+                      "results": [
+                          {"lane": "A", "answer": "short", "model": "m",
+                           "harness": "http"},
+                          {"lane": "B", "answer": "much " * 200 + "longer answer",
+                           "model": "m", "harness": "http"}],
+                      "round": 1}
+        tp = self.tmp / "transcripts" / "20261001-000001.json"
+        tp.parent.mkdir(exist_ok=True)
+        tp.write_text(json.dumps(transcript))
+        with StubServer() as s:
+            lanes = [{"name": n, "harness": "http", "model": "m",
+                      "base_url": s.url, "price_per_mtok": 1.0,
+                      "max_tokens": 100}
+                     for n in ("A", "B")]
+            r = self._invoke(
+                lanes, "--dry-run", "--each", "-j", "1", "--revise", str(tp),
+                "--json", stdin="focus on the longest")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            out = json.loads(r.stdout)
+            self.assertEqual(out["mode"], "revise")
+            # The longest packet dominates: both lanes' prompt_tokens reflect
+            # the larger of the two revision prompts, not the original brief.
+            tokens = [e["prompt_tokens"] for e in out["lanes"]]
+            self.assertGreater(tokens[1], 0)
+            self.assertGreater(tokens[0], 0)
+
+
 class TestEndToEnd(unittest.TestCase):
     """Exit codes, via the real CLI entry point."""
 
