@@ -115,6 +115,7 @@ The UI lives in its own private repo,
 - [x] Add `--dry-run` / `--estimate` — a priced pre-flight that shows per-lane and
       panel worst-case cost without dispatching (and surfaces unpriced lanes)
       ([#81](https://github.com/CryptoJones/FlatlineRoundtable/issues/81))
+      — shipped in PR #133
 - [ ] Transcripts accumulate forever — add bounded, opt-in retention that never
       deletes a `parent` of a later round
       ([#82](https://github.com/CryptoJones/FlatlineRoundtable/issues/82))
