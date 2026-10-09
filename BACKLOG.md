@@ -145,6 +145,29 @@ The UI lives in its own private repo,
       locally), free signal for no extra dependency
       ([#86](https://github.com/CryptoJones/FlatlineRoundtable/issues/86)) — fixed on fix/open-issues-batch
 
+### Epic: encrypted SQLite is the authoritative store for lanes, secrets and (next) metrics — YAML retired ([#105](https://github.com/CryptoJones/FlatlineRoundtable/issues/105))
+
+One encrypted, structured store per host replaces the YAML file: lane config with
+an edit history, lane auth secrets (AES-256-GCM, DB key in `pass`), and the tables
+the metrics work (#80, #79, #103, #89, #82, #75) needs a place to write to. Lanes
+are edited through subcommands; backups go to telesto. Decisions, definition of
+done and risks live on the epic. Children in dependency order:
+
+- [ ] Split config validation from YAML parsing; route scripts through `rt.fetch_keys`
+      ([#106](https://github.com/CryptoJones/FlatlineRoundtable/issues/106))
+- [ ] Encrypted store: `db init|migrate|doctor` and `secrets set|check|list|rotate|rm|rekey`
+      ([#107](https://github.com/CryptoJones/FlatlineRoundtable/issues/107)) — after #106
+- [ ] Lane config in the store: `lanes`, `defaults`, `globals`, `lane_versions`,
+      `db export|import`, `import-yaml`
+      ([#108](https://github.com/CryptoJones/FlatlineRoundtable/issues/108)) — after #107
+- [ ] Run from the store: `load_config` reads the DB, `fetch_keys` reads secrets,
+      YAML retired
+      ([#109](https://github.com/CryptoJones/FlatlineRoundtable/issues/109)) — after #108
+- [ ] `db backup|restore` and the telesto restic job
+      ([#110](https://github.com/CryptoJones/FlatlineRoundtable/issues/110)) — after #107
+- [ ] Fleet rollout notes and the Python 3.11 floor
+      ([#111](https://github.com/CryptoJones/FlatlineRoundtable/issues/111)) — after #109
+
 ## Verification set
 
 Run before any PR. Several of these are behavioural and were once human-only;
