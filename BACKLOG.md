@@ -50,6 +50,13 @@ The UI lives in its own private repo,
 
 ### Other open items
 
+- [ ] `toolpanel.py`: GLaDOS (grok cli) fails tool rounds with "Max turns reached" —
+      `cli_with_tools` has no grok branch, so the lane runs its tool-less args
+      (`--tools "" --max-turns 3`) against a brief that tells it to use tools
+      ([#134](https://github.com/CryptoJones/FlatlineRoundtable/issues/134))
+- [ ] `toolpanel.py`: TheDixieFlatline (agy) returns EMPTY on tool rounds; stderr is
+      dropped on exit 0, and the lane record's `model` disagrees with the model its
+      args invoke ([#135](https://github.com/CryptoJones/FlatlineRoundtable/issues/135))
 - [x] Transcripts clobber each other under `--each -j N`, losing paid answers —
       one-second filename stamp + shared `.json.tmp` collide; #58's failure mode
       via the filename instead of write order
