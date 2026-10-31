@@ -125,6 +125,19 @@ What each harness gets:
   Verified 2026-09-27: with the flags, a lane asked to create files could not.
 - **codex (SHODAN)**: its config already carries `--sandbox read-only`; runs with cwd=repo.
 - **agy (TheDixieFlatline)**: `--sandbox` is prepended.
+- **grok (GLaDOS)**: the stored tool-less `--tools "" --max-turns N` is replaced (grok takes the
+  LAST value, so it is removed, not followed) by `--tools read_file,glob --deny '*__*'
+  --permission-mode default --max-turns 30`. Verified 2026-10-31 on grok 1.0.70 by asking the
+  lane to read a file and then create one: it read it and could not create it. Two traps found
+  on the way: a `--tools` entry that names no tool (`read`, `view`) makes grok **keep every tool**
+  and only warn on stderr; and without the deny pattern the lane spends its turns on this
+  operator's MCP integrations (OMI memory, REA, Playwright) instead of the repo (#134).
+- **An `EMPTY` answer carries the CLI's stderr tail** (last 2000 chars) in the answer body: a lane
+  that exits 0 with nothing on stdout — agy once did, 2026-10-26 — used to lose the only place
+  the reason lived (#135).
+- **The header names the model the args invoke** (`--model`/`-m`), not the lane record's `model`
+  field; when the two disagree the answer body opens with a line saying so, so a transcript never
+  names a model that did not run (#135). Fix the record with `roundtable lanes edit`.
 
 Rules:
 - **Commit or snapshot the repo before the round** and check `git status --untracked-files=all`

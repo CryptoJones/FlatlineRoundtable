@@ -50,13 +50,18 @@ The UI lives in its own private repo,
 
 ### Other open items
 
-- [ ] `toolpanel.py`: GLaDOS (grok cli) fails tool rounds with "Max turns reached" —
+- [x] `toolpanel.py`: GLaDOS (grok cli) fails tool rounds with "Max turns reached" —
       `cli_with_tools` has no grok branch, so the lane runs its tool-less args
       (`--tools "" --max-turns 3`) against a brief that tells it to use tools
-      ([#134](https://github.com/CryptoJones/FlatlineRoundtable/issues/134))
-- [ ] `toolpanel.py`: TheDixieFlatline (agy) returns EMPTY on tool rounds; stderr is
+      ([#134](https://github.com/CryptoJones/FlatlineRoundtable/issues/134)) — fixed on
+      fix/134-135-toolpanel-grok-stderr: `--tools read_file,glob --deny '*__*'
+      --permission-mode default --max-turns 30`, verified unable to create a file
+- [x] `toolpanel.py`: TheDixieFlatline (agy) returns EMPTY on tool rounds; stderr is
       dropped on exit 0, and the lane record's `model` disagrees with the model its
-      args invoke ([#135](https://github.com/CryptoJones/FlatlineRoundtable/issues/135))
+      args invoke ([#135](https://github.com/CryptoJones/FlatlineRoundtable/issues/135)) —
+      fixed on fix/134-135-toolpanel-grok-stderr: an EMPTY answer carries the stderr tail,
+      the header names the model the args invoke; the EMPTY itself did not reproduce
+      (a 5 KB brief answered with and without `--sandbox`)
 - [x] Transcripts clobber each other under `--each -j N`, losing paid answers —
       one-second filename stamp + shared `.json.tmp` collide; #58's failure mode
       via the filename instead of write order
@@ -145,9 +150,13 @@ The UI lives in its own private repo,
 - [ ] `load_pricing` caches the whole catalog and re-parses it every run — cache the
       reduced `{id: (in, out)}` map instead
       ([#84](https://github.com/CryptoJones/FlatlineRoundtable/issues/84))
-- [ ] No integration tests for `--each` budget gate, transcript integrity, unknown
+- [x] No integration tests for `--each` budget gate, transcript integrity, unknown
       price, or `--diff`+`--each` — the four high-severity behaviours CI doesn't cover
-      ([#85](https://github.com/CryptoJones/FlatlineRoundtable/issues/85))
+      ([#85](https://github.com/CryptoJones/FlatlineRoundtable/issues/85)) — all four exist:
+      `test_each_parallel_writes_one_transcript_per_lane`,
+      `test_each_gates_the_whole_panel_before_spawning_children`,
+      `test_budget_refuses_a_lane_it_cannot_price`,
+      `test_each_with_diff_is_refused_before_anything_runs` (stub vendor, no paid calls)
 - [x] Add Python 3.14 to the CI matrix — the suite already passes on it (verified
       locally), free signal for no extra dependency
       ([#86](https://github.com/CryptoJones/FlatlineRoundtable/issues/86)) — fixed on fix/open-issues-batch
