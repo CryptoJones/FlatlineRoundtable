@@ -24,7 +24,10 @@ REPO = Path(os.environ.get("ROUNDTABLE_REPO", ".")).resolve()
 MAX_ROUNDS = 30
 MAX_TOOL_OUT = 15000
 
-_loader = importlib.machinery.SourceFileLoader("roundtable", str(Path.home() / ".local/bin/roundtable"))
+# The installed roundtable, else the checkout this file lives in (tests, CI, a
+# host that runs the skill from the repo).
+_RT_PATHS = (Path.home() / ".local/bin/roundtable", Path(__file__).resolve().parent.parent / "roundtable")
+_loader = importlib.machinery.SourceFileLoader("roundtable", str(next((p for p in _RT_PATHS if p.is_file()), _RT_PATHS[0])))
 _spec = importlib.util.spec_from_loader("roundtable", _loader)
 rt = importlib.util.module_from_spec(_spec)
 _loader.exec_module(rt)
@@ -178,11 +181,43 @@ def http_with_tools(lane, key, brief):
     return "", calls, "max_rounds"
 
 
-def cli_with_tools(lane, brief):
-    text = (lane.get("personality", "") + "\n\n---\n\n" + brief) if lane.get("personality") else brief
-    cmd = [lane["command"]]
+# grok's read-only built-ins. Verified 2026-10-31 on grok 1.0.70 by asking the lane to
+# read a file and then create one: `read_file,glob` read it and could not create it
+# (CREATED=no, exit 0). `read` and `view` are NOT file tools -- a `--tools` entry that
+# names no tool makes grok warn and keep every tool available, which is how a first
+# attempt with `read,read_file,view,glob` still wrote the probe file. `--deny '*__*'`
+# keeps the lane off this operator's MCP integrations (OMI memory, REA, Playwright...):
+# without it the lane spent all eight turns trying them instead of answering (#134).
+GROK_READ_ONLY_TOOLS = "read_file,glob"
+GROK_DENY_INTEGRATIONS = "*__*"
+STDERR_TAIL = 2000
+
+
+def _drop_options(args, names):
+    """``args`` without the ``--opt value`` pairs named (and ``--opt=value`` forms).
+    A stored tool-less config carries `--tools "" --max-turns 1`; grok takes the
+    LAST value, so the override must remove them rather than follow them (#134)."""
+    out, skip = [], False
+    for a in args:
+        if skip:
+            skip = False
+            continue
+        if a in names:
+            skip = True
+            continue
+        if any(a.startswith(n + "=") for n in names):
+            continue
+        out.append(a)
+    return out
+
+
+def build_cli_args(lane):
+    """The argv tail for a cli lane on a tool round: the lane's stored args with the
+    harness's read-only tool configuration applied. Pure, so it is testable without
+    running anything."""
     args = list(lane["args"])
-    if lane["command"] == "claude":
+    command = os.path.basename(str(lane["command"]))
+    if command == "claude":
         # Read-only tools, no user hooks: the lane must see the repo, not this operator's memory.
         args += ["--allowedTools", "Read,Grep,Glob,Bash(git diff:*),Bash(git show:*),Bash(git log:*),Bash(git grep:*)",
                  # bypassPermissions in the user's settings would otherwise hand the
@@ -190,15 +225,46 @@ def cli_with_tools(lane, brief):
                  "--permission-mode", "default",
                  "--disallowedTools", "Write,Edit,NotebookEdit",
                  "--settings", json.dumps({"disableAllHooks": True})]
-    elif lane["command"] == "agy":
+    elif command == "agy":
         args = ["--sandbox", *args]
+    elif command.startswith("grok"):
+        # `grok` or the `grok-stdin` shim pluto uses. Same shape as the claude branch:
+        # a read-only tool set, default permissions, the operator's integrations denied,
+        # and enough turns for a review (the http lanes get MAX_ROUNDS).
+        args = _drop_options(args, ("--tools", "--max-turns", "--permission-mode", "--disallowed-tools"))
+        args = ["--tools", GROK_READ_ONLY_TOOLS, "--deny", GROK_DENY_INTEGRATIONS,
+                "--permission-mode", "default", "--max-turns", str(MAX_ROUNDS), *args]
+    return args
+
+
+def invoked_model(lane):
+    """The model the lane's args actually ask for, else the lane record's `model`.
+    TheDixieFlatline's record said gemini-3.1-pro-high while its args passed
+    `--model gemini-3.8-flash-high`, so every header and transcript named a model
+    that never ran (#135)."""
+    args = list(lane.get("args") or [])
+    for i, a in enumerate(args):
+        if a in ("--model", "-m") and i + 1 < len(args):
+            return args[i + 1]
+        for prefix in ("--model=", "-m="):
+            if a.startswith(prefix):
+                return a[len(prefix):]
+    return lane.get("model")
+
+
+def cli_with_tools(lane, brief):
+    text = (lane.get("personality", "") + "\n\n---\n\n" + brief) if lane.get("personality") else brief
+    args = build_cli_args(lane)
     stdin = text if lane.get("stdin") else None
-    cmd += [text if a == "{prompt}" else a for a in args]
+    cmd = [lane["command"]] + [text if a == "{prompt}" else a for a in args]
     r = subprocess.run(cmd, input=stdin, capture_output=True, text=True, cwd=REPO, env=rt.child_env(lane),
                        timeout=lane.get("timeout", 900) * 2, start_new_session=True)
+    stderr = rt.ANSI_RE.sub("", r.stderr).strip()
     if r.returncode != 0:
-        raise RuntimeError(f"exit {r.returncode}: {r.stderr.strip()[:300]}")
-    return rt.ANSI_RE.sub("", r.stdout).strip(), None, "stop"
+        raise RuntimeError(f"exit {r.returncode}: {stderr[:300]}")
+    # The stderr tail travels with the answer: on exit 0 with nothing on stdout it
+    # is the only place the reason lives (a sandbox refusal reads as EMPTY otherwise, #135).
+    return rt.ANSI_RE.sub("", r.stdout).strip(), None, "stop", stderr[-STDERR_TAIL:]
 
 
 def main():
@@ -218,16 +284,22 @@ def main():
         print(msg.strip())
         return 3
     t0 = time.time()
+    stderr_tail = ""
     try:
         if lane.get("harness") == "http":
             key = rt.fetch_keys([lane]).get(lane.get("key_entry"))
             answer, calls, finish = http_with_tools(lane, key, brief)
         else:
-            answer, calls, finish = cli_with_tools(lane, brief)
+            answer, calls, finish, stderr_tail = cli_with_tools(lane, brief)
         status = "ok" if answer else "EMPTY"
     except Exception as e:
         answer, calls, finish, status = f"LANE FAILED: {e}", None, None, "FAILED"
-    hdr = f"# {name} ({lane.get('model')}, {lane.get('harness')}) status={status} tool_calls={calls} finish={finish} secs={int(time.time()-t0)}\n\n"
+    if status == "EMPTY" and stderr_tail:
+        answer = f"(no stdout)\n\nstderr, last {len(stderr_tail)} chars:\n{stderr_tail}"
+    hdr = f"# {name} ({invoked_model(lane)}, {lane.get('harness')}) status={status} tool_calls={calls} finish={finish} secs={int(time.time()-t0)}\n\n"
+    if lane.get("model") and invoked_model(lane) != lane.get("model"):
+        # The header names what ran; the record's claim is kept where a reader sees it.
+        answer = f"(lane record says model={lane['model']}; its args invoke {invoked_model(lane)} -- fix the record)\n\n" + answer
     Path(out_file).write_text(hdr + answer + "\n")
     print(hdr.strip())
     return 0 if status == "ok" else 1
